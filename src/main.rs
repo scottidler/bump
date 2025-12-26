@@ -1,6 +1,7 @@
 use clap::Parser;
 use eyre::{Context, Result, bail};
 use log::info;
+use semver::Version;
 use std::env;
 use std::fs;
 use std::io::{self, Write};
@@ -61,6 +62,65 @@ fn prompt_commit_message(staged_files: &[String]) -> Result<String> {
     Ok(message)
 }
 
+/// Result of determining what version action to take
+struct VersionAction {
+    /// The version to tag
+    target_version: Version,
+    /// Whether we need to update Cargo.toml
+    needs_cargo_update: bool,
+    /// Whether this is an initial tag (no bump) vs a version bump
+    is_initial_tag: bool,
+}
+
+/// Determine what version action to take
+fn determine_version_action(dir: &Path, cargo_path: &Path, bump_type: BumpType) -> Result<VersionAction> {
+    // First try to read from Cargo.toml
+    if let Some(cargo_version) = cargo::read_version(cargo_path)? {
+        let parsed = version::parse_version(&cargo_version)?;
+        let tag = version::format_tag(&parsed);
+
+        if !git::tag_exists(dir, &tag)? {
+            // Tag doesn't exist for current Cargo.toml version
+            // This is initial tagging - create tag for current version, no bump needed
+            info!("Tag {} does not exist. Creating initial tag for current version.", tag);
+            return Ok(VersionAction {
+                target_version: parsed,
+                needs_cargo_update: false,
+                is_initial_tag: true,
+            });
+        }
+
+        // Tag exists - need to bump from current version
+        info!("Tag {} exists. Bumping version.", tag);
+        let bumped = version::bump_version(&parsed, bump_type);
+        return Ok(VersionAction {
+            target_version: bumped,
+            needs_cargo_update: true,
+            is_initial_tag: false,
+        });
+    }
+
+    // No version in Cargo.toml, check git tags
+    if let Some(tag) = git::get_latest_tag(dir)? {
+        info!("No version in Cargo.toml. Using latest git tag: {}", tag);
+        let parsed = version::parse_version(&tag)?;
+        let bumped = version::bump_version(&parsed, bump_type);
+        return Ok(VersionAction {
+            target_version: bumped,
+            needs_cargo_update: true,
+            is_initial_tag: false,
+        });
+    }
+
+    // No version anywhere - start at 0.1.0 as initial tag
+    info!("No version found anywhere. Starting at 0.1.0");
+    Ok(VersionAction {
+        target_version: Version::new(0, 1, 0),
+        needs_cargo_update: true,
+        is_initial_tag: true,
+    })
+}
+
 /// Process a single directory
 fn process_directory(dir: &Path, bump_type: BumpType, dry_run: bool) -> Result<()> {
     let dir_name = dir
@@ -80,55 +140,75 @@ fn process_directory(dir: &Path, bump_type: BumpType, dry_run: bool) -> Result<(
 
     let cargo_path = cargo::cargo_toml_path(dir);
 
-    // 3. Determine current version
-    let current_version = determine_current_version(dir, &cargo_path)?;
-    info!("Current version: {}", current_version);
+    // 3. Determine version action
+    let action = determine_version_action(dir, &cargo_path, bump_type)?;
+    let new_tag = version::format_tag(&action.target_version);
+    let new_cargo_version = version::format_cargo_version(&action.target_version);
 
-    // 4. Parse and bump version
-    let parsed_version = version::parse_version(&current_version)?;
-    let new_version = version::bump_version(&parsed_version, bump_type);
-    let new_tag = version::format_tag(&new_version);
-    let new_cargo_version = version::format_cargo_version(&new_version);
-
-    println!(
-        "bump: {} → {}",
-        version::format_cargo_version(&parsed_version),
-        new_cargo_version
-    );
+    // 4. Display what we're doing
+    if action.is_initial_tag {
+        println!("tag: {}", new_tag);
+    } else {
+        // For bumps, show the transition
+        let current_version = cargo::read_version(&cargo_path)?
+            .and_then(|v| version::parse_version(&v).ok())
+            .map(|v| version::format_cargo_version(&v))
+            .unwrap_or_else(|| "unknown".to_string());
+        println!("bump: {} → {}", current_version, new_cargo_version);
+    }
 
     // 5. Verify new tag doesn't exist
     if git::tag_exists(dir, &new_tag)? {
         bail!("Tag {} already exists", new_tag);
     }
 
-    // 6. Update Cargo.toml
+    // 6. Handle dry-run
     if dry_run {
-        println!("[dry-run] Would update: Cargo.toml");
+        if action.needs_cargo_update {
+            println!("[dry-run] Would update: Cargo.toml");
+        }
         println!("[dry-run] Would commit and tag: {}", new_tag);
         return Ok(());
     }
 
-    cargo::write_version(&cargo_path, &new_cargo_version)?;
-    info!("Updated Cargo.toml to version {}", new_cargo_version);
+    // 7. Update Cargo.toml if needed
+    if action.needs_cargo_update {
+        cargo::write_version(&cargo_path, &new_cargo_version)?;
+        info!("Updated Cargo.toml to version {}", new_cargo_version);
+    }
 
-    // 7. Stage all changes
+    // 8. Stage all changes
     git::stage_all(dir)?;
 
-    // 8. Determine commit message
+    // 9. Determine commit message
     let staged_files = git::get_staged_files(dir)?;
-    let only_cargo_toml = staged_files.len() == 1 && staged_files[0] == "Cargo.toml";
 
-    let commit_message = if only_cargo_toml {
-        format!("Bump version to {}", new_tag)
+    let commit_message = if staged_files.is_empty() {
+        // No changes staged (initial tag with clean working tree)
+        // We still need to create a tag, but no commit needed
+        // Actually, git tag can be created without a new commit
+        // But for consistency, let's create an empty commit or just tag HEAD
+        format!("Release {}", new_tag)
     } else {
-        prompt_commit_message(&staged_files)?
+        let only_cargo_toml = staged_files.len() == 1 && staged_files[0] == "Cargo.toml";
+        if only_cargo_toml || (action.is_initial_tag && staged_files.is_empty()) {
+            if action.is_initial_tag {
+                format!("Release {}", new_tag)
+            } else {
+                format!("Bump version to {}", new_tag)
+            }
+        } else {
+            prompt_commit_message(&staged_files)?
+        }
     };
 
-    // 9. Commit
-    git::commit(dir, &commit_message)?;
-    info!("Committed with message: {}", commit_message);
+    // 10. Commit (only if there are staged changes)
+    if !staged_files.is_empty() {
+        git::commit(dir, &commit_message)?;
+        info!("Committed with message: {}", commit_message);
+    }
 
-    // 10. Create annotated tag
+    // 11. Create annotated tag
     git::create_tag(dir, &new_tag, &commit_message)?;
     info!("Created tag: {}", new_tag);
 
@@ -140,33 +220,6 @@ fn process_directory(dir: &Path, bump_type: BumpType, dry_run: bool) -> Result<(
     }
 
     Ok(())
-}
-
-/// Determine the current version to bump from
-fn determine_current_version(dir: &Path, cargo_path: &Path) -> Result<String> {
-    // First try to read from Cargo.toml
-    if let Some(cargo_version) = cargo::read_version(cargo_path)? {
-        // Check if this version's tag already exists (indicates Cargo.toml is stale)
-        let parsed = version::parse_version(&cargo_version)?;
-        let tag = version::format_tag(&parsed);
-
-        if git::tag_exists(dir, &tag)? {
-            info!("Tag {} exists, Cargo.toml may be stale. Using latest git tag.", tag);
-            // Fall through to git tag
-        } else {
-            return Ok(cargo_version);
-        }
-    }
-
-    // Fall back to latest git tag
-    if let Some(tag) = git::get_latest_tag(dir)? {
-        info!("Using latest git tag: {}", tag);
-        return Ok(tag);
-    }
-
-    // No version found anywhere, start at 0.0.0
-    info!("No version found, starting at 0.0.0");
-    Ok("0.0.0".to_string())
 }
 
 fn main() -> Result<()> {
