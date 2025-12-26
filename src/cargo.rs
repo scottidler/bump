@@ -103,8 +103,7 @@ pub fn sync_lockfile(dir: &Path) -> Result<()> {
 
     // Read the package name from Cargo.toml
     let cargo_toml = dir.join("Cargo.toml");
-    let content = fs::read_to_string(&cargo_toml)
-        .context(format!("Failed to read {}", cargo_toml.display()))?;
+    let content = fs::read_to_string(&cargo_toml).context(format!("Failed to read {}", cargo_toml.display()))?;
     let doc = content.parse::<DocumentMut>().context("Failed to parse Cargo.toml")?;
 
     let package_name = doc
@@ -121,10 +120,7 @@ pub fn sync_lockfile(dir: &Path) -> Result<()> {
         .context("Failed to run cargo update")?;
 
     if !output.status.success() {
-        bail!(
-            "cargo update failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        bail!("cargo update failed: {}", String::from_utf8_lossy(&output.stderr));
     }
 
     Ok(())

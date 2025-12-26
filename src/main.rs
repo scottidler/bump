@@ -63,6 +63,7 @@ fn prompt_commit_message(staged_files: &[String]) -> Result<String> {
 }
 
 /// Result of determining what version action to take
+#[derive(Debug)]
 struct VersionAction {
     /// The version to tag
     target_version: Version,
@@ -72,53 +73,89 @@ struct VersionAction {
     is_initial_tag: bool,
 }
 
+/// The default "untouched" version in Cargo.toml
+const DEFAULT_UNTOUCHED_VERSION: Version = Version::new(0, 1, 0);
+
 /// Determine what version action to take
 fn determine_version_action(dir: &Path, cargo_path: &Path, bump_type: BumpType) -> Result<VersionAction> {
-    // First try to read from Cargo.toml
-    if let Some(cargo_version) = cargo::read_version(cargo_path)? {
-        let parsed = version::parse_version(&cargo_version)?;
-        let tag = version::format_tag(&parsed);
+    // Get version from Cargo.toml (if it exists)
+    let cargo_version = cargo::read_version(cargo_path)?.and_then(|v| version::parse_version(&v).ok());
 
-        if !git::tag_exists(dir, &tag)? {
-            // Tag doesn't exist for current Cargo.toml version
-            // This is initial tagging - create tag for current version, no bump needed
-            info!("Tag {} does not exist. Creating initial tag for current version.", tag);
-            return Ok(VersionAction {
-                target_version: parsed,
-                needs_cargo_update: false,
-                is_initial_tag: true,
-            });
+    // Get latest git tag (if any exist)
+    let latest_tag_version = git::get_latest_tag(dir)?.and_then(|t| version::parse_version(&t).ok());
+
+    // Determine the base version to bump from
+    match (&cargo_version, &latest_tag_version) {
+        // Case: Both Cargo.toml and git tags exist
+        (Some(cargo), Some(tag)) => {
+            if *cargo == DEFAULT_UNTOUCHED_VERSION {
+                // Cargo.toml is at default 0.1.0 (untouched) - defer to git tag
+                info!(
+                    "Cargo.toml is at default 0.1.0, using git tag {} as base.",
+                    version::format_tag(tag)
+                );
+                let bumped = version::bump_version(tag, bump_type);
+                Ok(VersionAction {
+                    target_version: bumped,
+                    needs_cargo_update: true,
+                    is_initial_tag: false,
+                })
+            } else if cargo == tag {
+                // Cargo.toml matches latest tag - bump from it
+                info!("Cargo.toml matches latest tag {}. Bumping.", version::format_tag(cargo));
+                let bumped = version::bump_version(cargo, bump_type);
+                Ok(VersionAction {
+                    target_version: bumped,
+                    needs_cargo_update: true,
+                    is_initial_tag: false,
+                })
+            } else {
+                // Cargo.toml is NOT 0.1.0 and doesn't match latest tag - ERROR
+                bail!(
+                    "Version mismatch: Cargo.toml has {} but latest git tag is {}. \
+                    Please sync them manually before running bump.",
+                    version::format_cargo_version(cargo),
+                    version::format_tag(tag)
+                );
+            }
         }
 
-        // Tag exists - need to bump from current version
-        info!("Tag {} exists. Bumping version.", tag);
-        let bumped = version::bump_version(&parsed, bump_type);
-        return Ok(VersionAction {
-            target_version: bumped,
-            needs_cargo_update: true,
-            is_initial_tag: false,
-        });
-    }
+        // Case: Cargo.toml exists, no git tags
+        (Some(cargo), None) => {
+            let cargo_tag = version::format_tag(cargo);
+            // No tags exist - create initial tag for Cargo.toml version
+            info!("No git tags found. Creating initial tag {} from Cargo.toml.", cargo_tag);
+            Ok(VersionAction {
+                target_version: cargo.clone(),
+                needs_cargo_update: false,
+                is_initial_tag: true,
+            })
+        }
 
-    // No version in Cargo.toml, check git tags
-    if let Some(tag) = git::get_latest_tag(dir)? {
-        info!("No version in Cargo.toml. Using latest git tag: {}", tag);
-        let parsed = version::parse_version(&tag)?;
-        let bumped = version::bump_version(&parsed, bump_type);
-        return Ok(VersionAction {
-            target_version: bumped,
-            needs_cargo_update: true,
-            is_initial_tag: false,
-        });
-    }
+        // Case: No Cargo.toml version, but git tags exist
+        (None, Some(tag)) => {
+            info!(
+                "No version in Cargo.toml. Using git tag {} as base.",
+                version::format_tag(tag)
+            );
+            let bumped = version::bump_version(tag, bump_type);
+            Ok(VersionAction {
+                target_version: bumped,
+                needs_cargo_update: true,
+                is_initial_tag: false,
+            })
+        }
 
-    // No version anywhere - start at 0.1.0 as initial tag
-    info!("No version found anywhere. Starting at 0.1.0");
-    Ok(VersionAction {
-        target_version: Version::new(0, 1, 0),
-        needs_cargo_update: true,
-        is_initial_tag: true,
-    })
+        // Case: No version anywhere
+        (None, None) => {
+            info!("No version found anywhere. Starting at 0.1.0");
+            Ok(VersionAction {
+                target_version: Version::new(0, 1, 0),
+                needs_cargo_update: true,
+                is_initial_tag: true,
+            })
+        }
+    }
 }
 
 /// Process a single directory
@@ -277,4 +314,495 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// =============================================================================
+/// TEST MODULE FOR BUMP VERSION LOGIC
+/// =============================================================================
+///
+/// THE RULES (EXACTLY AS SPECIFIED):
+///
+/// 1. `0.1.0` is the SPECIAL "UNTOUCHED DEFAULT" version.
+///    - If Cargo.toml = 0.1.0 and git tags exist → DEFER TO GIT TAG
+///    - If Cargo.toml = 0.1.0 and no git tags → Create initial tag v0.1.0
+///
+/// 2. ANY OTHER VERSION in Cargo.toml means "ACTIVELY MANAGED"
+///    - If Cargo.toml != 0.1.0 and latest tag MATCHES → Bump from that version
+///    - If Cargo.toml != 0.1.0 and latest tag DOES NOT MATCH → **ERROR**
+///    - If Cargo.toml != 0.1.0 and no tags exist → Create initial tag
+///
+/// 3. If Cargo.toml has NO version field:
+///    - If git tags exist → Bump from latest tag
+///    - If no git tags → Start at 0.1.0
+///
+/// =============================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    // =========================================================================
+    // TEST HELPERS
+    // =========================================================================
+
+    fn setup_git_repo(dir: &Path) {
+        Command::new("git")
+            .args(["init"])
+            .current_dir(dir)
+            .output()
+            .expect("Failed to init git repo");
+
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(dir)
+            .output()
+            .expect("Failed to set git email");
+
+        Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(dir)
+            .output()
+            .expect("Failed to set git name");
+    }
+
+    fn create_initial_commit(dir: &Path) {
+        fs::write(dir.join("README.md"), "# Test").unwrap();
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(dir)
+            .output()
+            .expect("Failed to add files");
+
+        Command::new("git")
+            .args(["commit", "-m", "Initial commit"])
+            .current_dir(dir)
+            .output()
+            .expect("Failed to commit");
+    }
+
+    fn create_git_tag(dir: &Path, tag: &str) {
+        Command::new("git")
+            .args(["tag", "-a", tag, "-m", tag])
+            .current_dir(dir)
+            .output()
+            .expect("Failed to create tag");
+    }
+
+    fn create_cargo_toml(dir: &Path, version: Option<&str>) {
+        let content = match version {
+            Some(v) => format!(
+                r#"[package]
+name = "test-pkg"
+version = "{}"
+"#,
+                v
+            ),
+            None => r#"[package]
+name = "test-pkg"
+"#
+            .to_string(),
+        };
+        fs::write(dir.join("Cargo.toml"), content).unwrap();
+    }
+
+    // =========================================================================
+    // RULE 1: Cargo.toml = 0.1.0 (UNTOUCHED DEFAULT)
+    // =========================================================================
+
+    /// RULE 1a: Cargo.toml=0.1.0, NO git tags
+    /// → Create initial tag v0.1.0, do NOT update Cargo.toml
+    #[test]
+    fn rule_1a_cargo_at_default_no_tags_creates_initial_tag() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        setup_git_repo(dir);
+        create_cargo_toml(dir, Some("0.1.0")); // DEFAULT UNTOUCHED
+        create_initial_commit(dir);
+        // NO TAGS
+
+        let cargo_path = dir.join("Cargo.toml");
+        let action = determine_version_action(dir, &cargo_path, BumpType::Patch).unwrap();
+
+        // MUST create tag v0.1.0
+        assert_eq!(action.target_version, Version::new(0, 1, 0), "MUST create tag v0.1.0");
+        // MUST NOT update Cargo.toml (it's already at 0.1.0)
+        assert!(
+            !action.needs_cargo_update,
+            "MUST NOT update Cargo.toml - already at 0.1.0"
+        );
+        // MUST be initial tag
+        assert!(action.is_initial_tag, "MUST be initial tag");
+    }
+
+    /// RULE 1b: Cargo.toml=0.1.0, tag v0.1.0 exists
+    /// → Bump to v0.1.1, update Cargo.toml
+    #[test]
+    fn rule_1b_cargo_at_default_tag_matches_bumps() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        setup_git_repo(dir);
+        create_cargo_toml(dir, Some("0.1.0")); // DEFAULT
+        create_initial_commit(dir);
+        create_git_tag(dir, "v0.1.0"); // TAG MATCHES DEFAULT
+
+        let cargo_path = dir.join("Cargo.toml");
+        let action = determine_version_action(dir, &cargo_path, BumpType::Patch).unwrap();
+
+        // MUST bump to v0.1.1
+        assert_eq!(
+            action.target_version,
+            Version::new(0, 1, 1),
+            "MUST bump from v0.1.0 to v0.1.1"
+        );
+        // MUST update Cargo.toml
+        assert!(action.needs_cargo_update, "MUST update Cargo.toml to 0.1.1");
+        // MUST NOT be initial tag
+        assert!(!action.is_initial_tag, "MUST NOT be initial tag - this is a bump");
+    }
+
+    /// RULE 1c: Cargo.toml=0.1.0 (untouched), tag v0.1.28 exists (higher)
+    /// → DEFER TO GIT TAG: Bump from v0.1.28 to v0.1.29, update Cargo.toml
+    #[test]
+    fn rule_1c_cargo_at_default_tag_higher_defers_to_tag() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        setup_git_repo(dir);
+        create_cargo_toml(dir, Some("0.1.0")); // DEFAULT UNTOUCHED
+        create_initial_commit(dir);
+        create_git_tag(dir, "v0.1.28"); // TAG IS HIGHER
+
+        let cargo_path = dir.join("Cargo.toml");
+        let action = determine_version_action(dir, &cargo_path, BumpType::Patch).unwrap();
+
+        // MUST bump from tag v0.1.28 to v0.1.29
+        assert_eq!(
+            action.target_version,
+            Version::new(0, 1, 29),
+            "MUST bump from git tag v0.1.28 to v0.1.29 (Cargo.toml=0.1.0 is untouched default)"
+        );
+        // MUST update Cargo.toml to 0.1.29
+        assert!(action.needs_cargo_update, "MUST update Cargo.toml from 0.1.0 to 0.1.29");
+        // MUST NOT be initial tag
+        assert!(!action.is_initial_tag, "MUST NOT be initial tag - this is a bump");
+    }
+
+    /// RULE 1d: Same as 1c but with minor bump
+    /// → Bump from v0.1.28 to v0.2.0
+    #[test]
+    fn rule_1d_cargo_at_default_tag_higher_minor_bump() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        setup_git_repo(dir);
+        create_cargo_toml(dir, Some("0.1.0")); // DEFAULT UNTOUCHED
+        create_initial_commit(dir);
+        create_git_tag(dir, "v0.1.28"); // TAG IS HIGHER
+
+        let cargo_path = dir.join("Cargo.toml");
+        let action = determine_version_action(dir, &cargo_path, BumpType::Minor).unwrap();
+
+        // MUST minor bump from tag v0.1.28 to v0.2.0
+        assert_eq!(
+            action.target_version,
+            Version::new(0, 2, 0),
+            "MUST minor bump from git tag v0.1.28 to v0.2.0"
+        );
+        assert!(action.needs_cargo_update);
+        assert!(!action.is_initial_tag);
+    }
+
+    // =========================================================================
+    // RULE 2: Cargo.toml != 0.1.0 (ACTIVELY MANAGED)
+    // =========================================================================
+
+    /// RULE 2a: Cargo.toml=0.2.0 (managed), tag v0.1.28 (MISMATCH)
+    /// → **ERROR**: Version mismatch
+    #[test]
+    fn rule_2a_cargo_managed_tag_mismatch_is_error() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        setup_git_repo(dir);
+        create_cargo_toml(dir, Some("0.2.0")); // ACTIVELY MANAGED (not 0.1.0)
+        create_initial_commit(dir);
+        create_git_tag(dir, "v0.1.28"); // DOES NOT MATCH
+
+        let cargo_path = dir.join("Cargo.toml");
+        let result = determine_version_action(dir, &cargo_path, BumpType::Patch);
+
+        // MUST ERROR
+        assert!(
+            result.is_err(),
+            "MUST ERROR: Cargo.toml=0.2.0 does not match latest tag v0.1.28"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("mismatch") || err.contains("Mismatch"),
+            "Error MUST mention version mismatch. Got: {}",
+            err
+        );
+    }
+
+    /// RULE 2b: Cargo.toml=0.1.5 (managed), tag v0.1.28 (MISMATCH - tag higher)
+    /// → **ERROR**: Version mismatch
+    #[test]
+    fn rule_2b_cargo_managed_lower_than_tag_is_error() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        setup_git_repo(dir);
+        create_cargo_toml(dir, Some("0.1.5")); // ACTIVELY MANAGED (not 0.1.0)
+        create_initial_commit(dir);
+        create_git_tag(dir, "v0.1.28"); // DOES NOT MATCH (higher)
+
+        let cargo_path = dir.join("Cargo.toml");
+        let result = determine_version_action(dir, &cargo_path, BumpType::Patch);
+
+        // MUST ERROR
+        assert!(
+            result.is_err(),
+            "MUST ERROR: Cargo.toml=0.1.5 does not match latest tag v0.1.28"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("mismatch") || err.contains("Mismatch"),
+            "Error MUST mention version mismatch. Got: {}",
+            err
+        );
+    }
+
+    /// RULE 2c: Cargo.toml=0.2.0 (managed), tag v0.2.0 (MATCHES)
+    /// → Bump to v0.2.1, update Cargo.toml
+    #[test]
+    fn rule_2c_cargo_managed_tag_matches_bumps() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        setup_git_repo(dir);
+        create_cargo_toml(dir, Some("0.2.0")); // ACTIVELY MANAGED
+        create_initial_commit(dir);
+        create_git_tag(dir, "v0.2.0"); // MATCHES
+
+        let cargo_path = dir.join("Cargo.toml");
+        let action = determine_version_action(dir, &cargo_path, BumpType::Patch).unwrap();
+
+        // MUST bump to v0.2.1
+        assert_eq!(
+            action.target_version,
+            Version::new(0, 2, 1),
+            "MUST bump from v0.2.0 to v0.2.1"
+        );
+        assert!(action.needs_cargo_update, "MUST update Cargo.toml");
+        assert!(!action.is_initial_tag);
+    }
+
+    /// RULE 2d: Cargo.toml=0.1.5 (managed), tag v0.1.5 (MATCHES)
+    /// → Bump to v0.1.6, update Cargo.toml
+    #[test]
+    fn rule_2d_cargo_managed_tag_matches_bumps() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        setup_git_repo(dir);
+        create_cargo_toml(dir, Some("0.1.5")); // ACTIVELY MANAGED (not 0.1.0!)
+        create_initial_commit(dir);
+        create_git_tag(dir, "v0.1.5"); // MATCHES
+
+        let cargo_path = dir.join("Cargo.toml");
+        let action = determine_version_action(dir, &cargo_path, BumpType::Patch).unwrap();
+
+        // MUST bump to v0.1.6
+        assert_eq!(
+            action.target_version,
+            Version::new(0, 1, 6),
+            "MUST bump from v0.1.5 to v0.1.6"
+        );
+        assert!(action.needs_cargo_update, "MUST update Cargo.toml");
+        assert!(!action.is_initial_tag);
+    }
+
+    /// RULE 2e: Cargo.toml=0.2.0 (managed), NO tags
+    /// → Create initial tag v0.2.0, do NOT update Cargo.toml
+    #[test]
+    fn rule_2e_cargo_managed_no_tags_creates_initial_tag() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        setup_git_repo(dir);
+        create_cargo_toml(dir, Some("0.2.0")); // ACTIVELY MANAGED
+        create_initial_commit(dir);
+        // NO TAGS
+
+        let cargo_path = dir.join("Cargo.toml");
+        let action = determine_version_action(dir, &cargo_path, BumpType::Patch).unwrap();
+
+        // MUST create tag v0.2.0
+        assert_eq!(
+            action.target_version,
+            Version::new(0, 2, 0),
+            "MUST create initial tag v0.2.0"
+        );
+        // MUST NOT update Cargo.toml (it's already at 0.2.0)
+        assert!(
+            !action.needs_cargo_update,
+            "MUST NOT update Cargo.toml - already at 0.2.0"
+        );
+        // MUST be initial tag
+        assert!(action.is_initial_tag, "MUST be initial tag");
+    }
+
+    /// RULE 2f: Cargo.toml=0.1.5 (managed), tag v0.1.5, minor bump
+    /// → Bump to v0.2.0
+    #[test]
+    fn rule_2f_cargo_managed_minor_bump() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        setup_git_repo(dir);
+        create_cargo_toml(dir, Some("0.1.5")); // ACTIVELY MANAGED
+        create_initial_commit(dir);
+        create_git_tag(dir, "v0.1.5"); // MATCHES
+
+        let cargo_path = dir.join("Cargo.toml");
+        let action = determine_version_action(dir, &cargo_path, BumpType::Minor).unwrap();
+
+        // MUST bump to v0.2.0
+        assert_eq!(
+            action.target_version,
+            Version::new(0, 2, 0),
+            "MUST minor bump from v0.1.5 to v0.2.0"
+        );
+        assert!(action.needs_cargo_update);
+        assert!(!action.is_initial_tag);
+    }
+
+    /// RULE 2g: Cargo.toml=0.1.5 (managed), tag v0.1.5, major bump
+    /// → Bump to v1.0.0
+    #[test]
+    fn rule_2g_cargo_managed_major_bump() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        setup_git_repo(dir);
+        create_cargo_toml(dir, Some("0.1.5")); // ACTIVELY MANAGED
+        create_initial_commit(dir);
+        create_git_tag(dir, "v0.1.5"); // MATCHES
+
+        let cargo_path = dir.join("Cargo.toml");
+        let action = determine_version_action(dir, &cargo_path, BumpType::Major).unwrap();
+
+        // MUST bump to v1.0.0
+        assert_eq!(
+            action.target_version,
+            Version::new(1, 0, 0),
+            "MUST major bump from v0.1.5 to v1.0.0"
+        );
+        assert!(action.needs_cargo_update);
+        assert!(!action.is_initial_tag);
+    }
+
+    // =========================================================================
+    // RULE 3: Cargo.toml has NO version field
+    // =========================================================================
+
+    /// RULE 3a: NO version in Cargo.toml, tag v0.1.5 exists
+    /// → Bump from tag to v0.1.6, update Cargo.toml
+    #[test]
+    fn rule_3a_no_cargo_version_tag_exists_bumps_from_tag() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        setup_git_repo(dir);
+        create_cargo_toml(dir, None); // NO VERSION FIELD
+        create_initial_commit(dir);
+        create_git_tag(dir, "v0.1.5");
+
+        let cargo_path = dir.join("Cargo.toml");
+        let action = determine_version_action(dir, &cargo_path, BumpType::Patch).unwrap();
+
+        // MUST bump from tag v0.1.5 to v0.1.6
+        assert_eq!(
+            action.target_version,
+            Version::new(0, 1, 6),
+            "MUST bump from git tag v0.1.5 to v0.1.6"
+        );
+        // MUST update Cargo.toml (it has no version)
+        assert!(action.needs_cargo_update, "MUST update Cargo.toml to 0.1.6");
+        assert!(!action.is_initial_tag);
+    }
+
+    /// RULE 3b: NO version in Cargo.toml, NO tags
+    /// → Start at v0.1.0, update Cargo.toml, create initial tag
+    #[test]
+    fn rule_3b_no_cargo_version_no_tags_starts_at_0_1_0() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        setup_git_repo(dir);
+        create_cargo_toml(dir, None); // NO VERSION FIELD
+        create_initial_commit(dir);
+        // NO TAGS
+
+        let cargo_path = dir.join("Cargo.toml");
+        let action = determine_version_action(dir, &cargo_path, BumpType::Patch).unwrap();
+
+        // MUST start at v0.1.0
+        assert_eq!(action.target_version, Version::new(0, 1, 0), "MUST start at v0.1.0");
+        // MUST update Cargo.toml (it has no version)
+        assert!(action.needs_cargo_update, "MUST update Cargo.toml to 0.1.0");
+        // MUST be initial tag
+        assert!(action.is_initial_tag, "MUST be initial tag");
+    }
+
+    // =========================================================================
+    // EDGE CASES: Cargo.toml higher than tag but tag doesn't match
+    // =========================================================================
+
+    /// EDGE CASE: Cargo.toml=0.3.0, tag v0.1.28 exists
+    /// → **ERROR**: Mismatch (Cargo.toml is managed, doesn't match tag)
+    #[test]
+    fn edge_cargo_higher_than_tag_mismatch_is_error() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        setup_git_repo(dir);
+        create_cargo_toml(dir, Some("0.3.0")); // MANAGED, HIGHER THAN TAG
+        create_initial_commit(dir);
+        create_git_tag(dir, "v0.1.28"); // LOWER, DOES NOT MATCH
+
+        let cargo_path = dir.join("Cargo.toml");
+        let result = determine_version_action(dir, &cargo_path, BumpType::Patch);
+
+        // MUST ERROR - this is a mismatch situation
+        assert!(
+            result.is_err(),
+            "MUST ERROR: Cargo.toml=0.3.0 does not match latest tag v0.1.28"
+        );
+    }
+
+    /// EDGE CASE: Cargo.toml=1.0.0, tag v0.9.0 exists
+    /// → **ERROR**: Mismatch
+    #[test]
+    fn edge_cargo_1_0_0_tag_0_9_0_mismatch_is_error() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        setup_git_repo(dir);
+        create_cargo_toml(dir, Some("1.0.0")); // MANAGED
+        create_initial_commit(dir);
+        create_git_tag(dir, "v0.9.0"); // DOES NOT MATCH
+
+        let cargo_path = dir.join("Cargo.toml");
+        let result = determine_version_action(dir, &cargo_path, BumpType::Patch);
+
+        // MUST ERROR
+        assert!(
+            result.is_err(),
+            "MUST ERROR: Cargo.toml=1.0.0 does not match latest tag v0.9.0"
+        );
+    }
 }
