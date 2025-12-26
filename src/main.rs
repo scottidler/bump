@@ -175,6 +175,9 @@ fn process_directory(dir: &Path, bump_type: BumpType, dry_run: bool) -> Result<(
     if action.needs_cargo_update {
         cargo::write_version(&cargo_path, &new_cargo_version)?;
         info!("Updated Cargo.toml to version {}", new_cargo_version);
+
+        // 7b. Sync Cargo.lock if it exists
+        cargo::sync_lockfile(dir)?;
     }
 
     // 8. Stage all changes

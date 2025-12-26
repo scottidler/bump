@@ -1,4 +1,4 @@
-use eyre::{Context, Result, bail};
+use eyre::{Context, ContextCompat, Result, bail};
 use std::fs;
 use std::path::Path;
 use toml_edit::{DocumentMut, Item, Value};
@@ -89,6 +89,43 @@ pub fn write_version(cargo_toml_path: &Path, new_version: &str) -> Result<()> {
     }
 
     fs::write(cargo_toml_path, doc.to_string()).context(format!("Failed to write {}", cargo_toml_path.display()))?;
+
+    Ok(())
+}
+
+/// Sync Cargo.lock with Cargo.toml by running cargo update
+/// Only runs if Cargo.lock exists (to avoid creating one in library-only projects)
+pub fn sync_lockfile(dir: &Path) -> Result<()> {
+    let lockfile = dir.join("Cargo.lock");
+    if !lockfile.exists() {
+        return Ok(());
+    }
+
+    // Read the package name from Cargo.toml
+    let cargo_toml = dir.join("Cargo.toml");
+    let content = fs::read_to_string(&cargo_toml)
+        .context(format!("Failed to read {}", cargo_toml.display()))?;
+    let doc = content.parse::<DocumentMut>().context("Failed to parse Cargo.toml")?;
+
+    let package_name = doc
+        .get("package")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())
+        .context("Failed to get package name from Cargo.toml")?;
+
+    // Run cargo update -p <package> to sync just this package in the lock file
+    let output = std::process::Command::new("cargo")
+        .args(["update", "-p", package_name])
+        .current_dir(dir)
+        .output()
+        .context("Failed to run cargo update")?;
+
+    if !output.status.success() {
+        bail!(
+            "cargo update failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     Ok(())
 }
