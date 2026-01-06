@@ -47,6 +47,11 @@ fn read_workspace_version(doc: &DocumentMut) -> Result<Option<String>> {
     Ok(None)
 }
 
+/// Check if this is a workspace-only manifest (has [workspace] but no [package])
+fn is_workspace_only(doc: &DocumentMut) -> bool {
+    doc.get("workspace").is_some() && doc.get("package").is_none()
+}
+
 /// Update the version in Cargo.toml
 /// Creates the version field if it doesn't exist
 pub fn write_version(cargo_toml_path: &Path, new_version: &str) -> Result<()> {
@@ -54,6 +59,30 @@ pub fn write_version(cargo_toml_path: &Path, new_version: &str) -> Result<()> {
         fs::read_to_string(cargo_toml_path).context(format!("Failed to read {}", cargo_toml_path.display()))?;
 
     let mut doc = content.parse::<DocumentMut>().context("Failed to parse Cargo.toml")?;
+
+    // Check if this is a workspace-only manifest (no [package] section)
+    if is_workspace_only(&doc) {
+        // Update or create [workspace.package].version
+        let workspace = doc.get_mut("workspace").context("[workspace] section not found")?;
+
+        if let Item::Table(ws_table) = workspace {
+            let package = ws_table
+                .entry("package")
+                .or_insert(Item::Table(toml_edit::Table::new()));
+
+            if let Item::Table(pkg_table) = package {
+                pkg_table["version"] = Item::Value(Value::from(new_version));
+            } else {
+                bail!("[workspace.package] is not a table");
+            }
+        } else {
+            bail!("[workspace] is not a table");
+        }
+
+        fs::write(cargo_toml_path, doc.to_string())
+            .context(format!("Failed to write {}", cargo_toml_path.display()))?;
+        return Ok(());
+    }
 
     // Check if this is a workspace member with version.workspace = true
     let uses_workspace_version = doc
@@ -101,11 +130,31 @@ pub fn sync_lockfile(dir: &Path) -> Result<()> {
         return Ok(());
     }
 
-    // Read the package name from Cargo.toml
+    // Read Cargo.toml to determine if this is a workspace or a package
     let cargo_toml = dir.join("Cargo.toml");
     let content = fs::read_to_string(&cargo_toml).context(format!("Failed to read {}", cargo_toml.display()))?;
     let doc = content.parse::<DocumentMut>().context("Failed to parse Cargo.toml")?;
 
+    // Check if this is a workspace-only manifest
+    if is_workspace_only(&doc) {
+        // For workspaces, just run cargo update to sync all workspace members
+        let output = std::process::Command::new("cargo")
+            .args(["update", "--workspace"])
+            .current_dir(dir)
+            .output()
+            .context("Failed to run cargo update")?;
+
+        if !output.status.success() {
+            bail!(
+                "cargo update --workspace failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        return Ok(());
+    }
+
+    // For regular packages, get the package name
     let package_name = doc
         .get("package")
         .and_then(|p| p.get("name"))
@@ -240,5 +289,100 @@ name = "test"
 
         create_cargo_toml(dir.path(), "[package]\nname = \"test\"");
         assert!(cargo_toml_exists(dir.path()));
+    }
+
+    #[test]
+    fn test_read_version_workspace_only() {
+        let dir = TempDir::new().unwrap();
+        let path = create_cargo_toml(
+            dir.path(),
+            r#"
+[workspace]
+members = ["crate-a", "crate-b"]
+
+[workspace.package]
+version = "3.0.0"
+
+[workspace.dependencies]
+serde = "1.0"
+"#,
+        );
+
+        let version = read_version(&path).unwrap();
+        assert_eq!(version, Some("3.0.0".to_string()));
+    }
+
+    #[test]
+    fn test_read_version_workspace_only_no_version() {
+        let dir = TempDir::new().unwrap();
+        let path = create_cargo_toml(
+            dir.path(),
+            r#"
+[workspace]
+members = ["crate-a", "crate-b"]
+
+[workspace.dependencies]
+serde = "1.0"
+"#,
+        );
+
+        let version = read_version(&path).unwrap();
+        assert_eq!(version, None);
+    }
+
+    #[test]
+    fn test_write_version_workspace_only_creates_workspace_package() {
+        let dir = TempDir::new().unwrap();
+        let path = create_cargo_toml(
+            dir.path(),
+            r#"
+[workspace]
+members = ["crate-a", "crate-b"]
+
+[workspace.dependencies]
+serde = "1.0"
+"#,
+        );
+
+        write_version(&path, "0.2.0").unwrap();
+
+        let version = read_version(&path).unwrap();
+        assert_eq!(version, Some("0.2.0".to_string()));
+
+        // Verify that no [package] section was created
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(!content.contains("[package]"), "Should not create [package] section");
+        assert!(
+            content.contains("[workspace.package]"),
+            "Should create [workspace.package] section"
+        );
+    }
+
+    #[test]
+    fn test_write_version_workspace_only_updates_existing() {
+        let dir = TempDir::new().unwrap();
+        let path = create_cargo_toml(
+            dir.path(),
+            r#"
+[workspace]
+members = ["crate-a", "crate-b"]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+
+[workspace.dependencies]
+serde = "1.0"
+"#,
+        );
+
+        write_version(&path, "1.1.0").unwrap();
+
+        let version = read_version(&path).unwrap();
+        assert_eq!(version, Some("1.1.0".to_string()));
+
+        // Verify the content still has no [package] section
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(!content.contains("\n[package]"), "Should not create [package] section");
     }
 }
