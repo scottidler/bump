@@ -25,6 +25,14 @@ pub struct Cli {
     #[arg(short = 'n', long)]
     pub dry_run: bool,
 
+    /// Commit message to use
+    #[arg(long, conflicts_with = "automatic")]
+    pub message: Option<String>,
+
+    /// Generate automatic commit message
+    #[arg(short = 'a', long, conflicts_with = "message")]
+    pub automatic: bool,
+
     /// Paths to git repository roots
     #[arg(value_name = "DIRECTORIES")]
     pub directories: Vec<PathBuf>,
@@ -158,6 +166,32 @@ mod tests {
     #[test]
     fn test_cli_major_minor_conflict() {
         let result = Cli::try_parse_from(["bump", "--major", "--minor"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_cli_message_flag() {
+        let cli = Cli::try_parse_from(["bump", "--message", "my commit message"]).unwrap();
+        assert_eq!(cli.message, Some("my commit message".to_string()));
+        assert!(!cli.automatic);
+    }
+
+    #[test]
+    fn test_cli_automatic_flag() {
+        let cli = Cli::try_parse_from(["bump", "-a"]).unwrap();
+        assert!(cli.automatic);
+        assert!(cli.message.is_none());
+    }
+
+    #[test]
+    fn test_cli_automatic_long_flag() {
+        let cli = Cli::try_parse_from(["bump", "--automatic"]).unwrap();
+        assert!(cli.automatic);
+    }
+
+    #[test]
+    fn test_cli_message_automatic_conflict() {
+        let result = Cli::try_parse_from(["bump", "--message", "test", "--automatic"]);
         assert!(result.is_err());
     }
 }

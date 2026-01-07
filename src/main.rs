@@ -4,8 +4,9 @@ use log::info;
 use semver::Version;
 use std::env;
 use std::fs;
-use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use tempfile::NamedTempFile;
 
 mod cargo;
 mod cli;
@@ -41,24 +42,61 @@ fn setup_logging() -> Result<()> {
     Ok(())
 }
 
-/// Prompt user for commit message
-fn prompt_commit_message(staged_files: &[String]) -> Result<String> {
-    println!("\nStaged changes:");
-    for file in staged_files {
-        println!("  {}", file);
+/// Prompt user for commit message using an editor (like git does)
+fn prompt_commit_message_with_editor(staged_files: &[String]) -> Result<String> {
+    // Create temp file with template
+    let temp_file = NamedTempFile::new().context("Failed to create temp file for commit message")?;
+
+    let staged_list = staged_files
+        .iter()
+        .map(|f| format!("#   {}", f))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let template = format!(
+        "\n\
+# Enter commit message above.\n\
+# Lines starting with '#' will be ignored.\n\
+#\n\
+# Staged changes:\n\
+{}\n\
+#\n\
+# An empty message aborts the commit.\n",
+        staged_list
+    );
+
+    fs::write(temp_file.path(), &template).context("Failed to write commit message template")?;
+
+    // Determine editor: $VISUAL -> $EDITOR -> vim
+    let editor = env::var("VISUAL")
+        .or_else(|_| env::var("EDITOR"))
+        .unwrap_or_else(|_| "vim".to_string());
+
+    // Open editor
+    let status = Command::new(&editor)
+        .arg(temp_file.path())
+        .status()
+        .with_context(|| format!("Failed to open editor: {}", editor))?;
+
+    if !status.success() {
+        bail!("Editor exited with error");
     }
-    println!();
 
-    print!("Enter commit message: ");
-    io::stdout().flush()?;
+    // Read and process result
+    let content = fs::read_to_string(temp_file.path()).context("Failed to read commit message")?;
 
-    let mut message = String::new();
-    io::stdin().read_line(&mut message)?;
+    let message: String = content
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string();
 
-    let message = message.trim().to_string();
     if message.is_empty() {
-        bail!("Commit message cannot be empty");
+        bail!("Aborting commit due to empty commit message");
     }
+
     Ok(message)
 }
 
@@ -158,8 +196,43 @@ fn determine_version_action(dir: &Path, cargo_path: &Path, bump_type: BumpType) 
     }
 }
 
+/// Determine the commit message based on CLI flags and context
+fn determine_commit_message(
+    cli: &Cli,
+    new_tag: &str,
+    staged_files: &[String],
+    is_initial_tag: bool,
+) -> Result<String> {
+    // Priority 1: User provided --message
+    if let Some(ref msg) = cli.message {
+        return Ok(msg.clone());
+    }
+
+    // Priority 2: User requested --automatic
+    if cli.automatic {
+        return Ok(format!("Bump version to {}", new_tag));
+    }
+
+    // Priority 3: Auto-generate for version-only changes
+    if staged_files.is_empty() {
+        return Ok(format!("Release {}", new_tag));
+    }
+
+    let only_cargo_files = staged_files.iter().all(|f| f == "Cargo.toml" || f == "Cargo.lock");
+    if only_cargo_files {
+        if is_initial_tag {
+            return Ok(format!("Release {}", new_tag));
+        } else {
+            return Ok(format!("Bump version to {}", new_tag));
+        }
+    }
+
+    // Priority 4: Open editor for complex changes
+    prompt_commit_message_with_editor(staged_files)
+}
+
 /// Process a single directory
-fn process_directory(dir: &Path, bump_type: BumpType, dry_run: bool) -> Result<()> {
+fn process_directory(dir: &Path, cli: &Cli, bump_type: BumpType) -> Result<()> {
     let dir_name = dir
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
@@ -199,60 +272,107 @@ fn process_directory(dir: &Path, bump_type: BumpType, dry_run: bool) -> Result<(
         bail!("Tag {} already exists", new_tag);
     }
 
-    // 6. Handle dry-run
-    if dry_run {
+    // 6. Check for uncommitted changes to determine workflow
+    let has_changes = git::has_uncommitted_changes(dir)?;
+
+    // 7. Handle dry-run
+    if cli.dry_run {
         if action.needs_cargo_update {
             println!("[dry-run] Would update: Cargo.toml");
         }
-        println!("[dry-run] Would commit and tag: {}", new_tag);
+        if !has_changes && !git::head_has_tag(dir)? {
+            let is_pushed = git::is_head_pushed(dir)?;
+            if is_pushed {
+                println!("[dry-run] Would create new commit and tag: {}", new_tag);
+            } else {
+                println!("[dry-run] Would amend previous commit and tag: {}", new_tag);
+            }
+        } else {
+            println!("[dry-run] Would commit and tag: {}", new_tag);
+        }
         return Ok(());
     }
 
-    // 7. Update Cargo.toml if needed
-    if action.needs_cargo_update {
-        cargo::write_version(&cargo_path, &new_cargo_version)?;
-        info!("Updated Cargo.toml to version {}", new_cargo_version);
+    // Workflow branches based on whether there are uncommitted changes
+    if has_changes {
+        // ===== STANDARD WORKFLOW: Uncommitted changes exist =====
 
-        // 7b. Sync Cargo.lock if it exists
-        cargo::sync_lockfile(dir)?;
-    }
-
-    // 8. Stage all changes
-    git::stage_all(dir)?;
-
-    // 9. Determine commit message
-    let staged_files = git::get_staged_files(dir)?;
-
-    let commit_message = if staged_files.is_empty() {
-        // No changes staged (initial tag with clean working tree)
-        // We still need to create a tag, but no commit needed
-        // Actually, git tag can be created without a new commit
-        // But for consistency, let's create an empty commit or just tag HEAD
-        format!("Release {}", new_tag)
-    } else {
-        let only_cargo_toml = staged_files.len() == 1 && staged_files[0] == "Cargo.toml";
-        if only_cargo_toml || (action.is_initial_tag && staged_files.is_empty()) {
-            if action.is_initial_tag {
-                format!("Release {}", new_tag)
-            } else {
-                format!("Bump version to {}", new_tag)
-            }
-        } else {
-            prompt_commit_message(&staged_files)?
+        // 8. Update Cargo.toml if needed
+        if action.needs_cargo_update {
+            cargo::write_version(&cargo_path, &new_cargo_version)?;
+            info!("Updated Cargo.toml to version {}", new_cargo_version);
+            cargo::sync_lockfile(dir)?;
         }
-    };
 
-    // 10. Commit (only if there are staged changes)
-    if !staged_files.is_empty() {
-        git::commit(dir, &commit_message)?;
-        info!("Committed with message: {}", commit_message);
+        // 9. Stage all changes
+        git::stage_all(dir)?;
+
+        // 10. Determine commit message
+        let staged_files = git::get_staged_files(dir)?;
+        let commit_message = determine_commit_message(cli, &new_tag, &staged_files, action.is_initial_tag)?;
+
+        // 11. Commit
+        if !staged_files.is_empty() {
+            git::commit(dir, &commit_message)?;
+            info!("Committed with message: {}", commit_message);
+        }
+
+        // 12. Create annotated tag
+        git::create_tag(dir, &new_tag, &commit_message)?;
+        info!("Created tag: {}", new_tag);
+
+        println!("Committed and tagged {}", new_tag);
+    } else {
+        // ===== CLEAN TREE WORKFLOW: No uncommitted changes =====
+
+        // Check if HEAD already has a tag
+        if git::head_has_tag(dir)? {
+            bail!("HEAD already has a tag. Make changes first, then run bump.");
+        }
+
+        // Check if HEAD has been pushed
+        let is_pushed = git::is_head_pushed(dir)?;
+
+        // Update Cargo.toml
+        if action.needs_cargo_update {
+            cargo::write_version(&cargo_path, &new_cargo_version)?;
+            info!("Updated Cargo.toml to version {}", new_cargo_version);
+            cargo::sync_lockfile(dir)?;
+        }
+
+        // Stage the Cargo.toml changes
+        git::stage_all(dir)?;
+        let staged_files = git::get_staged_files(dir)?;
+
+        if is_pushed {
+            // HEAD is pushed - create a new commit
+            let commit_message = determine_commit_message(cli, &new_tag, &staged_files, action.is_initial_tag)?;
+
+            if !staged_files.is_empty() {
+                git::commit(dir, &commit_message)?;
+                info!("Committed with message: {}", commit_message);
+            }
+
+            git::create_tag(dir, &new_tag, &commit_message)?;
+            info!("Created tag: {}", new_tag);
+
+            println!("Committed and tagged {}", new_tag);
+        } else {
+            // HEAD is not pushed - amend the previous commit
+            if !staged_files.is_empty() {
+                git::amend_commit_no_edit(dir)?;
+                info!("Amended previous commit with Cargo.toml changes");
+            }
+
+            // Use automatic message for the tag since we're amending
+            let tag_message = format!("Bump version to {}", new_tag);
+            git::create_tag(dir, &new_tag, &tag_message)?;
+            info!("Created tag: {}", new_tag);
+
+            println!("Amended commit and tagged {}", new_tag);
+        }
     }
 
-    // 11. Create annotated tag
-    git::create_tag(dir, &new_tag, &commit_message)?;
-    info!("Created tag: {}", new_tag);
-
-    println!("Committed and tagged {}", new_tag);
     println!("Run: git push && git push --tags");
 
     if !dir_name.is_empty() && dir != env::current_dir().unwrap_or_default() {
@@ -274,7 +394,7 @@ fn main() -> Result<()> {
     let directories: Vec<PathBuf> = if cli.directories.is_empty() {
         vec![env::current_dir().context("Failed to get current directory")?]
     } else {
-        cli.directories
+        cli.directories.clone()
     };
 
     let mut successes = 0;
@@ -291,7 +411,7 @@ fn main() -> Result<()> {
             println!("\n[{}]", dir_name);
         }
 
-        match process_directory(&dir, bump_type, cli.dry_run) {
+        match process_directory(&dir, &cli, bump_type) {
             Ok(()) => successes += 1,
             Err(e) => {
                 eprintln!("Error: {:#}", e);
