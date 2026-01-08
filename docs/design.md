@@ -19,12 +19,14 @@ Arguments:
                     (default: current working directory)
 
 Options:
-  -M, --major     Bump major version (X.0.0)
-  -m, --minor     Bump minor version (x.Y.0)
-                  (default: bump patch x.y.Z)
-  -n, --dry-run   Preview changes without applying
-  -h, --help      Print help
-  -V, --version   Print version
+  -M, --major       Bump major version (X.0.0)
+  -m, --minor       Bump minor version (x.Y.0)
+                    (default: bump patch x.y.Z)
+  -n, --dry-run     Preview changes without applying
+      --message     Commit message to use
+  -a, --automatic   Generate automatic commit message
+  -h, --help        Print help
+  -V, --version     Print version
 
 REQUIRED TOOLS:
   ✅ git       2.43.0
@@ -124,82 +126,55 @@ This is exposed via `env!("GIT_DESCRIBE")` in the CLI's `#[command(version = ...
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────────┐
-│ 2. DETERMINE CURRENT VERSION                                │
+│ 2. DETERMINE VERSION ACTION                                 │
 ├─────────────────────────────────────────────────────────────┤
 │ • Read version from Cargo.toml                              │
-│ • If version field missing → use latest semver git tag      │
-│ • If Cargo.toml version's tag exists → use latest git tag   │
-│   (indicates Cargo.toml is stale/incorrect)                 │
+│ • Get latest git tag (if any)                               │
+│ • 0.1.0 in Cargo.toml is treated as "untouched default"     │
+│   and defers to git tags if they exist                      │
+│ • Calculate target version based on bump type               │
 └─────────────────────────────────────────────────────────────┘
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────────┐
-│ 3. CALCULATE NEW VERSION                                    │
+│ 3. CHECK FOR UNCOMMITTED CHANGES                            │
 ├─────────────────────────────────────────────────────────────┤
-│ • Apply bump type (major/minor/patch)                       │
-│ • Error if pre-release or build metadata present            │
-│ • Verify new tag doesn't already exist                      │
+│ • git status --porcelain                                    │
+│ • Branch based on result:                                   │
+│   - Has changes → Standard workflow                         │
+│   - Clean tree → Clean tree workflow                        │
 └─────────────────────────────────────────────────────────────┘
                               │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│ 4. UPDATE CARGO.TOML                                        │
-├─────────────────────────────────────────────────────────────┤
-│ • Update [package] version field                            │
-│ • Or update [workspace.package] version if workspace        │
-│ • Add version field if missing                              │
-│ • Preserve file formatting                                  │
-└─────────────────────────────────────────────────────────────┘
-                              │
+              ┌───────────────┴───────────────┐
+              ▼                               ▼
+┌─────────────────────────┐     ┌─────────────────────────────┐
+│ STANDARD WORKFLOW       │     │ CLEAN TREE WORKFLOW         │
+│ (uncommitted changes)   │     │ (already committed)         │
+├─────────────────────────┤     ├─────────────────────────────┤
+│ 4. Update Cargo.toml    │     │ 4. Check if HEAD has tag    │
+│ 5. Sync Cargo.lock      │     │    → Error if already tagged│
+│ 6. git add -A           │     │ 5. Check if HEAD is pushed  │
+│ 7. Determine message:   │     │ 6. Update Cargo.toml        │
+│    --message > -a >     │     │ 7. Sync Cargo.lock          │
+│    auto > editor        │     │ 8. git add -A               │
+│ 8. git commit           │     │                             │
+│ 9. git tag              │     │ If pushed:                  │
+│                         │     │   9. git commit (new)       │
+│                         │     │   10. git tag               │
+│                         │     │                             │
+│                         │     │ If not pushed:              │
+│                         │     │   9. git commit --amend     │
+│                         │     │   10. git tag               │
+└─────────────────────────┘     └─────────────────────────────┘
+              │                               │
+              └───────────────┬───────────────┘
                               ▼
                     ┌─────────────────┐
-                    │   --dry-run?    │
-                    └────────┬────────┘
-                      yes    │    no
-                 ┌───────────┴───────────┐
-                 ▼                       ▼
-        ┌────────────────┐    ┌─────────────────────────────────┐
-        │ Print preview  │    │ 5. STAGE CHANGES                │
-        │ and exit       │    ├─────────────────────────────────┤
-        └────────────────┘    │ • git add -A                    │
-                              └─────────────────────────────────┘
-                                          │
-                                          ▼
-                              ┌─────────────────────────────────┐
-                              │ 6. DETERMINE COMMIT MESSAGE     │
-                              ├─────────────────────────────────┤
-                              │ • Check if only Cargo.toml      │
-                              │   changed (git diff --cached)   │
-                              │                                 │
-                              │ Only Cargo.toml:                │
-                              │   → "Bump version to vX.Y.Z"    │
-                              │                                 │
-                              │ Other changes present:          │
-                              │   → Prompt user for message     │
-                              └─────────────────────────────────┘
-                                          │
-                                          ▼
-                              ┌─────────────────────────────────┐
-                              │ 7. COMMIT                       │
-                              ├─────────────────────────────────┤
-                              │ • git commit -m "<message>"     │
-                              └─────────────────────────────────┘
-                                          │
-                                          ▼
-                              ┌─────────────────────────────────┐
-                              │ 8. TAG                          │
-                              ├─────────────────────────────────┤
-                              │ • git tag -a vX.Y.Z             │
-                              │       -m "<same message>"       │
-                              └─────────────────────────────────┘
-                                          │
-                                          ▼
-                              ┌─────────────────────────────────┐
-                              │ 9. REPORT SUCCESS               │
-                              ├─────────────────────────────────┤
-                              │ • Print new version             │
-                              │ • Remind user to push           │
-                              └─────────────────────────────────┘
+                    │ REPORT SUCCESS  │
+                    ├─────────────────┤
+                    │ Print version   │
+                    │ Remind to push  │
+                    └─────────────────┘
 ```
 
 ### Multiple Directories
@@ -230,12 +205,32 @@ When multiple directory paths are provided:
 
 Default output is concise but informative:
 
+### Standard workflow (uncommitted changes)
 ```
 $ bump
 bump: 0.4.2 → 0.4.3
 Committed and tagged v0.4.3
 Run: git push && git push --tags
+```
 
+### Clean tree workflow (already committed, unpushed)
+```
+$ bump -a
+bump: 0.4.2 → 0.4.3
+Amended commit and tagged v0.4.3
+Run: git push && git push --tags
+```
+
+### Clean tree workflow (already committed and pushed)
+```
+$ bump -a
+bump: 0.4.2 → 0.4.3
+Committed and tagged v0.4.3
+Run: git push && git push --tags
+```
+
+### Multiple directories
+```
 $ bump --major ./proj1 ./proj2
 [proj1] bump: 1.2.3 → 2.0.0
 Committed and tagged v2.0.0
@@ -246,27 +241,15 @@ Committed and tagged v1.0.0
 All done! Don't forget to push your changes.
 ```
 
-With other changes present:
-```
-$ bump
-bump: 0.4.2 → 0.4.3
-
-Staged changes:
-  M src/main.rs
-  A src/new_feature.rs
-
-Enter commit message: Add new feature
-
-Committed and tagged v0.4.3
-Run: git push && git push --tags
-```
-
-Dry run:
+### Dry run
 ```
 $ bump --dry-run
-[dry-run] Would bump: 0.4.2 → 0.4.3
+bump: 0.4.2 → 0.4.3
 [dry-run] Would update: Cargo.toml
 [dry-run] Would commit and tag: v0.4.3
+
+# Or for clean tree (unpushed):
+[dry-run] Would amend previous commit and tag: v0.4.3
 ```
 
 ## Implementation Details
@@ -300,19 +283,17 @@ pub struct Cli {
     #[arg(short = 'n', long)]
     pub dry_run: bool,
 
+    /// Commit message to use
+    #[arg(long, conflicts_with = "automatic")]
+    pub message: Option<String>,
+
+    /// Generate automatic commit message
+    #[arg(short = 'a', long, conflicts_with = "message")]
+    pub automatic: bool,
+
     /// Paths to git repository roots
     #[arg(value_name = "DIRECTORIES")]
     pub directories: Vec<PathBuf>,
-}
-
-/// Generate tool validation help text (called once via LazyLock)
-fn get_tool_validation_help() -> String {
-    let git_status = check_tool_version("git", "--version", "2.20.0");
-    format!(
-        "REQUIRED TOOLS:\n  {} git       {}\n\nLogs are written to: ~/.local/share/bump/logs/bump.log",
-        git_status.icon,
-        git_status.version
-    )
 }
 ```
 
@@ -348,36 +329,31 @@ impl BumpType {
 | Stage all changes | `git add -A` |
 | Get staged files | `git diff --cached --name-only` |
 | Commit | `git commit -m "<message>"` |
+| Amend commit | `git commit --amend --no-edit` |
 | Create annotated tag | `git tag -a <tag> -m "<message>"` |
 | Check for uncommitted changes | `git status --porcelain` |
+| Check if HEAD has tag | `git describe --exact-match HEAD` |
+| Check if HEAD is pushed | `git merge-base --is-ancestor HEAD @{u}` |
 
 ### User Input for Commit Message
 
-When prompting for a commit message (other changes exist beyond Cargo.toml):
+Commit message is determined by priority:
 
-```rust
-use std::io::{self, Write};
+1. `--message <MSG>` - Use provided message directly
+2. `-a` / `--automatic` - Generate "Bump version to vX.Y.Z"
+3. Version-only changes - Auto-generate appropriate message
+4. Other changes - Open editor for user input
 
-fn prompt_commit_message() -> Result<String> {
-    print!("Enter commit message: ");
-    io::stdout().flush()?;
-
-    let mut message = String::new();
-    io::stdin().read_line(&mut message)?;
-
-    let message = message.trim().to_string();
-    if message.is_empty() {
-        eyre::bail!("Commit message cannot be empty");
-    }
-    Ok(message)
-}
-```
+When opening editor:
+- Checks `$VISUAL`, then `$EDITOR`, then falls back to `vim`
+- Creates temp file with template showing staged files
+- Lines starting with `#` are stripped
+- Empty message aborts the operation
 
 ## Future Considerations
 
-Not in scope for initial implementation, but potential future additions:
+Potential future additions:
 
-- `--message` / `-m` flag to provide commit message non-interactively
 - Support for other version files (package.json, pyproject.toml)
 - `--push` flag to automatically push after tagging
 - Config file for per-project defaults
