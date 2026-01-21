@@ -248,6 +248,20 @@ fn process_directory(dir: &Path, cli: &Cli, bump_type: BumpType) -> Result<()> {
         bail!("No Cargo.toml found in: {}", dir.display());
     }
 
+    // 3. Validate - check for workspace members with independent versions
+    let independent_members = cargo::check_workspace_independent_versions(dir)?;
+    if !independent_members.is_empty() {
+        let member_list: Vec<String> = independent_members
+            .iter()
+            .map(|m| format!("  - {} ({}): {}", m.name, m.path, m.version))
+            .collect();
+        bail!(
+            "Workspace members have independent versions (not using version.workspace = true):\n{}\n\n\
+             bump only supports workspaces with a unified version in [workspace.package].",
+            member_list.join("\n")
+        );
+    }
+
     let cargo_path = cargo::cargo_toml_path(dir);
 
     // 3. Determine version action

@@ -180,6 +180,84 @@ pub fn cargo_toml_exists(dir: &Path) -> bool {
     dir.join("Cargo.toml").exists()
 }
 
+/// Represents a workspace member with an independent version
+#[derive(Debug)]
+pub struct IndependentVersionMember {
+    pub name: String,
+    pub path: String,
+    pub version: String,
+}
+
+/// Check if workspace members have independent versions (not using version.workspace = true)
+/// Returns a list of members with independent versions, or empty vec if all use workspace version
+pub fn check_workspace_independent_versions(dir: &Path) -> Result<Vec<IndependentVersionMember>> {
+    let cargo_toml = dir.join("Cargo.toml");
+    let content = fs::read_to_string(&cargo_toml)
+        .context(format!("Failed to read {}", cargo_toml.display()))?;
+    let doc = content.parse::<DocumentMut>().context("Failed to parse Cargo.toml")?;
+
+    // Only check if this is a workspace
+    let workspace = match doc.get("workspace") {
+        Some(ws) => ws,
+        None => return Ok(vec![]), // Not a workspace, nothing to check
+    };
+
+    // Get workspace members
+    let members = match workspace.get("members").and_then(|m| m.as_array()) {
+        Some(arr) => arr,
+        None => return Ok(vec![]), // No members defined
+    };
+
+    let mut independent_versions = Vec::new();
+
+    for member in members.iter() {
+        let member_path = match member.as_str() {
+            Some(p) => p,
+            None => continue,
+        };
+
+        let member_cargo_toml = dir.join(member_path).join("Cargo.toml");
+        if !member_cargo_toml.exists() {
+            continue; // Member might use glob pattern or doesn't exist yet
+        }
+
+        let member_content = fs::read_to_string(&member_cargo_toml)
+            .context(format!("Failed to read {}", member_cargo_toml.display()))?;
+        let member_doc = member_content
+            .parse::<DocumentMut>()
+            .context(format!("Failed to parse {}", member_cargo_toml.display()))?;
+
+        // Check if this member has an independent version
+        if let Some(package) = member_doc.get("package") {
+            if let Some(version) = package.get("version") {
+                // Check if it's NOT using workspace = true
+                let uses_workspace = version
+                    .as_inline_table()
+                    .is_some_and(|t| t.get("workspace").is_some_and(|w| w.as_bool() == Some(true)));
+
+                if !uses_workspace {
+                    // This member has an independent version
+                    if let Some(v) = version.as_str() {
+                        let name = package
+                            .get("name")
+                            .and_then(|n| n.as_str())
+                            .unwrap_or(member_path)
+                            .to_string();
+
+                        independent_versions.push(IndependentVersionMember {
+                            name,
+                            path: member_path.to_string(),
+                            version: v.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(independent_versions)
+}
+
 /// Get the path to Cargo.toml in the given directory
 pub fn cargo_toml_path(dir: &Path) -> std::path::PathBuf {
     dir.join("Cargo.toml")
@@ -384,5 +462,286 @@ serde = "1.0"
         // Verify the content still has no [package] section
         let content = fs::read_to_string(&path).unwrap();
         assert!(!content.contains("\n[package]"), "Should not create [package] section");
+    }
+
+    // Tests for check_workspace_independent_versions
+
+    fn create_member_cargo_toml(dir: &Path, member_path: &str, content: &str) {
+        let member_dir = dir.join(member_path);
+        fs::create_dir_all(&member_dir).unwrap();
+        let path = member_dir.join("Cargo.toml");
+        fs::write(&path, content).unwrap();
+    }
+
+    #[test]
+    fn test_check_independent_versions_not_a_workspace() {
+        let dir = TempDir::new().unwrap();
+        create_cargo_toml(
+            dir.path(),
+            r#"
+[package]
+name = "my-app"
+version = "1.0.0"
+"#,
+        );
+
+        let result = check_workspace_independent_versions(dir.path()).unwrap();
+        assert!(result.is_empty(), "Non-workspace should return empty vec");
+    }
+
+    #[test]
+    fn test_check_independent_versions_workspace_no_members() {
+        let dir = TempDir::new().unwrap();
+        create_cargo_toml(
+            dir.path(),
+            r#"
+[workspace]
+
+[workspace.package]
+version = "1.0.0"
+"#,
+        );
+
+        let result = check_workspace_independent_versions(dir.path()).unwrap();
+        assert!(result.is_empty(), "Workspace with no members should return empty vec");
+    }
+
+    #[test]
+    fn test_check_independent_versions_all_use_workspace_version() {
+        let dir = TempDir::new().unwrap();
+        create_cargo_toml(
+            dir.path(),
+            r#"
+[workspace]
+members = ["crate-a", "crate-b"]
+
+[workspace.package]
+version = "1.0.0"
+"#,
+        );
+
+        create_member_cargo_toml(
+            dir.path(),
+            "crate-a",
+            r#"
+[package]
+name = "crate-a"
+version.workspace = true
+"#,
+        );
+
+        create_member_cargo_toml(
+            dir.path(),
+            "crate-b",
+            r#"
+[package]
+name = "crate-b"
+version.workspace = true
+"#,
+        );
+
+        let result = check_workspace_independent_versions(dir.path()).unwrap();
+        assert!(
+            result.is_empty(),
+            "All members using workspace version should return empty vec"
+        );
+    }
+
+    #[test]
+    fn test_check_independent_versions_some_independent() {
+        let dir = TempDir::new().unwrap();
+        create_cargo_toml(
+            dir.path(),
+            r#"
+[workspace]
+members = ["crate-a", "crate-b", "crate-c"]
+
+[workspace.package]
+version = "1.0.0"
+"#,
+        );
+
+        // crate-a uses workspace version
+        create_member_cargo_toml(
+            dir.path(),
+            "crate-a",
+            r#"
+[package]
+name = "crate-a"
+version.workspace = true
+"#,
+        );
+
+        // crate-b has independent version
+        create_member_cargo_toml(
+            dir.path(),
+            "crate-b",
+            r#"
+[package]
+name = "crate-b"
+version = "2.0.0"
+"#,
+        );
+
+        // crate-c has independent version
+        create_member_cargo_toml(
+            dir.path(),
+            "crate-c",
+            r#"
+[package]
+name = "crate-c"
+version = "3.5.0"
+"#,
+        );
+
+        let result = check_workspace_independent_versions(dir.path()).unwrap();
+        assert_eq!(result.len(), 2, "Should detect 2 members with independent versions");
+
+        let names: Vec<&str> = result.iter().map(|m| m.name.as_str()).collect();
+        assert!(names.contains(&"crate-b"), "Should detect crate-b");
+        assert!(names.contains(&"crate-c"), "Should detect crate-c");
+
+        let crate_b = result.iter().find(|m| m.name == "crate-b").unwrap();
+        assert_eq!(crate_b.version, "2.0.0");
+        assert_eq!(crate_b.path, "crate-b");
+
+        let crate_c = result.iter().find(|m| m.name == "crate-c").unwrap();
+        assert_eq!(crate_c.version, "3.5.0");
+        assert_eq!(crate_c.path, "crate-c");
+    }
+
+    #[test]
+    fn test_check_independent_versions_all_independent() {
+        let dir = TempDir::new().unwrap();
+        create_cargo_toml(
+            dir.path(),
+            r#"
+[workspace]
+members = ["crate-a", "crate-b"]
+"#,
+        );
+
+        create_member_cargo_toml(
+            dir.path(),
+            "crate-a",
+            r#"
+[package]
+name = "crate-a"
+version = "1.0.0"
+"#,
+        );
+
+        create_member_cargo_toml(
+            dir.path(),
+            "crate-b",
+            r#"
+[package]
+name = "crate-b"
+version = "2.0.0"
+"#,
+        );
+
+        let result = check_workspace_independent_versions(dir.path()).unwrap();
+        assert_eq!(result.len(), 2, "Should detect both members with independent versions");
+    }
+
+    #[test]
+    fn test_check_independent_versions_member_missing_cargo_toml() {
+        let dir = TempDir::new().unwrap();
+        create_cargo_toml(
+            dir.path(),
+            r#"
+[workspace]
+members = ["crate-a", "crate-missing"]
+
+[workspace.package]
+version = "1.0.0"
+"#,
+        );
+
+        // Only create crate-a, crate-missing doesn't exist
+        create_member_cargo_toml(
+            dir.path(),
+            "crate-a",
+            r#"
+[package]
+name = "crate-a"
+version = "1.0.0"
+"#,
+        );
+
+        // Should not error, just skip missing member
+        let result = check_workspace_independent_versions(dir.path()).unwrap();
+        assert_eq!(result.len(), 1, "Should only detect existing member");
+        assert_eq!(result[0].name, "crate-a");
+    }
+
+    #[test]
+    fn test_check_independent_versions_member_no_version_field() {
+        let dir = TempDir::new().unwrap();
+        create_cargo_toml(
+            dir.path(),
+            r#"
+[workspace]
+members = ["crate-a"]
+
+[workspace.package]
+version = "1.0.0"
+"#,
+        );
+
+        // Member has no version field at all
+        create_member_cargo_toml(
+            dir.path(),
+            "crate-a",
+            r#"
+[package]
+name = "crate-a"
+"#,
+        );
+
+        let result = check_workspace_independent_versions(dir.path()).unwrap();
+        assert!(result.is_empty(), "Member with no version field should not be flagged");
+    }
+
+    #[test]
+    fn test_check_independent_versions_nested_path() {
+        let dir = TempDir::new().unwrap();
+        create_cargo_toml(
+            dir.path(),
+            r#"
+[workspace]
+members = ["crates/core", "crates/cli"]
+
+[workspace.package]
+version = "1.0.0"
+"#,
+        );
+
+        create_member_cargo_toml(
+            dir.path(),
+            "crates/core",
+            r#"
+[package]
+name = "my-core"
+version = "0.5.0"
+"#,
+        );
+
+        create_member_cargo_toml(
+            dir.path(),
+            "crates/cli",
+            r#"
+[package]
+name = "my-cli"
+version.workspace = true
+"#,
+        );
+
+        let result = check_workspace_independent_versions(dir.path()).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "my-core");
+        assert_eq!(result[0].path, "crates/core");
+        assert_eq!(result[0].version, "0.5.0");
     }
 }
