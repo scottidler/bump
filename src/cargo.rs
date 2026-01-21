@@ -18,10 +18,8 @@ pub fn read_version(cargo_toml_path: &Path) -> Result<Option<String>> {
         if let Some(v) = version.as_str() {
             return Ok(Some(v.to_string()));
         }
-        // Check for version.workspace = true
-        if let Some(table) = version.as_inline_table()
-            && table.get("workspace").is_some_and(|w| w.as_bool() == Some(true))
-        {
+        // Check for version.workspace = true (inline table or dotted key)
+        if is_workspace_version(version) {
             // Version is inherited from workspace, check workspace.package.version
             return read_workspace_version(&doc);
         }
@@ -33,6 +31,24 @@ pub fn read_version(cargo_toml_path: &Path) -> Result<Option<String>> {
     }
 
     Ok(None)
+}
+
+/// Check if a version field uses workspace = true (either inline table or dotted key)
+fn is_workspace_version(version: &Item) -> bool {
+    // Check inline table syntax: version = { workspace = true }
+    if let Some(table) = version.as_inline_table() {
+        if table.get("workspace").is_some_and(|w| w.as_bool() == Some(true)) {
+            return true;
+        }
+    }
+    // Check dotted key syntax: version.workspace = true
+    // This gets parsed as a regular table by toml_edit
+    if let Some(table) = version.as_table_like() {
+        if table.get("workspace").is_some_and(|w| w.as_bool() == Some(true)) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Read workspace version from [workspace.package]
@@ -88,8 +104,7 @@ pub fn write_version(cargo_toml_path: &Path, new_version: &str) -> Result<()> {
     let uses_workspace_version = doc
         .get("package")
         .and_then(|p| p.get("version"))
-        .and_then(|v| v.as_inline_table())
-        .is_some_and(|t| t.get("workspace").is_some_and(|w| w.as_bool() == Some(true)));
+        .is_some_and(is_workspace_version);
 
     if uses_workspace_version {
         // Update workspace.package.version instead
@@ -231,9 +246,7 @@ pub fn check_workspace_independent_versions(dir: &Path) -> Result<Vec<Independen
         if let Some(package) = member_doc.get("package") {
             if let Some(version) = package.get("version") {
                 // Check if it's NOT using workspace = true
-                let uses_workspace = version
-                    .as_inline_table()
-                    .is_some_and(|t| t.get("workspace").is_some_and(|w| w.as_bool() == Some(true)));
+                let uses_workspace = is_workspace_version(version);
 
                 if !uses_workspace {
                     // This member has an independent version
@@ -743,5 +756,187 @@ version.workspace = true
         assert_eq!(result[0].name, "my-core");
         assert_eq!(result[0].path, "crates/core");
         assert_eq!(result[0].version, "0.5.0");
+    }
+
+    // Tests for dotted key syntax: version.workspace = true
+
+    #[test]
+    fn test_read_version_dotted_workspace_syntax() {
+        let dir = TempDir::new().unwrap();
+        let path = create_cargo_toml(
+            dir.path(),
+            r#"
+[workspace.package]
+version = "2.5.0"
+
+[package]
+name = "test"
+version.workspace = true
+"#,
+        );
+
+        let version = read_version(&path).unwrap();
+        assert_eq!(version, Some("2.5.0".to_string()), "Should read workspace version when using dotted key syntax");
+    }
+
+    #[test]
+    fn test_read_version_inline_table_workspace_syntax() {
+        let dir = TempDir::new().unwrap();
+        let path = create_cargo_toml(
+            dir.path(),
+            r#"
+[workspace.package]
+version = "3.0.0"
+
+[package]
+name = "test"
+version = { workspace = true }
+"#,
+        );
+
+        let version = read_version(&path).unwrap();
+        assert_eq!(version, Some("3.0.0".to_string()), "Should read workspace version when using inline table syntax");
+    }
+
+    #[test]
+    fn test_write_version_preserves_dotted_workspace_syntax() {
+        let dir = TempDir::new().unwrap();
+        let path = create_cargo_toml(
+            dir.path(),
+            r#"
+[workspace]
+members = []
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+
+[package]
+name = "test"
+version.workspace = true
+edition.workspace = true
+"#,
+        );
+
+        write_version(&path, "1.1.0").unwrap();
+
+        // Should update workspace.package.version, not [package].version
+        let version = read_version(&path).unwrap();
+        assert_eq!(version, Some("1.1.0".to_string()));
+
+        // Verify the file still uses workspace syntax (not a direct version)
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("version.workspace = true") || content.contains("version = { workspace = true }"),
+            "Should preserve workspace version inheritance in [package]"
+        );
+        // The workspace.package.version will have "1.1.0", but [package] section should NOT
+        // have version = "1.1.0" on its own line
+        let package_section_start = content.find("[package]").unwrap();
+        let package_section = &content[package_section_start..];
+        assert!(
+            !package_section.contains("\nversion = \"1.1.0\""),
+            "Should NOT write direct version to [package] section"
+        );
+    }
+
+    #[test]
+    fn test_write_version_preserves_inline_table_workspace_syntax() {
+        let dir = TempDir::new().unwrap();
+        let path = create_cargo_toml(
+            dir.path(),
+            r#"
+[workspace]
+members = []
+
+[workspace.package]
+version = "1.0.0"
+
+[package]
+name = "test"
+version = { workspace = true }
+"#,
+        );
+
+        write_version(&path, "1.2.0").unwrap();
+
+        let version = read_version(&path).unwrap();
+        assert_eq!(version, Some("1.2.0".to_string()));
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("version = { workspace = true }"),
+            "Should preserve inline table workspace syntax"
+        );
+    }
+
+    #[test]
+    fn test_write_version_direct_version_not_workspace() {
+        let dir = TempDir::new().unwrap();
+        let path = create_cargo_toml(
+            dir.path(),
+            r#"
+[package]
+name = "standalone"
+version = "1.0.0"
+"#,
+        );
+
+        write_version(&path, "1.0.1").unwrap();
+
+        let version = read_version(&path).unwrap();
+        assert_eq!(version, Some("1.0.1".to_string()));
+
+        // Should update direct version
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains("version = \"1.0.1\""), "Should update direct version");
+    }
+
+    #[test]
+    fn test_is_workspace_version_dotted_key() {
+        let content = r#"
+[package]
+name = "test"
+version.workspace = true
+"#;
+        let doc = content.parse::<DocumentMut>().unwrap();
+        let version = doc.get("package").unwrap().get("version").unwrap();
+        assert!(is_workspace_version(version), "Should detect dotted key syntax");
+    }
+
+    #[test]
+    fn test_is_workspace_version_inline_table() {
+        let content = r#"
+[package]
+name = "test"
+version = { workspace = true }
+"#;
+        let doc = content.parse::<DocumentMut>().unwrap();
+        let version = doc.get("package").unwrap().get("version").unwrap();
+        assert!(is_workspace_version(version), "Should detect inline table syntax");
+    }
+
+    #[test]
+    fn test_is_workspace_version_direct_string() {
+        let content = r#"
+[package]
+name = "test"
+version = "1.0.0"
+"#;
+        let doc = content.parse::<DocumentMut>().unwrap();
+        let version = doc.get("package").unwrap().get("version").unwrap();
+        assert!(!is_workspace_version(version), "Direct version string should NOT be workspace version");
+    }
+
+    #[test]
+    fn test_is_workspace_version_false_value() {
+        let content = r#"
+[package]
+name = "test"
+version.workspace = false
+"#;
+        let doc = content.parse::<DocumentMut>().unwrap();
+        let version = doc.get("package").unwrap().get("version").unwrap();
+        assert!(!is_workspace_version(version), "workspace = false should NOT be detected as workspace version");
     }
 }
