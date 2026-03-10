@@ -340,8 +340,8 @@ fn process_directory(dir: &Path, cli: &Cli, bump_type: BumpType) -> Result<()> {
         // ===== CLEAN TREE WORKFLOW: No uncommitted changes =====
 
         // Check if HEAD already has a tag
-        if git::head_has_tag(dir)? {
-            bail!("HEAD already has a tag. Make changes first, then run bump.");
+        if git::head_has_tag(dir)? && !cli.force {
+            bail!("HEAD already has a tag. Make changes first, then run bump. Use --force to override.");
         }
 
         // Check if HEAD has been pushed

@@ -33,6 +33,10 @@ pub struct Cli {
     #[arg(short = 'a', long, conflicts_with = "message")]
     pub automatic: bool,
 
+    /// Force bump even if HEAD already has a tag
+    #[arg(short = 'f', long)]
+    pub force: bool,
+
     /// Paths to git repository roots
     #[arg(value_name = "DIRECTORIES")]
     pub directories: Vec<PathBuf>,
@@ -187,6 +191,18 @@ mod tests {
     fn test_cli_automatic_long_flag() {
         let cli = Cli::try_parse_from(["bump", "--automatic"]).unwrap();
         assert!(cli.automatic);
+    }
+
+    #[test]
+    fn test_cli_force_flag() {
+        let cli = Cli::try_parse_from(["bump", "--force"]).unwrap();
+        assert!(cli.force);
+    }
+
+    #[test]
+    fn test_cli_force_short_flag() {
+        let cli = Cli::try_parse_from(["bump", "-f"]).unwrap();
+        assert!(cli.force);
     }
 
     #[test]
