@@ -8,7 +8,7 @@ static HELP_TEXT: LazyLock<String> = LazyLock::new(get_tool_validation_help);
 #[derive(Parser)]
 #[command(
     name = "bump",
-    about = "bump semantic versions in Cargo.toml, commit, and tag",
+    about = "bump semantic versions, commit, and tag (Rust, Python, or any git repo)",
     version = env!("GIT_DESCRIBE"),
     after_help = HELP_TEXT.as_str()
 )]

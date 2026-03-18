@@ -57,10 +57,11 @@ pub fn bump_version(version: &Version, bump_type: BumpType) -> Version {
     new_version
 }
 
-/// Format version for Cargo.toml (no 'v' prefix)
-pub fn format_cargo_version(version: &Version) -> String {
+/// Format version for version files (no 'v' prefix)
+pub fn format_file_version(version: &Version) -> String {
     format!("{}.{}.{}", version.major, version.minor, version.patch)
 }
+
 
 /// Format version for git tag (with 'v' prefix)
 pub fn format_tag(version: &Version) -> String {
@@ -140,9 +141,9 @@ mod tests {
     }
 
     #[test]
-    fn test_format_cargo_version() {
+    fn test_format_file_version() {
         let v = Version::new(1, 2, 3);
-        assert_eq!(format_cargo_version(&v), "1.2.3");
+        assert_eq!(format_file_version(&v), "1.2.3");
     }
 
     #[test]
