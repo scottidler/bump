@@ -62,7 +62,6 @@ pub fn format_file_version(version: &Version) -> String {
     format!("{}.{}.{}", version.major, version.minor, version.patch)
 }
 
-
 /// Format version for git tag (with 'v' prefix)
 pub fn format_tag(version: &Version) -> String {
     format!("v{}.{}.{}", version.major, version.minor, version.patch)

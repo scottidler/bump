@@ -17,10 +17,11 @@ pub fn pyproject_toml_path(dir: &Path) -> std::path::PathBuf {
 /// Checks [project].version (PEP 621) first, then [tool.poetry].version
 /// Returns None if version field is missing or dynamic
 pub fn read_version(pyproject_path: &Path) -> Result<Option<String>> {
-    let content =
-        fs::read_to_string(pyproject_path).context(format!("Failed to read {}", pyproject_path.display()))?;
+    let content = fs::read_to_string(pyproject_path).context(format!("Failed to read {}", pyproject_path.display()))?;
 
-    let doc = content.parse::<DocumentMut>().context("Failed to parse pyproject.toml")?;
+    let doc = content
+        .parse::<DocumentMut>()
+        .context("Failed to parse pyproject.toml")?;
 
     // Check if version is declared dynamic (PEP 621)
     if let Some(project) = doc.get("project")
@@ -79,16 +80,15 @@ fn version_section(doc: &DocumentMut) -> Option<&'static str> {
 /// Update the version in pyproject.toml
 /// Creates the version field if it doesn't exist
 pub fn write_version(pyproject_path: &Path, new_version: &str) -> Result<()> {
-    let content =
-        fs::read_to_string(pyproject_path).context(format!("Failed to read {}", pyproject_path.display()))?;
+    let content = fs::read_to_string(pyproject_path).context(format!("Failed to read {}", pyproject_path.display()))?;
 
-    let mut doc = content.parse::<DocumentMut>().context("Failed to parse pyproject.toml")?;
+    let mut doc = content
+        .parse::<DocumentMut>()
+        .context("Failed to parse pyproject.toml")?;
 
     match version_section(&doc) {
         Some("project") => {
-            let project = doc
-                .get_mut("project")
-                .context("[project] section not found")?;
+            let project = doc.get_mut("project").context("[project] section not found")?;
 
             if let Item::Table(table) = project {
                 table["version"] = Item::Value(Value::from(new_version));
@@ -113,9 +113,7 @@ pub fn write_version(pyproject_path: &Path, new_version: &str) -> Result<()> {
         }
         _ => {
             // Create [project] section with version
-            let project = doc
-                .entry("project")
-                .or_insert(Item::Table(toml_edit::Table::new()));
+            let project = doc.entry("project").or_insert(Item::Table(toml_edit::Table::new()));
             if let Item::Table(table) = project {
                 table["version"] = Item::Value(Value::from(new_version));
             } else {
@@ -124,8 +122,7 @@ pub fn write_version(pyproject_path: &Path, new_version: &str) -> Result<()> {
         }
     }
 
-    fs::write(pyproject_path, doc.to_string())
-        .context(format!("Failed to write {}", pyproject_path.display()))?;
+    fs::write(pyproject_path, doc.to_string()).context(format!("Failed to write {}", pyproject_path.display()))?;
 
     Ok(())
 }
@@ -197,7 +194,11 @@ version = "2.0.0"
         );
 
         let version = read_version(&path).unwrap();
-        assert_eq!(version, Some("1.0.0".to_string()), "PEP 621 should take precedence over Poetry");
+        assert_eq!(
+            version,
+            Some("1.0.0".to_string()),
+            "PEP 621 should take precedence over Poetry"
+        );
     }
 
     #[test]

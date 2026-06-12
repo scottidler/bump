@@ -151,10 +151,7 @@ pub fn amend_commit_no_edit(path: &Path) -> Result<()> {
         .context("Failed to run git commit --amend")?;
 
     if !output.status.success() {
-        bail!(
-            "git commit --amend failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        bail!("git commit --amend failed: {}", String::from_utf8_lossy(&output.stderr));
     }
 
     Ok(())
