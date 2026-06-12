@@ -36,17 +36,17 @@ pub fn read_version(cargo_toml_path: &Path) -> Result<Option<String>> {
 /// Check if a version field uses workspace = true (either inline table or dotted key)
 fn is_workspace_version(version: &Item) -> bool {
     // Check inline table syntax: version = { workspace = true }
-    if let Some(table) = version.as_inline_table() {
-        if table.get("workspace").is_some_and(|w| w.as_bool() == Some(true)) {
-            return true;
-        }
+    if let Some(table) = version.as_inline_table()
+        && table.get("workspace").is_some_and(|w| w.as_bool() == Some(true))
+    {
+        return true;
     }
     // Check dotted key syntax: version.workspace = true
     // This gets parsed as a regular table by toml_edit
-    if let Some(table) = version.as_table_like() {
-        if table.get("workspace").is_some_and(|w| w.as_bool() == Some(true)) {
-            return true;
-        }
+    if let Some(table) = version.as_table_like()
+        && table.get("workspace").is_some_and(|w| w.as_bool() == Some(true))
+    {
+        return true;
     }
     false
 }
@@ -207,8 +207,7 @@ pub struct IndependentVersionMember {
 /// Returns a list of members with independent versions, or empty vec if all use workspace version
 pub fn check_workspace_independent_versions(dir: &Path) -> Result<Vec<IndependentVersionMember>> {
     let cargo_toml = dir.join("Cargo.toml");
-    let content = fs::read_to_string(&cargo_toml)
-        .context(format!("Failed to read {}", cargo_toml.display()))?;
+    let content = fs::read_to_string(&cargo_toml).context(format!("Failed to read {}", cargo_toml.display()))?;
     let doc = content.parse::<DocumentMut>().context("Failed to parse Cargo.toml")?;
 
     // Only check if this is a workspace
@@ -243,26 +242,26 @@ pub fn check_workspace_independent_versions(dir: &Path) -> Result<Vec<Independen
             .context(format!("Failed to parse {}", member_cargo_toml.display()))?;
 
         // Check if this member has an independent version
-        if let Some(package) = member_doc.get("package") {
-            if let Some(version) = package.get("version") {
-                // Check if it's NOT using workspace = true
-                let uses_workspace = is_workspace_version(version);
+        if let Some(package) = member_doc.get("package")
+            && let Some(version) = package.get("version")
+        {
+            // Check if it's NOT using workspace = true
+            let uses_workspace = is_workspace_version(version);
 
-                if !uses_workspace {
-                    // This member has an independent version
-                    if let Some(v) = version.as_str() {
-                        let name = package
-                            .get("name")
-                            .and_then(|n| n.as_str())
-                            .unwrap_or(member_path)
-                            .to_string();
+            if !uses_workspace {
+                // This member has an independent version
+                if let Some(v) = version.as_str() {
+                    let name = package
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or(member_path)
+                        .to_string();
 
-                        independent_versions.push(IndependentVersionMember {
-                            name,
-                            path: member_path.to_string(),
-                            version: v.to_string(),
-                        });
-                    }
+                    independent_versions.push(IndependentVersionMember {
+                        name,
+                        path: member_path.to_string(),
+                        version: v.to_string(),
+                    });
                 }
             }
         }
@@ -776,7 +775,11 @@ version.workspace = true
         );
 
         let version = read_version(&path).unwrap();
-        assert_eq!(version, Some("2.5.0".to_string()), "Should read workspace version when using dotted key syntax");
+        assert_eq!(
+            version,
+            Some("2.5.0".to_string()),
+            "Should read workspace version when using dotted key syntax"
+        );
     }
 
     #[test]
@@ -795,7 +798,11 @@ version = { workspace = true }
         );
 
         let version = read_version(&path).unwrap();
-        assert_eq!(version, Some("3.0.0".to_string()), "Should read workspace version when using inline table syntax");
+        assert_eq!(
+            version,
+            Some("3.0.0".to_string()),
+            "Should read workspace version when using inline table syntax"
+        );
     }
 
     #[test]
@@ -925,7 +932,10 @@ version = "1.0.0"
 "#;
         let doc = content.parse::<DocumentMut>().unwrap();
         let version = doc.get("package").unwrap().get("version").unwrap();
-        assert!(!is_workspace_version(version), "Direct version string should NOT be workspace version");
+        assert!(
+            !is_workspace_version(version),
+            "Direct version string should NOT be workspace version"
+        );
     }
 
     #[test]
@@ -937,6 +947,9 @@ version.workspace = false
 "#;
         let doc = content.parse::<DocumentMut>().unwrap();
         let version = doc.get("package").unwrap().get("version").unwrap();
-        assert!(!is_workspace_version(version), "workspace = false should NOT be detected as workspace version");
+        assert!(
+            !is_workspace_version(version),
+            "workspace = false should NOT be detected as workspace version"
+        );
     }
 }
