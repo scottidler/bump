@@ -97,9 +97,7 @@ fn version_file_name(project_type: ProjectType) -> &'static str {
 /// Check if staged files are only version-related files
 fn is_version_files_only(staged_files: &[String], project_type: ProjectType) -> bool {
     match project_type {
-        ProjectType::Rust => staged_files
-            .iter()
-            .all(|f| f == "Cargo.toml" || f == "Cargo.lock"),
+        ProjectType::Rust => staged_files.iter().all(|f| f == "Cargo.toml" || f == "Cargo.lock"),
         ProjectType::Python => staged_files.iter().all(|f| f == "pyproject.toml"),
         ProjectType::Generic => staged_files.is_empty(),
     }
@@ -124,8 +122,24 @@ fn validate_project(dir: &Path, project_type: ProjectType) -> Result<()> {
     Ok(())
 }
 
+/// XDG data dir, honoring `$XDG_DATA_HOME` and falling back to `$HOME/.local/share`.
+///
+/// We deliberately do NOT use the `dirs` config/data helpers: those honor
+/// `$XDG_CONFIG_HOME` / `$XDG_DATA_HOME` only on Linux. On macOS they resolve via system
+/// APIs and return `~/Library/...`, ignoring the env vars. These helpers resolve to the
+/// same XDG layout on every platform.
+fn xdg_data_dir() -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("XDG_DATA_HOME") {
+        let path = PathBuf::from(dir);
+        if path.is_absolute() {
+            return Some(path);
+        }
+    }
+    dirs::home_dir().map(|h| h.join(".local").join("share"))
+}
+
 fn setup_logging() -> Result<()> {
-    let log_dir = dirs::data_local_dir()
+    let log_dir = xdg_data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("bump")
         .join("logs");
@@ -233,8 +247,8 @@ fn determine_version_action(
     let latest_tag_version = git::get_latest_tag(dir)?.and_then(|t| version::parse_version(&t).ok());
 
     // Only Rust has the "untouched default" concept (Cargo.toml starts at 0.1.0)
-    let is_untouched_default = project_type == ProjectType::Rust
-        && file_version.as_ref() == Some(&DEFAULT_UNTOUCHED_VERSION);
+    let is_untouched_default =
+        project_type == ProjectType::Rust && file_version.as_ref() == Some(&DEFAULT_UNTOUCHED_VERSION);
 
     // Determine the base version to bump from
     match (&file_version, &latest_tag_version) {
@@ -428,7 +442,11 @@ fn process_directory(dir: &Path, cli: &Cli, bump_type: BumpType) -> Result<()> {
         // Update version file if needed
         if action.needs_file_update {
             write_file_version(dir, project_type, &new_file_version)?;
-            info!("Updated {} to version {}", version_file_name(project_type), new_file_version);
+            info!(
+                "Updated {} to version {}",
+                version_file_name(project_type),
+                new_file_version
+            );
             sync_lockfile(dir, project_type)?;
         }
 
@@ -465,7 +483,11 @@ fn process_directory(dir: &Path, cli: &Cli, bump_type: BumpType) -> Result<()> {
         // Update version file
         if action.needs_file_update {
             write_file_version(dir, project_type, &new_file_version)?;
-            info!("Updated {} to version {}", version_file_name(project_type), new_file_version);
+            info!(
+                "Updated {} to version {}",
+                version_file_name(project_type),
+                new_file_version
+            );
             sync_lockfile(dir, project_type)?;
         }
 
