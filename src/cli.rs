@@ -37,6 +37,10 @@ pub struct Cli {
     #[arg(short = 'f', long)]
     pub force: bool,
 
+    /// Bump version and commit, but do NOT create a tag (for PR-gated repos)
+    #[arg(long)]
+    pub no_tag: bool,
+
     /// Skip the remote gate probe (treat the repo as ungated)
     #[arg(long)]
     pub no_verify: bool,
@@ -225,6 +229,14 @@ mod tests {
         assert!(cli.no_verify);
         let cli = Cli::try_parse_from(["bump"]).unwrap();
         assert!(!cli.no_verify);
+    }
+
+    #[test]
+    fn test_cli_no_tag_flag() {
+        let cli = Cli::try_parse_from(["bump", "--no-tag"]).unwrap();
+        assert!(cli.no_tag);
+        let cli = Cli::try_parse_from(["bump"]).unwrap();
+        assert!(!cli.no_tag);
     }
 
     #[test]

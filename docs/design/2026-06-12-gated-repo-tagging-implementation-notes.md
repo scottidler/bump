@@ -74,3 +74,33 @@ Running, append-only record of how the implementation interprets or diverges fro
 
 ### Open questions
 - None.
+
+## Phase 3: --no-tag
+
+### Design decisions
+- `create_tag` gating — `src/main.rs:process_directory` — threaded a single
+  `let create_tag = !cli.no_tag` through both workflow branches (standard and clean-tree)
+  and the dry-run block; each `git::create_tag` call site is guarded by it, with distinct
+  "no tag" output naming the version and pointing at `--tag-only` for later.
+- `--no-tag` skips the gate probe entirely — there is no tag to orphan, so the probe is
+  pointless and would only slow the PR inner loop (matches the design's performance note).
+- The `--no-tag` flag is added WITHOUT the design's `conflicts_with_all = ["tag_only"]`
+  because `tag_only` does not exist until Phase 4; clap panics at command-build time if a
+  conflict references an unknown arg id. The conflict is added in Phase 4 when both flags
+  coexist.
+
+### Deviations
+- None.
+
+### Tradeoffs
+- `no_tag_bumps_file_without_tagging` passes `-a` — a realistic `--no-tag` run commits
+  code changes alongside the version bump, so the staged set is not version-files-only and
+  `determine_commit_message` would otherwise open `$EDITOR` (which hangs headless). `-a`
+  (automatic message) reflects how the flag is actually used and keeps the test
+  non-interactive.
+
+### Open questions
+- The clean-tree tagging path still prints `Run: git push && git push --tags`, which
+  conflicts with the git.md rule (never `git push --tags`; push the tag by explicit name).
+  Left unchanged here (out of --no-tag scope); corrected in Phase 5 alongside the README /
+  after_help push recipes.

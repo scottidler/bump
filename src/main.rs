@@ -401,10 +401,17 @@ fn process_directory(dir: &Path, cli: &Cli, bump_type: BumpType) -> Result<()> {
         bail!("Not a git repository: {}", dir.display());
     }
 
+    // --no-tag bumps the version and commits but creates no tag, so the orphan risk
+    // (and thus the gate probe) does not apply.
+    let create_tag = !cli.no_tag;
+
     // 1b. Probe the remote default-branch gate and apply policy BEFORE any mutation:
     //     refuse on a gated branch (tagging would orphan the tag), warn-and-proceed
-    //     when the probe is inconclusive, skip entirely under --no-verify.
-    if cli.no_verify {
+    //     when the probe is inconclusive, skip under --no-tag (nothing to refuse) or
+    //     --no-verify.
+    if !create_tag {
+        info!("Skipping gate probe for {} (--no-tag: no tag created)", dir.display());
+    } else if cli.no_verify {
         info!("Skipping gate probe for {} (--no-verify)", dir.display());
     } else {
         match github::detect(dir) {
@@ -441,7 +448,11 @@ fn process_directory(dir: &Path, cli: &Cli, bump_type: BumpType) -> Result<()> {
 
     // 5. Display what we're doing
     if action.is_initial_tag {
-        println!("tag: {}", new_tag);
+        if create_tag {
+            println!("tag: {}", new_tag);
+        } else {
+            println!("version: {}", new_file_version);
+        }
     } else {
         // For bumps, show the transition
         let current_version = read_file_version(dir, project_type)?
@@ -464,7 +475,9 @@ fn process_directory(dir: &Path, cli: &Cli, bump_type: BumpType) -> Result<()> {
         if action.needs_file_update {
             println!("[dry-run] Would update: {}", version_file_name(project_type));
         }
-        if !has_changes && !git::head_has_tag(dir)? {
+        if !create_tag {
+            println!("[dry-run] Would commit version bump to {} (no tag)", new_file_version);
+        } else if !has_changes && !git::head_has_tag(dir)? {
             let is_pushed = git::is_head_pushed(dir)?;
             if is_pushed {
                 println!("[dry-run] Would create new commit and tag: {}", new_tag);
@@ -506,11 +519,14 @@ fn process_directory(dir: &Path, cli: &Cli, bump_type: BumpType) -> Result<()> {
             info!("Committed with message: {}", commit_message);
         }
 
-        // Create annotated tag
-        git::create_tag(dir, &new_tag, &commit_message)?;
-        info!("Created tag: {}", new_tag);
-
-        println!("Committed and tagged {}", new_tag);
+        // Create annotated tag (unless --no-tag)
+        if create_tag {
+            git::create_tag(dir, &new_tag, &commit_message)?;
+            info!("Created tag: {}", new_tag);
+            println!("Committed and tagged {}", new_tag);
+        } else {
+            println!("Committed version bump to {} (no tag)", new_file_version);
+        }
     } else {
         // ===== CLEAN TREE WORKFLOW: No uncommitted changes =====
 
@@ -547,10 +563,13 @@ fn process_directory(dir: &Path, cli: &Cli, bump_type: BumpType) -> Result<()> {
                 info!("Committed with message: {}", commit_message);
             }
 
-            git::create_tag(dir, &new_tag, &commit_message)?;
-            info!("Created tag: {}", new_tag);
-
-            println!("Committed and tagged {}", new_tag);
+            if create_tag {
+                git::create_tag(dir, &new_tag, &commit_message)?;
+                info!("Created tag: {}", new_tag);
+                println!("Committed and tagged {}", new_tag);
+            } else {
+                println!("Committed version bump to {} (no tag)", new_file_version);
+            }
         } else {
             // HEAD is not pushed - amend the previous commit
             if !staged_files.is_empty() {
@@ -558,16 +577,23 @@ fn process_directory(dir: &Path, cli: &Cli, bump_type: BumpType) -> Result<()> {
                 info!("Amended previous commit with version file changes");
             }
 
-            // Use automatic message for the tag since we're amending
-            let tag_message = format!("Bump version to {}", new_tag);
-            git::create_tag(dir, &new_tag, &tag_message)?;
-            info!("Created tag: {}", new_tag);
-
-            println!("Amended commit and tagged {}", new_tag);
+            if create_tag {
+                // Use automatic message for the tag since we're amending
+                let tag_message = format!("Bump version to {}", new_tag);
+                git::create_tag(dir, &new_tag, &tag_message)?;
+                info!("Created tag: {}", new_tag);
+                println!("Amended commit and tagged {}", new_tag);
+            } else {
+                println!("Amended commit with version bump to {} (no tag)", new_file_version);
+            }
         }
     }
 
-    println!("Run: git push && git push --tags");
+    if create_tag {
+        println!("Run: git push && git push --tags");
+    } else {
+        println!("Run: git push <branch>  (open a PR; after merge, tag with: bump --tag-only)");
+    }
 
     if !dir_name.is_empty() && dir != env::current_dir().unwrap_or_default() {
         println!("[{}] Done", dir_name);
@@ -1387,5 +1413,67 @@ name = "test-pkg"
             git::tag_exists(dir, "v0.1.0").unwrap(),
             "tag must be created under --no-verify"
         );
+    }
+
+    // =========================================================================
+    // --no-tag (Phase 3): bump + commit, but never tag
+    // =========================================================================
+
+    /// --no-tag bumps the version file and commits, but creates NO tag.
+    #[test]
+    fn no_tag_bumps_file_without_tagging() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        setup_git_repo(dir);
+        create_cargo_toml(dir, Some("0.1.5"));
+        create_initial_commit(dir);
+        create_git_tag(dir, "v0.1.5");
+        // Pending work on the branch (the realistic --no-tag case), so this takes the
+        // standard (uncommitted-changes) workflow rather than the clean-tree path. Use
+        // -a so the non-version-only staged set doesn't open an editor for the message.
+        fs::write(dir.join("feature.txt"), "work").unwrap();
+
+        let cli = Cli::try_parse_from(["bump", "--no-tag", "-a"]).unwrap();
+        process_directory(dir, &cli, BumpType::Patch).unwrap();
+
+        assert!(!git::tag_exists(dir, "v0.1.6").unwrap(), "no new tag under --no-tag");
+        assert!(git::tag_exists(dir, "v0.1.5").unwrap(), "prior tag untouched");
+        let version = read_file_version(dir, ProjectType::Rust).unwrap().unwrap();
+        assert_eq!(version, "0.1.6", "version file must still be bumped");
+    }
+
+    /// --no-tag on an initial-tag scenario commits the version but creates no tag.
+    #[test]
+    fn no_tag_initial_creates_no_tag() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        setup_git_repo(dir);
+        create_cargo_toml(dir, Some("0.2.0"));
+        create_initial_commit(dir);
+
+        let cli = Cli::try_parse_from(["bump", "--no-tag"]).unwrap();
+        process_directory(dir, &cli, BumpType::Patch).unwrap();
+
+        assert!(
+            !git::tag_exists(dir, "v0.2.0").unwrap(),
+            "no tag created under --no-tag"
+        );
+    }
+
+    /// --no-tag does not probe gates, so it never refuses even on a gated repo.
+    #[test]
+    fn no_tag_skips_gate_probe_even_when_gated() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        setup_taggable_repo(dir);
+
+        let cli = Cli::try_parse_from(["bump", "--no-tag"]).unwrap();
+        let prev = set_probe("gated:pull_request");
+        let result = process_directory(dir, &cli, BumpType::Patch);
+        restore_probe(prev);
+
+        assert!(result.is_ok(), "--no-tag must not refuse on a gated repo: {result:?}");
+        assert!(!git::tag_exists(dir, "v0.1.0").unwrap(), "still no tag under --no-tag");
     }
 }
