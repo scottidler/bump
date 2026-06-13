@@ -173,6 +173,187 @@ pub fn has_uncommitted_changes(path: &Path) -> Result<bool> {
     Ok(!status.trim().is_empty())
 }
 
+/// Relation of local HEAD to the remote tracking branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadRemote {
+    /// HEAD points at the same commit as the remote branch.
+    Equal,
+    /// HEAD has commits the remote does not (the bump commit isn't merged/pushed yet).
+    Ahead,
+    /// The remote has commits HEAD does not (local is stale).
+    Behind,
+    /// Histories have diverged.
+    Diverged,
+}
+
+/// Run `git rev-parse <rev>` and return the resolved SHA.
+fn rev_parse(path: &Path, rev: &str) -> Result<String> {
+    let output = Command::new("git")
+        .args(["rev-parse", rev])
+        .current_dir(path)
+        .output()
+        .context("Failed to run git rev-parse")?;
+
+    if !output.status.success() {
+        bail!(
+            "git rev-parse {} failed: {}",
+            rev,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Is `ancestor` an ancestor of (or equal to) `descendant`?
+fn is_ancestor(path: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
+    let output = Command::new("git")
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .current_dir(path)
+        .output()
+        .context("Failed to run git merge-base")?;
+    Ok(output.status.success())
+}
+
+/// The SHA at local HEAD.
+pub fn head_sha(path: &Path) -> Result<String> {
+    rev_parse(path, "HEAD")
+}
+
+/// The current branch name (`git rev-parse --abbrev-ref HEAD`).
+pub fn current_branch(path: &Path) -> Result<String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(path)
+        .output()
+        .context("Failed to run git rev-parse --abbrev-ref")?;
+
+    if !output.status.success() {
+        bail!(
+            "git rev-parse --abbrev-ref HEAD failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Resolve the remote default branch from `refs/remotes/origin/HEAD`.
+pub fn remote_default_branch(path: &Path) -> Result<String> {
+    let output = Command::new("git")
+        .args(["symbolic-ref", "refs/remotes/origin/HEAD"])
+        .current_dir(path)
+        .output()
+        .context("Failed to run git symbolic-ref")?;
+
+    if !output.status.success() {
+        bail!(
+            "could not determine the remote default branch (is origin/HEAD set?). \
+             Try: git remote set-head origin -a"
+        );
+    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .strip_prefix("refs/remotes/origin/")
+        .map(str::to_string)
+        .ok_or_else(|| eyre::eyre!("unexpected symbolic-ref output for origin/HEAD"))
+}
+
+/// Fetch a single branch from origin (updates the remote-tracking ref).
+pub fn fetch_branch(path: &Path, branch: &str) -> Result<()> {
+    let output = Command::new("git")
+        .args(["fetch", "origin", branch])
+        .current_dir(path)
+        .output()
+        .context("Failed to run git fetch")?;
+
+    if !output.status.success() {
+        bail!(
+            "git fetch origin {} failed: {}",
+            branch,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    Ok(())
+}
+
+/// Compare local HEAD to `origin/<branch>` (call `fetch_branch` first).
+pub fn compare_head_to_remote(path: &Path, branch: &str) -> Result<HeadRemote> {
+    let head = head_sha(path)?;
+    let remote_ref = format!("origin/{branch}");
+    let remote = rev_parse(path, &remote_ref)?;
+
+    if head == remote {
+        return Ok(HeadRemote::Equal);
+    }
+
+    let head_is_ancestor = is_ancestor(path, "HEAD", &remote_ref)?;
+    let remote_is_ancestor = is_ancestor(path, &remote_ref, "HEAD")?;
+
+    Ok(match (head_is_ancestor, remote_is_ancestor) {
+        (true, false) => HeadRemote::Behind,
+        (false, true) => HeadRemote::Ahead,
+        _ => HeadRemote::Diverged,
+    })
+}
+
+/// The commit SHA a local tag points to (annotated tags are dereferenced).
+pub fn tag_sha(path: &Path, tag: &str) -> Result<String> {
+    let output = Command::new("git")
+        .args(["rev-list", "-n", "1", tag])
+        .current_dir(path)
+        .output()
+        .context("Failed to run git rev-list")?;
+
+    if !output.status.success() {
+        bail!(
+            "git rev-list {} failed: {}",
+            tag,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// The commit SHA a tag points to ON THE REMOTE, or `None` if the remote has no
+/// such tag. Annotated tags are dereferenced via the `^{}` peeled line.
+pub fn remote_tag_sha(path: &Path, tag: &str) -> Result<Option<String>> {
+    let refspec = format!("refs/tags/{tag}");
+    let output = Command::new("git")
+        .args(["ls-remote", "origin", &refspec])
+        .current_dir(path)
+        .output()
+        .context("Failed to run git ls-remote")?;
+
+    if !output.status.success() {
+        bail!(
+            "git ls-remote origin {} failed: {}",
+            refspec,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let peeled = format!("{refspec}^{{}}");
+    let mut plain_sha = None;
+    for line in stdout.lines() {
+        let Some((sha, name)) = line.split_once('\t') else {
+            continue;
+        };
+        if name == peeled {
+            // Peeled commit of an annotated tag: this is what the tag points to.
+            return Ok(Some(sha.trim().to_string()));
+        }
+        if name == refspec {
+            plain_sha = Some(sha.trim().to_string());
+        }
+    }
+    Ok(plain_sha)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

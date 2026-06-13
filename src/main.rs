@@ -389,6 +389,95 @@ fn gated_refusal_message(label: &str, rules: &[String]) -> String {
     )
 }
 
+/// --tag-only: create the annotated tag for the current manifest version on HEAD,
+/// after verifying HEAD is exactly the merged default-branch commit. No version
+/// change, no commit. Every check must hold or it exits non-zero with no mutation.
+fn tag_only(dir: &Path) -> Result<()> {
+    info!("tag_only: dir={}", dir.display());
+
+    // 1. Working tree must be clean.
+    if git::has_uncommitted_changes(dir)? {
+        bail!("--tag-only requires a clean working tree; commit or stash changes first.");
+    }
+
+    // 2. Must be on the remote default branch.
+    let default = git::remote_default_branch(dir)?;
+    let current = git::current_branch(dir)?;
+    if current != default {
+        bail!(
+            "--tag-only must run on the default branch '{default}', but HEAD is on '{current}'.\n\
+             Run: git checkout {default} && git pull --ff-only origin {default}"
+        );
+    }
+
+    // 3. HEAD must equal origin/<default> EXACTLY (not merely an ancestor).
+    git::fetch_branch(dir, &default)?;
+    match git::compare_head_to_remote(dir, &default)? {
+        git::HeadRemote::Equal => {}
+        git::HeadRemote::Behind => bail!(
+            "HEAD is behind origin/{default}; the merged bump commit isn't checked out.\n\
+             Run: git pull --ff-only origin {default}"
+        ),
+        git::HeadRemote::Ahead => bail!(
+            "HEAD is ahead of origin/{default}; the commit to tag is not merged/pushed yet.\n\
+             Merge the PR first, then run --tag-only on the merged commit."
+        ),
+        git::HeadRemote::Diverged => bail!(
+            "HEAD has diverged from origin/{default}; reconcile before tagging.\n\
+             Run: git pull --ff-only origin {default}"
+        ),
+    }
+
+    // 4. Manifest version -> tag name.
+    let project_type = detect_project_type(dir);
+    let file_version = read_file_version(dir, project_type)?
+        .and_then(|v| version::parse_version(&v).ok())
+        .ok_or_else(|| {
+            eyre::eyre!(
+                "--tag-only needs a version in {}; none found. \
+                 (Generic/tag-only projects have no manifest version to tag.)",
+                version_file_name(project_type)
+            )
+        })?;
+    let new_tag = version::format_tag(&file_version);
+    let head = git::head_sha(dir)?;
+
+    // 5. Tag-existence check, remote then local.
+    if let Some(remote_sha) = git::remote_tag_sha(dir, &new_tag)? {
+        if remote_sha == head {
+            println!("{new_tag} is already tagged at HEAD on origin. Nothing to do.");
+            return Ok(());
+        }
+        bail!(
+            "Tag {new_tag} already exists on origin at {remote_sha}, not HEAD ({head}).\n\
+             Resolving that is manual tag surgery, not bump's job."
+        );
+    }
+
+    if git::tag_exists(dir, &new_tag)? {
+        let local_sha = git::tag_sha(dir, &new_tag)?;
+        if local_sha == head {
+            println!("{new_tag} is already tagged at HEAD locally. Run: git push origin {new_tag}");
+            return Ok(());
+        }
+        bail!(
+            "Tag {new_tag} exists locally at {local_sha}, not HEAD ({head}).\n\
+             Resolving that is manual tag surgery, not bump's job."
+        );
+    }
+
+    // 6. Create the annotated tag on the merged commit.
+    let message = format!("Release {new_tag}");
+    git::create_tag(dir, &new_tag, &message)?;
+    info!("tag_only: created tag {new_tag} at {head}");
+    let short: String = head.chars().take(12).collect();
+    println!("Tagged {new_tag} on merged {default} ({short})");
+
+    // 7. Push hint (by explicit name; never --tags).
+    println!("Run: git push origin {new_tag}");
+    Ok(())
+}
+
 /// Process a single directory
 fn process_directory(dir: &Path, cli: &Cli, bump_type: BumpType) -> Result<()> {
     let dir_name = dir
@@ -399,6 +488,12 @@ fn process_directory(dir: &Path, cli: &Cli, bump_type: BumpType) -> Result<()> {
     // 1. Validate - is this a git repo?
     if !git::is_git_repo(dir) {
         bail!("Not a git repository: {}", dir.display());
+    }
+
+    // --tag-only is its own flow: tag the already-merged commit after a hard
+    // verification ladder. No version change, no commit, no gate refusal.
+    if cli.tag_only {
+        return tag_only(dir);
     }
 
     // --no-tag bumps the version and commits but creates no tag, so the orphan risk
@@ -1475,5 +1570,169 @@ name = "test-pkg"
 
         assert!(result.is_ok(), "--no-tag must not refuse on a gated repo: {result:?}");
         assert!(!git::tag_exists(dir, "v0.1.0").unwrap(), "still no tag under --no-tag");
+    }
+
+    // =========================================================================
+    // --tag-only (Phase 4): tag the merged commit after a verification ladder.
+    //
+    // These use a real bare "origin" so fetch / ls-remote / origin/HEAD behave.
+    // =========================================================================
+
+    /// Run a git command in `dir`, returning trimmed stdout (panics on failure).
+    fn git_in(dir: &Path, args: &[&str]) -> String {
+        let output = Command::new("git").args(args).current_dir(dir).output().unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// A bare `origin` plus a working clone on `main` at 0.1.0, HEAD == origin/main.
+    /// Returns both TempDirs (keep them alive for the test's duration).
+    fn setup_remote_repo() -> (TempDir, TempDir) {
+        let origin = TempDir::new().unwrap();
+        Command::new("git")
+            .args(["init", "--bare", "-b", "main"])
+            .current_dir(origin.path())
+            .output()
+            .unwrap();
+
+        let work = TempDir::new().unwrap();
+        setup_git_repo(work.path());
+        create_cargo_toml(work.path(), Some("0.1.0"));
+        create_initial_commit(work.path());
+        git_in(work.path(), &["branch", "-M", "main"]);
+        git_in(
+            work.path(),
+            &["remote", "add", "origin", origin.path().to_str().unwrap()],
+        );
+        git_in(work.path(), &["push", "-u", "origin", "main"]);
+        git_in(work.path(), &["remote", "set-head", "origin", "main"]);
+        (origin, work)
+    }
+
+    /// Happy path: HEAD == origin/main, no existing tag -> create vX.Y.Z.
+    #[test]
+    fn tag_only_creates_tag_on_merged_head() {
+        let (_origin, work) = setup_remote_repo();
+        let dir = work.path();
+
+        tag_only(dir).unwrap();
+
+        assert!(
+            git::tag_exists(dir, "v0.1.0").unwrap(),
+            "tag must be created on merged HEAD"
+        );
+        assert_eq!(git::tag_sha(dir, "v0.1.0").unwrap(), git::head_sha(dir).unwrap());
+    }
+
+    /// Step 1: dirty working tree refuses, no tag.
+    #[test]
+    fn tag_only_refuses_dirty_tree() {
+        let (_origin, work) = setup_remote_repo();
+        let dir = work.path();
+        fs::write(dir.join("dirty.txt"), "x").unwrap();
+
+        let err = tag_only(dir).unwrap_err().to_string();
+        assert!(err.contains("clean working tree"), "got: {err}");
+        assert!(!git::tag_exists(dir, "v0.1.0").unwrap());
+    }
+
+    /// Step 2: not on the default branch refuses, no tag.
+    #[test]
+    fn tag_only_refuses_wrong_branch() {
+        let (_origin, work) = setup_remote_repo();
+        let dir = work.path();
+        git_in(dir, &["checkout", "-b", "feature"]);
+
+        let err = tag_only(dir).unwrap_err().to_string();
+        assert!(err.contains("default branch"), "got: {err}");
+        assert!(!git::tag_exists(dir, "v0.1.0").unwrap());
+    }
+
+    /// Step 3: HEAD ahead of origin/main refuses with a distinct message.
+    #[test]
+    fn tag_only_refuses_when_ahead() {
+        let (_origin, work) = setup_remote_repo();
+        let dir = work.path();
+        git_in(dir, &["commit", "--allow-empty", "-m", "unmerged work"]);
+
+        let err = tag_only(dir).unwrap_err().to_string();
+        assert!(err.contains("ahead"), "got: {err}");
+        assert!(!git::tag_exists(dir, "v0.1.0").unwrap());
+    }
+
+    /// Step 3: HEAD behind origin/main refuses with a distinct message.
+    #[test]
+    fn tag_only_refuses_when_behind() {
+        let (_origin, work) = setup_remote_repo();
+        let dir = work.path();
+        let c1 = git::head_sha(dir).unwrap();
+        git_in(dir, &["commit", "--allow-empty", "-m", "c2"]);
+        git_in(dir, &["push", "origin", "main"]);
+        git_in(dir, &["reset", "--hard", &c1]);
+
+        let err = tag_only(dir).unwrap_err().to_string();
+        assert!(err.contains("behind"), "got: {err}");
+        assert!(!git::tag_exists(dir, "v0.1.0").unwrap());
+    }
+
+    /// Step 5: a local tag already at HEAD is idempotent success.
+    #[test]
+    fn tag_only_idempotent_local_tag_at_head() {
+        let (_origin, work) = setup_remote_repo();
+        let dir = work.path();
+        git_in(dir, &["tag", "-a", "v0.1.0", "-m", "v0.1.0"]);
+
+        let result = tag_only(dir);
+        assert!(result.is_ok(), "local tag at HEAD must be idempotent: {result:?}");
+    }
+
+    /// Step 5: a remote tag at a different commit is a refusal, no local tag.
+    #[test]
+    fn tag_only_refuses_remote_tag_conflict() {
+        let (_origin, work) = setup_remote_repo();
+        let dir = work.path();
+        let c1 = git::head_sha(dir).unwrap();
+        // Tag v0.1.0 at a different commit and push only the tag, then return to c1.
+        git_in(dir, &["commit", "--allow-empty", "-m", "other"]);
+        git_in(dir, &["tag", "-a", "v0.1.0", "-m", "v0.1.0"]);
+        git_in(dir, &["push", "origin", "v0.1.0"]);
+        git_in(dir, &["reset", "--hard", &c1]);
+        // Drop the local tag so only the remote one remains in conflict.
+        git_in(dir, &["tag", "-d", "v0.1.0"]);
+
+        let err = tag_only(dir).unwrap_err().to_string();
+        assert!(err.contains("already exists on origin"), "got: {err}");
+        assert!(
+            !git::tag_exists(dir, "v0.1.0").unwrap(),
+            "no local tag created on conflict"
+        );
+    }
+
+    /// Step 4: a generic (no-manifest-version) repo cannot --tag-only.
+    #[test]
+    fn tag_only_generic_no_version_errors() {
+        let origin = TempDir::new().unwrap();
+        Command::new("git")
+            .args(["init", "--bare", "-b", "main"])
+            .current_dir(origin.path())
+            .output()
+            .unwrap();
+        let work = TempDir::new().unwrap();
+        setup_git_repo(work.path());
+        create_initial_commit(work.path()); // no Cargo.toml -> Generic
+        git_in(work.path(), &["branch", "-M", "main"]);
+        git_in(
+            work.path(),
+            &["remote", "add", "origin", origin.path().to_str().unwrap()],
+        );
+        git_in(work.path(), &["push", "-u", "origin", "main"]);
+        git_in(work.path(), &["remote", "set-head", "origin", "main"]);
+
+        let err = tag_only(work.path()).unwrap_err().to_string();
+        assert!(err.contains("needs a version"), "got: {err}");
     }
 }

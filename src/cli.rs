@@ -38,8 +38,13 @@ pub struct Cli {
     pub force: bool,
 
     /// Bump version and commit, but do NOT create a tag (for PR-gated repos)
-    #[arg(long)]
+    #[arg(long, conflicts_with = "tag_only")]
     pub no_tag: bool,
+
+    /// Create the tag for the current manifest version on HEAD (post-merge step
+    /// for PR-gated repos). No version change, no commit.
+    #[arg(long, conflicts_with_all = ["no_tag", "major", "minor", "force", "message", "automatic"])]
+    pub tag_only: bool,
 
     /// Skip the remote gate probe (treat the repo as ungated)
     #[arg(long)]
@@ -237,6 +242,28 @@ mod tests {
         assert!(cli.no_tag);
         let cli = Cli::try_parse_from(["bump"]).unwrap();
         assert!(!cli.no_tag);
+    }
+
+    #[test]
+    fn test_cli_tag_only_flag() {
+        let cli = Cli::try_parse_from(["bump", "--tag-only"]).unwrap();
+        assert!(cli.tag_only);
+        let cli = Cli::try_parse_from(["bump"]).unwrap();
+        assert!(!cli.tag_only);
+    }
+
+    #[test]
+    fn test_cli_tag_only_conflicts_with_no_tag() {
+        assert!(Cli::try_parse_from(["bump", "--tag-only", "--no-tag"]).is_err());
+    }
+
+    #[test]
+    fn test_cli_tag_only_conflicts_with_bump_flags() {
+        assert!(Cli::try_parse_from(["bump", "--tag-only", "-M"]).is_err());
+        assert!(Cli::try_parse_from(["bump", "--tag-only", "-m"]).is_err());
+        assert!(Cli::try_parse_from(["bump", "--tag-only", "--force"]).is_err());
+        assert!(Cli::try_parse_from(["bump", "--tag-only", "-a"]).is_err());
+        assert!(Cli::try_parse_from(["bump", "--tag-only", "--message", "x"]).is_err());
     }
 
     #[test]

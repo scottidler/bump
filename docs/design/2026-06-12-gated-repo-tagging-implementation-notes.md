@@ -104,3 +104,38 @@ Running, append-only record of how the implementation interprets or diverges fro
   conflicts with the git.md rule (never `git push --tags`; push the tag by explicit name).
   Left unchanged here (out of --no-tag scope); corrected in Phase 5 alongside the README /
   after_help push recipes.
+
+## Phase 4: --tag-only
+
+### Design decisions
+- `compare_head_to_remote` returns a `HeadRemote` enum (`Equal`/`Ahead`/`Behind`/
+  `Diverged`) — `src/git.rs` — rather than the design's literal `head_equals_remote`
+  boolean. The ladder needs to emit *distinct* ahead/behind/diverged errors (design step 3
+  explicitly: "behind and ahead are both errors with distinct messages"), which a bool
+  cannot carry.
+- Extra git primitives beyond the design's four — added `current_branch`, `head_sha`,
+  `tag_sha`, plus private `rev_parse`/`is_ancestor` helpers — in addition to the specified
+  `fetch_branch`, `remote_default_branch`, `remote_tag_sha`. The ladder's branch check and
+  idempotency/conflict comparisons need them.
+- `remote_tag_sha` dereferences annotated tags via the `^{}` peeled line — `src/git.rs` —
+  so the comparison is commit-vs-commit (an annotated tag's own object SHA is never equal
+  to HEAD's commit SHA; comparing the peeled commit is what makes idempotency correct).
+- `--tag-only` does not invoke the gate refusal — `process_directory` dispatches to
+  `tag_only` before the gate block. The exact `HEAD == origin/<default>` equality check is
+  the real safety here (the design: the probe would only "label its report, never refuse").
+- Tag message is `Release vX.Y.Z` — the merged commit already has its own message; the
+  annotated-tag message just records the release.
+
+### Deviations
+- None beyond the enum rename noted above.
+
+### Tradeoffs
+- `remote_default_branch` (git.rs) overlaps `github::local_default_branch` — both read the
+  `origin/HEAD` symref. Kept separate: git.rs owns the tag-only ladder's git plumbing,
+  github.rs owns gate probing. Unifying would couple the two modules for ~5 lines.
+- Tests stand up a real bare `origin` and exercise fetch/ls-remote/reset against it (no
+  network, all filesystem), covering every ladder rung in isolation: dirty tree, wrong
+  branch, ahead, behind, local-idempotent, remote-conflict, generic-no-version, happy path.
+
+### Open questions
+- None.
