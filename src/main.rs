@@ -1,6 +1,6 @@
 use clap::Parser;
 use eyre::{Context, Result, bail};
-use log::info;
+use log::{info, warn};
 use semver::Version;
 use std::env;
 use std::fs;
@@ -373,6 +373,22 @@ fn determine_commit_message(
     prompt_commit_message_with_editor(staged_files)
 }
 
+/// Build the gated-repo refusal message: names the gated branch/repo and the
+/// blocking rules, explains the orphan risk, and prints the gated release recipe.
+fn gated_refusal_message(label: &str, rules: &[String]) -> String {
+    format!(
+        "{label} is gated ({}).\n\
+         Tagging here would orphan the tag (squash-merge rewrites the SHA).\n\n\
+         Gated flow:\n  \
+         bump --no-tag [-m|-M]      # version bump rides your branch/PR\n  \
+         <push branch, open PR, merge>\n  \
+         git checkout main && git pull --ff-only origin main\n  \
+         bump --tag-only            # tag the merged commit\n  \
+         git push origin vX.Y.Z",
+        rules.join(", ")
+    )
+}
+
 /// Process a single directory
 fn process_directory(dir: &Path, cli: &Cli, bump_type: BumpType) -> Result<()> {
     let dir_name = dir
@@ -385,10 +401,30 @@ fn process_directory(dir: &Path, cli: &Cli, bump_type: BumpType) -> Result<()> {
         bail!("Not a git repository: {}", dir.display());
     }
 
-    // 1b. Probe the remote default-branch gate. Phase 1 only observes and logs the
-    //     verdict; the refusal/warn-and-proceed policy is wired in Phase 2.
-    let gate = github::detect(dir);
-    info!("Gate status for {}: {:?}", dir.display(), gate);
+    // 1b. Probe the remote default-branch gate and apply policy BEFORE any mutation:
+    //     refuse on a gated branch (tagging would orphan the tag), warn-and-proceed
+    //     when the probe is inconclusive, skip entirely under --no-verify.
+    if cli.no_verify {
+        info!("Skipping gate probe for {} (--no-verify)", dir.display());
+    } else {
+        match github::detect(dir) {
+            github::Gate::Ungated => {
+                info!("Gate status for {}: ungated", dir.display());
+            }
+            github::Gate::Gated(rules) => {
+                info!("Gate status for {}: gated by {:?}", dir.display(), rules);
+                bail!("{}", gated_refusal_message(&github::repo_label(dir), &rules));
+            }
+            github::Gate::Unknown(reason) => {
+                warn!("Gate probe inconclusive for {}: {}", dir.display(), reason);
+                eprintln!(
+                    "bump: WARNING: could not verify branch-protection gates ({reason}); \
+                     proceeding as ungated.\n\
+                     If this repo is PR-gated, run `bump --gates` once online before tagging."
+                );
+            }
+        }
+    }
 
     // 2. Detect project type
     let project_type = detect_project_type(dir);
@@ -587,7 +623,9 @@ fn main() -> Result<()> {
         }
     }
 
-    if failures > 0 && successes == 0 {
+    // Exit non-zero if ANY directory failed, so a gated refusal (or any error) in a
+    // batch fails loudly instead of being masked by a sibling success.
+    if failures > 0 {
         std::process::exit(1);
     }
 
@@ -1250,5 +1288,104 @@ name = "test-pkg"
         assert_eq!(action.target_version, Version::new(2, 0, 0));
         assert!(!action.needs_file_update);
         assert!(!action.is_initial_tag);
+    }
+
+    // =========================================================================
+    // GATE POLICY (Phase 2): gated refusal / unknown-proceed / --no-verify
+    //
+    // These exercise process_directory with the BUMP_GATES_PROBE env seam, so no
+    // network is touched. Env mutation is serialized behind ENV_LOCK.
+    // =========================================================================
+
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Set BUMP_GATES_PROBE, returning the prior value for restoration.
+    fn set_probe(val: &str) -> Option<String> {
+        let prev = env::var("BUMP_GATES_PROBE").ok();
+        unsafe { env::set_var("BUMP_GATES_PROBE", val) };
+        prev
+    }
+
+    fn restore_probe(prev: Option<String>) {
+        match prev {
+            Some(v) => unsafe { env::set_var("BUMP_GATES_PROBE", v) },
+            None => unsafe { env::remove_var("BUMP_GATES_PROBE") },
+        }
+    }
+
+    /// Minimal Rust repo at 0.1.0 with one commit and no tags. Without gating,
+    /// process_directory would create the initial tag v0.1.0.
+    fn setup_taggable_repo(dir: &Path) {
+        setup_git_repo(dir);
+        create_cargo_toml(dir, Some("0.1.0"));
+        create_initial_commit(dir);
+    }
+
+    /// A gated repo must refuse and make NO mutation (no tag created).
+    #[test]
+    fn gated_refusal_aborts_before_mutation() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        setup_taggable_repo(dir);
+
+        let cli = Cli::try_parse_from(["bump"]).unwrap();
+        let prev = set_probe("gated:pull_request,workflows");
+        let result = process_directory(dir, &cli, BumpType::Patch);
+        restore_probe(prev);
+
+        assert!(result.is_err(), "gated repo must refuse to tag");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("gated"), "error must name the gate, got: {err}");
+        assert!(
+            err.contains("--tag-only"),
+            "error must show the gated recipe, got: {err}"
+        );
+        assert!(
+            !git::tag_exists(dir, "v0.1.0").unwrap(),
+            "no tag may be created when refusing"
+        );
+    }
+
+    /// An inconclusive probe (Unknown) proceeds and tags.
+    #[test]
+    fn unknown_gate_proceeds_and_tags() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        setup_taggable_repo(dir);
+
+        let cli = Cli::try_parse_from(["bump"]).unwrap();
+        let prev = set_probe("unknown:offline");
+        let result = process_directory(dir, &cli, BumpType::Patch);
+        restore_probe(prev);
+
+        assert!(result.is_ok(), "unknown gate must proceed: {result:?}");
+        assert!(
+            git::tag_exists(dir, "v0.1.0").unwrap(),
+            "tag must be created when proceeding"
+        );
+    }
+
+    /// --no-verify bypasses the probe even when the repo would be gated.
+    #[test]
+    fn no_verify_skips_gate_probe() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        setup_taggable_repo(dir);
+
+        let cli = Cli::try_parse_from(["bump", "--no-verify"]).unwrap();
+        let prev = set_probe("gated:pull_request");
+        let result = process_directory(dir, &cli, BumpType::Patch);
+        restore_probe(prev);
+
+        assert!(result.is_ok(), "--no-verify must bypass gating: {result:?}");
+        assert!(
+            git::tag_exists(dir, "v0.1.0").unwrap(),
+            "tag must be created under --no-verify"
+        );
     }
 }

@@ -42,3 +42,35 @@ Running, append-only record of how the implementation interprets or diverges fro
 
 ### Open questions
 - None.
+
+## Phase 2: gated refusal in the default path
+
+### Design decisions
+- Refusal surfaced via `bail!` — `src/main.rs:process_directory` — the gated recipe is
+  returned as the `eyre` error so `main`'s existing `eprintln!("Error: {:#}", e)` handler
+  renders it as one coherent message (the message is worded so the `Error:` prefix reads
+  naturally). This reuses the existing error/exit path rather than printing-then-bailing
+  (which would double-print).
+- Repo label without a re-probe — `src/github.rs:repo_label` / `local_default_branch` —
+  the refusal message names "'branch' on owner/repo" using local git only (remote URL +
+  `refs/remotes/origin/HEAD` symref), no extra network call. `default_branch` was
+  refactored to share `local_default_branch`.
+- Gate check placement — runs at step 1b, before project detection and any file/git
+  mutation, so refusal is guaranteed to precede mutation (verified by
+  `gated_refusal_aborts_before_mutation`).
+
+### Deviations
+- Aggregate exit code — `src/main.rs:main` — changed the multi-directory exit condition
+  from `failures > 0 && successes == 0` to `failures > 0`. The design's Phase 2 calls out
+  "aggregate exit code" and the risk table wants gated refusals in a batch to "fail
+  loudly"; under the old condition a gated refusal was masked by any sibling success. This
+  also makes any other per-repo error fail the batch, which is the more correct behavior.
+
+### Tradeoffs
+- The Unknown-policy warning and the refusal recipe both reference flags that land in
+  later phases (`--gates`, `--no-tag`, `--tag-only`). Since all five phases ship in one
+  push, the referenced flags exist by release time; the intermediate commits name them
+  ahead of their implementation by design (the recipe is the whole point of the feature).
+
+### Open questions
+- None.

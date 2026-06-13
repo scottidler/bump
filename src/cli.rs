@@ -37,6 +37,10 @@ pub struct Cli {
     #[arg(short = 'f', long)]
     pub force: bool,
 
+    /// Skip the remote gate probe (treat the repo as ungated)
+    #[arg(long)]
+    pub no_verify: bool,
+
     /// Paths to git repository roots
     #[arg(value_name = "DIRECTORIES")]
     pub directories: Vec<PathBuf>,
@@ -213,6 +217,14 @@ mod tests {
     fn test_cli_force_short_flag() {
         let cli = Cli::try_parse_from(["bump", "-f"]).unwrap();
         assert!(cli.force);
+    }
+
+    #[test]
+    fn test_cli_no_verify_flag() {
+        let cli = Cli::try_parse_from(["bump", "--no-verify"]).unwrap();
+        assert!(cli.no_verify);
+        let cli = Cli::try_parse_from(["bump"]).unwrap();
+        assert!(!cli.no_verify);
     }
 
     #[test]

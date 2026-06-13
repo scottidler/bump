@@ -127,6 +127,32 @@ fn org_of(slug: &str) -> &str {
     slug.split('/').next().unwrap_or(slug)
 }
 
+/// Best-effort "'branch' on owner/repo" label for user-facing messages. Uses
+/// only local git (no network), falling back to generic wording when a piece is
+/// unavailable, so it is safe to call on the rare refusal/warning path.
+pub fn repo_label(path: &Path) -> String {
+    let slug = remote_slug(path).unwrap_or_else(|| "this repo".to_string());
+    let branch = local_default_branch(path).unwrap_or_else(|| "the default branch".to_string());
+    format!("'{branch}' on {slug}")
+}
+
+/// Read the remote default branch from the local `refs/remotes/origin/HEAD`
+/// symref only (no API fallback). `None` if the symref is absent.
+fn local_default_branch(path: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .args(["symbolic-ref", "refs/remotes/origin/HEAD"])
+        .current_dir(path)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .strip_prefix("refs/remotes/origin/")
+        .map(str::to_string)
+}
+
 /// Resolve the GitHub `owner/repo` slug from the `origin` remote, or `None` if
 /// there is no `origin` or it is not a github.com remote.
 fn remote_slug(path: &Path) -> Option<String> {
@@ -188,19 +214,9 @@ fn normalize_slug(path: &str) -> Option<String> {
 /// Resolve the remote default branch name. Prefers the local
 /// `refs/remotes/origin/HEAD` symref; falls back to the GitHub API.
 fn default_branch(path: &Path, slug: &str) -> Result<String> {
-    let symref = Command::new("git")
-        .args(["symbolic-ref", "refs/remotes/origin/HEAD"])
-        .current_dir(path)
-        .output();
-
-    if let Ok(output) = symref
-        && output.status.success()
-    {
-        let full = String::from_utf8_lossy(&output.stdout);
-        if let Some(branch) = full.trim().strip_prefix("refs/remotes/origin/") {
-            debug!("default_branch: {slug} -> {branch} (symref)");
-            return Ok(branch.to_string());
-        }
+    if let Some(branch) = local_default_branch(path) {
+        debug!("default_branch: {slug} -> {branch} (symref)");
+        return Ok(branch);
     }
 
     // Fallback: ask GitHub directly.
