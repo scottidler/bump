@@ -11,6 +11,7 @@ use tempfile::NamedTempFile;
 mod cargo;
 mod cli;
 mod git;
+mod github;
 mod python;
 mod version;
 
@@ -383,6 +384,11 @@ fn process_directory(dir: &Path, cli: &Cli, bump_type: BumpType) -> Result<()> {
     if !git::is_git_repo(dir) {
         bail!("Not a git repository: {}", dir.display());
     }
+
+    // 1b. Probe the remote default-branch gate. Phase 1 only observes and logs the
+    //     verdict; the refusal/warn-and-proceed policy is wired in Phase 2.
+    let gate = github::detect(dir);
+    info!("Gate status for {}: {:?}", dir.display(), gate);
 
     // 2. Detect project type
     let project_type = detect_project_type(dir);

@@ -45,9 +45,13 @@ pub struct Cli {
 /// Generate tool validation help text (called once via LazyLock)
 fn get_tool_validation_help() -> String {
     let git_status = check_tool_version("git", "--version", "2.20.0");
+    let gh_status = check_tool_version("gh", "--version", "2.0.0");
     format!(
-        "REQUIRED TOOLS:\n  {} {:<10} {}\n\nLogs are written to: ~/.local/share/bump/logs/bump.log",
-        git_status.status_icon, "git", git_status.version
+        "REQUIRED TOOLS:\n  {} {:<10} {}\n  {} {:<10} {}\n\n\
+         gh is used to probe branch-protection gates; without it gated repos cannot be\n\
+         detected and bump warns and proceeds as if ungated.\n\n\
+         Logs are written to: ~/.local/share/bump/logs/bump.log",
+        git_status.status_icon, "git", git_status.version, gh_status.status_icon, "gh", gh_status.version
     )
 }
 
@@ -83,13 +87,13 @@ fn check_tool_version(tool: &str, version_arg: &str, min_version: &str) -> ToolS
 
 /// Extract version number from tool output
 fn extract_version_from_output(tool: &str, output: &str) -> String {
-    if tool == "git" {
-        // git version 2.34.1
-        if let Some(line) = output.lines().next()
-            && let Some(version_part) = line.split_whitespace().nth(2)
-        {
-            return version_part.to_string();
-        }
+    // Both `git --version` ("git version 2.34.1") and `gh --version`
+    // ("gh version 2.40.1 (2023-12-13)") put the version in the third field.
+    if (tool == "git" || tool == "gh")
+        && let Some(line) = output.lines().next()
+        && let Some(version_part) = line.split_whitespace().nth(2)
+    {
+        return version_part.to_string();
     }
     "unknown".to_string()
 }
@@ -130,6 +134,12 @@ mod tests {
     fn test_extract_git_version() {
         let output = "git version 2.43.0";
         assert_eq!(extract_version_from_output("git", output), "2.43.0");
+    }
+
+    #[test]
+    fn test_extract_gh_version() {
+        let output = "gh version 2.40.1 (2023-12-13)\nhttps://github.com/cli/cli/releases/latest";
+        assert_eq!(extract_version_from_output("gh", output), "2.40.1");
     }
 
     #[test]
