@@ -139,3 +139,33 @@ Running, append-only record of how the implementation interprets or diverges fro
 
 ### Open questions
 - None.
+
+## Phase 5: --gates report, help, docs, ecosystem cleanup
+
+### Design decisions
+- `--gates` report — `src/main.rs:report_gates` — prints Repo / Branch / Gates plus the
+  matching flow recipe, mirroring the interim `tagit gates` output, then exits 0. It calls
+  the now-public `github::remote_slug` / `github::local_default_branch` for the header and
+  `github::detect` for the verdict.
+- Fixed the ungated tagging path's push hint from `git push && git push --tags` to
+  `git push origin <branch> && git push origin vX.Y.Z` — the old form violated the git.md
+  "never `git push --tags`" rule (followTags can land the tag even when the branch push is
+  rejected, which orphaned okta-auth-rs v0.2.0). README examples updated to match. This was
+  flagged as an open question in Phase 3 and resolved here.
+- `after_help` now leads with both RELEASE FLOWS (ungated/gated) ahead of REQUIRED TOOLS
+  and the log path.
+
+### Deviations
+- Ecosystem cleanup (retire `tagit`, collapse the bump/shipit skills and the git.md
+  tagging rule to one-liners pointing at `bump --gates`/`--no-tag`/`--tag-only`) is NOT
+  done in this commit. Those files live in a different repo (`scottidler/claude`) and
+  retiring `tagit` is a deletion; per the safety rules and the single-repo scope of this
+  execution, they are surfaced to the user as follow-ups rather than changed automatically.
+
+### Tradeoffs
+- None.
+
+### Open questions
+- Follow-up (cross-repo, for the user): retire `~/.claude/bin/tagit` (via `rkvr`), and
+  update `git.md` + the `bump`/`shipit` skills to point at the new `bump` flags now that
+  `bump` owns the gated flow.

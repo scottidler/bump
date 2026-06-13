@@ -46,6 +46,10 @@ pub struct Cli {
     #[arg(long, conflicts_with_all = ["no_tag", "major", "minor", "force", "message", "automatic"])]
     pub tag_only: bool,
 
+    /// Report gate status (classic protection + rulesets) and the recommended flow
+    #[arg(long)]
+    pub gates: bool,
+
     /// Skip the remote gate probe (treat the repo as ungated)
     #[arg(long)]
     pub no_verify: bool,
@@ -60,7 +64,13 @@ fn get_tool_validation_help() -> String {
     let git_status = check_tool_version("git", "--version", "2.20.0");
     let gh_status = check_tool_version("gh", "--version", "2.0.0");
     format!(
-        "REQUIRED TOOLS:\n  {} {:<10} {}\n  {} {:<10} {}\n\n\
+        "RELEASE FLOWS (run `bump --gates` to see which applies to this repo):\n\
+         \x20 ungated:  bump [-m|-M]  &&  git push origin <branch>  &&  git push origin vX.Y.Z\n\
+         \x20 gated:    bump --no-tag [-m|-M]   (version bump rides your PR branch)\n\
+         \x20           <push branch, open PR, merge>\n\
+         \x20           git checkout <default> && git pull --ff-only origin <default>\n\
+         \x20           bump --tag-only  &&  git push origin vX.Y.Z\n\n\
+         REQUIRED TOOLS:\n  {} {:<10} {}\n  {} {:<10} {}\n\n\
          gh is used to probe branch-protection gates; without it gated repos cannot be\n\
          detected and bump warns and proceeds as if ungated.\n\n\
          Logs are written to: ~/.local/share/bump/logs/bump.log",
@@ -250,6 +260,14 @@ mod tests {
         assert!(cli.tag_only);
         let cli = Cli::try_parse_from(["bump"]).unwrap();
         assert!(!cli.tag_only);
+    }
+
+    #[test]
+    fn test_cli_gates_flag() {
+        let cli = Cli::try_parse_from(["bump", "--gates"]).unwrap();
+        assert!(cli.gates);
+        let cli = Cli::try_parse_from(["bump"]).unwrap();
+        assert!(!cli.gates);
     }
 
     #[test]

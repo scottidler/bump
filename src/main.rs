@@ -389,6 +389,46 @@ fn gated_refusal_message(label: &str, rules: &[String]) -> String {
     )
 }
 
+/// --gates: probe and report the branch-protection verdict and the recommended
+/// release flow for this repo, then exit 0. Purely informational.
+fn report_gates(dir: &Path) -> Result<()> {
+    info!("report_gates: dir={}", dir.display());
+
+    let slug = github::remote_slug(dir).unwrap_or_else(|| "(no github remote)".to_string());
+    let branch = github::local_default_branch(dir).unwrap_or_else(|| "(unknown)".to_string());
+
+    println!("Repo:   {slug}");
+    println!("Branch: {branch}");
+
+    match github::detect(dir) {
+        github::Gate::Ungated => {
+            println!("Gates:  none (ungated)");
+            println!();
+            println!("Ungated flow:");
+            println!("  bump [-m|-M]");
+            println!("  git push origin {branch}");
+            println!("  git push origin vX.Y.Z");
+        }
+        github::Gate::Gated(rules) => {
+            println!("Gates:  {} (gated)", rules.join(", "));
+            println!();
+            println!("Gated flow:");
+            println!("  bump --no-tag [-m|-M]      # version bump rides your branch/PR");
+            println!("  <push branch, open PR, merge>");
+            println!("  git checkout {branch} && git pull --ff-only origin {branch}");
+            println!("  bump --tag-only            # tag the merged commit");
+            println!("  git push origin vX.Y.Z");
+        }
+        github::Gate::Unknown(reason) => {
+            println!("Gates:  UNKNOWN (could not verify: {reason})");
+            println!();
+            println!("Re-run `bump --gates` once online / authenticated for a verdict.");
+        }
+    }
+
+    Ok(())
+}
+
 /// --tag-only: create the annotated tag for the current manifest version on HEAD,
 /// after verifying HEAD is exactly the merged default-branch commit. No version
 /// change, no commit. Every check must hold or it exits non-zero with no mutation.
@@ -488,6 +528,11 @@ fn process_directory(dir: &Path, cli: &Cli, bump_type: BumpType) -> Result<()> {
     // 1. Validate - is this a git repo?
     if !git::is_git_repo(dir) {
         bail!("Not a git repository: {}", dir.display());
+    }
+
+    // --gates is informational: report the verdict and recommended flow, then exit 0.
+    if cli.gates {
+        return report_gates(dir);
     }
 
     // --tag-only is its own flow: tag the already-merged commit after a hard
@@ -685,7 +730,10 @@ fn process_directory(dir: &Path, cli: &Cli, bump_type: BumpType) -> Result<()> {
     }
 
     if create_tag {
-        println!("Run: git push && git push --tags");
+        // Push the branch first, then the tag BY EXPLICIT NAME (never `git push --tags`,
+        // which can land the tag even when the branch push is rejected).
+        let branch = git::current_branch(dir).unwrap_or_else(|_| "<branch>".to_string());
+        println!("Run: git push origin {branch} && git push origin {new_tag}");
     } else {
         println!("Run: git push <branch>  (open a PR; after merge, tag with: bump --tag-only)");
     }
@@ -1734,5 +1782,27 @@ name = "test-pkg"
 
         let err = tag_only(work.path()).unwrap_err().to_string();
         assert!(err.contains("needs a version"), "got: {err}");
+    }
+
+    // =========================================================================
+    // --gates report (Phase 5)
+    // =========================================================================
+
+    /// report_gates renders (and succeeds) for every verdict.
+    #[test]
+    fn report_gates_runs_for_each_verdict() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        setup_git_repo(dir);
+        create_cargo_toml(dir, Some("0.1.0"));
+        create_initial_commit(dir);
+
+        for probe in ["ungated", "gated:pull_request,workflows", "unknown:offline"] {
+            let prev = set_probe(probe);
+            let result = report_gates(dir);
+            restore_probe(prev);
+            assert!(result.is_ok(), "report_gates must succeed for {probe}: {result:?}");
+        }
     }
 }

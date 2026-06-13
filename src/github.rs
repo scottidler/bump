@@ -138,7 +138,7 @@ pub fn repo_label(path: &Path) -> String {
 
 /// Read the remote default branch from the local `refs/remotes/origin/HEAD`
 /// symref only (no API fallback). `None` if the symref is absent.
-fn local_default_branch(path: &Path) -> Option<String> {
+pub fn local_default_branch(path: &Path) -> Option<String> {
     let output = Command::new("git")
         .args(["symbolic-ref", "refs/remotes/origin/HEAD"])
         .current_dir(path)
@@ -155,7 +155,7 @@ fn local_default_branch(path: &Path) -> Option<String> {
 
 /// Resolve the GitHub `owner/repo` slug from the `origin` remote, or `None` if
 /// there is no `origin` or it is not a github.com remote.
-fn remote_slug(path: &Path) -> Option<String> {
+pub fn remote_slug(path: &Path) -> Option<String> {
     let output = Command::new("git")
         .args(["remote", "get-url", "origin"])
         .current_dir(path)
