@@ -43,3 +43,31 @@ the terminal print, tests, and this note.
 
 ### Open questions
 - None.
+
+## Post-audit fixes (review-panel Implementation Audit, commit b71b630)
+
+The Architect approved with zero findings; the Staff Engineer surfaced two real
+cheap-wins (both fail-closed / disclosure gaps, neither a correctness defect). Both
+were fixed rather than merely disclosed:
+
+- **Non-Rust `--skip-member` no longer rots silently.** `validate_project`
+  (`src/main.rs`) previously returned `Ok(())` for a non-Rust project *before* looking
+  at `skip_members`, so `bump --skip-member typo` on a Python/generic repo was a silent
+  no-op — contradicting the CLI help, the doc's "a stale skip flag can't rot silently in
+  CI" goal, and the fail-closed rule. Now a non-empty `skip_members` on a non-Rust
+  project `bail!`s. Covered by `validate_skip_member_on_non_rust_aborts`.
+- **Terminal visibility is now a biting test.** The `println!` skip announcement had no
+  test that would catch a `println!` -> `info!` regression (the exact failure this
+  feature exists to prevent). Added `tests/skip_member.rs`, an end-to-end test that runs
+  the compiled binary and asserts the skip line appears on real stdout. The earlier
+  "Deviations: None" overstated coverage on this axis; this note and the new test correct
+  it.
+
+### Decisions reaffirmed by the audit (no change)
+- `num_args = 1..` (space-separated) is kept: `rules/cli.md` mandates space-separated
+  list flags, so repeated-only would violate the house rule. The trailing-positional
+  greediness fails closed (a swallowed directory becomes a stale skip name that aborts
+  validation before any mutation). The behavior is now an asserted contract:
+  `test_cli_skip_member_swallows_trailing_positional` (`src/cli.rs`).
+- Stale-before-unhandled check ordering, and printing the skip under `--dry-run`, were
+  both confirmed correct.

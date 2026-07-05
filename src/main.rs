@@ -133,6 +133,20 @@ fn validate_project(dir: &Path, project_type: ProjectType, skip_members: &[Strin
     );
 
     if project_type != ProjectType::Rust {
+        // --skip-member is a Cargo-workspace concept. Fail closed rather than let a
+        // stale flag no-op silently on a Python/generic repo (the doc's whole point is
+        // that a stale skip can't rot unnoticed in CI).
+        if !skip_members.is_empty() {
+            warn!(
+                "validate_project: --skip-member on a non-Rust ({}) project: {:?}",
+                project_type, skip_members
+            );
+            bail!(
+                "--skip-member is only meaningful for a Cargo workspace, but this is a {} project.\n\
+                 There are no independently-versioned members to skip here; remove the flag.",
+                project_type
+            );
+        }
         return Ok(());
     }
 
@@ -1963,6 +1977,22 @@ name = "test-pkg"
             .to_string();
         assert!(err.contains("not independently versioned"), "got: {err}");
         assert!(err.contains("pricing"), "must name the stale skip: {err}");
+    }
+
+    /// --skip-member on a non-Rust (Python/generic) project fails closed rather than
+    /// no-op silently -- there are no independent members to skip there.
+    #[test]
+    fn validate_skip_member_on_non_rust_aborts() {
+        let tmp = TempDir::new().unwrap();
+        create_pyproject_toml(tmp.path(), Some("1.0.0"));
+
+        let err = validate_project(tmp.path(), ProjectType::Python, &["claude-pricing".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("only meaningful for a Cargo workspace"), "got: {err}");
+
+        // No flag on a non-Rust project is still fine (unchanged behavior).
+        assert!(validate_project(tmp.path(), ProjectType::Python, &[]).is_ok());
     }
 
     /// A --skip-member naming no independent member aborts (fail closed on a stale flag).

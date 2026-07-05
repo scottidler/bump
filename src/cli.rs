@@ -320,4 +320,28 @@ mod tests {
         let cli = Cli::try_parse_from(["bump", "--skip-member", "claude-pricing"]).unwrap();
         assert_eq!(cli.skip_member, vec!["claude-pricing".to_string()]);
     }
+
+    /// Documented footgun: `--skip-member` uses num_args=1.. (space-separated, per the
+    /// house CLI rule), so a trailing DIRECTORIES positional is greedily swallowed into
+    /// the skip list. This is a KNOWN contract, not a surprise -- and it fails closed
+    /// downstream (the swallowed path is a stale skip name that aborts validation). The
+    /// realistic invocation runs bump in the repo (no positional) or puts the directory
+    /// before the flag.
+    #[test]
+    fn test_cli_skip_member_swallows_trailing_positional() {
+        let cli = Cli::try_parse_from(["bump", "--skip-member", "claude-pricing", "./some-dir"]).unwrap();
+        assert_eq!(
+            cli.skip_member,
+            vec!["claude-pricing".to_string(), "./some-dir".to_string()]
+        );
+        assert!(
+            cli.directories.is_empty(),
+            "the positional was swallowed by --skip-member"
+        );
+
+        // Putting the directory before the flag keeps them separate.
+        let cli = Cli::try_parse_from(["bump", "./some-dir", "--skip-member", "claude-pricing"]).unwrap();
+        assert_eq!(cli.skip_member, vec!["claude-pricing".to_string()]);
+        assert_eq!(cli.directories.len(), 1);
+    }
 }
