@@ -54,6 +54,13 @@ pub struct Cli {
     #[arg(long)]
     pub no_verify: bool,
 
+    /// Leave a workspace member's independent (literal) version untouched, matched by
+    /// package name (e.g. claude-pricing, not the member path). Repeatable and
+    /// space-separated. For a member whose version is a deliberate contract, not
+    /// workspace-inherited; a name matching no independent member is an error.
+    #[arg(long = "skip-member", value_name = "NAME", num_args = 1.., action = clap::ArgAction::Append)]
+    pub skip_member: Vec<String>,
+
     /// Paths to git repository roots
     #[arg(value_name = "DIRECTORIES")]
     pub directories: Vec<PathBuf>,
@@ -288,5 +295,29 @@ mod tests {
     fn test_cli_message_automatic_conflict() {
         let result = Cli::try_parse_from(["bump", "--message", "test", "--automatic"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_cli_skip_member_default_empty() {
+        let cli = Cli::try_parse_from(["bump"]).unwrap();
+        assert!(cli.skip_member.is_empty());
+    }
+
+    #[test]
+    fn test_cli_skip_member_repeated() {
+        let cli = Cli::try_parse_from(["bump", "--skip-member", "a", "--skip-member", "b"]).unwrap();
+        assert_eq!(cli.skip_member, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn test_cli_skip_member_space_separated() {
+        let cli = Cli::try_parse_from(["bump", "--skip-member", "a", "b"]).unwrap();
+        assert_eq!(cli.skip_member, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn test_cli_skip_member_single() {
+        let cli = Cli::try_parse_from(["bump", "--skip-member", "claude-pricing"]).unwrap();
+        assert_eq!(cli.skip_member, vec!["claude-pricing".to_string()]);
     }
 }

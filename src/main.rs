@@ -1,6 +1,6 @@
 use clap::Parser;
 use eyre::{Context, Result, bail};
-use log::{info, warn};
+use log::{debug, info, warn};
 use semver::Version;
 use std::env;
 use std::fs;
@@ -104,22 +104,88 @@ fn is_version_files_only(staged_files: &[String], project_type: ProjectType) -> 
     }
 }
 
-/// Validate project-specific constraints
-fn validate_project(dir: &Path, project_type: ProjectType) -> Result<()> {
-    if project_type == ProjectType::Rust {
-        let independent_members = cargo::check_workspace_independent_versions(dir)?;
-        if !independent_members.is_empty() {
-            let member_list: Vec<String> = independent_members
-                .iter()
-                .map(|m| format!("  - {} ({}): {}", m.name, m.path, m.version))
-                .collect();
-            bail!(
-                "Workspace members have independent versions (not using version.workspace = true):\n{}\n\n\
-                 bump only supports workspaces with a unified version in [workspace.package].",
-                member_list.join("\n")
-            );
-        }
+/// The terminal line announcing a member left untouched. Printed with `println!`
+/// (NOT `info!`): `bump` routes logging to a file, so an `info!` line would be
+/// invisible to the operator and break the "never silent" guarantee.
+fn skip_message(member: &cargo::IndependentVersionMember) -> String {
+    format!("skipping {} (independent version {})", member.name, member.version)
+}
+
+/// Validate project-specific constraints.
+///
+/// For a Rust workspace, every member carrying its own literal `version =` (not
+/// `version.workspace = true`) must be accounted for by a `--skip-member <name>`,
+/// matched on the **package name**. The guard fails **closed**, always before any
+/// mutation:
+///   - an independent member not named by `--skip-member` aborts (its raison d'être);
+///   - a `--skip-member` matching no independent member aborts, so a stale flag can't
+///     rot silently in CI.
+///
+/// With every independent member skipped, each skip is printed to the terminal and the
+/// run proceeds (only `[workspace.package].version` is bumped; the pinned members are
+/// left untouched).
+fn validate_project(dir: &Path, project_type: ProjectType, skip_members: &[String]) -> Result<()> {
+    debug!(
+        "validate_project: dir={} project_type={} skip_members={:?}",
+        dir.display(),
+        project_type,
+        skip_members
+    );
+
+    if project_type != ProjectType::Rust {
+        return Ok(());
     }
+
+    let independent_members = cargo::check_workspace_independent_versions(dir)?;
+
+    // Fail closed on a stale/misspelled skip: a --skip-member that names no
+    // independently-versioned member (wrong name, or a member that already inherits
+    // version.workspace = true) aborts before anything is touched.
+    let unmatched: Vec<&String> = skip_members
+        .iter()
+        .filter(|name| !independent_members.iter().any(|m| &m.name == *name))
+        .collect();
+    if !unmatched.is_empty() {
+        let names: Vec<&str> = unmatched.iter().map(|s| s.as_str()).collect();
+        warn!(
+            "validate_project: --skip-member names no independent member: {:?}",
+            names
+        );
+        bail!(
+            "--skip-member named member(s) that are not independently versioned: {}\n\
+             (wrong package name, or that member already inherits version.workspace = true). \
+             --skip-member matches the package name, not the member path.",
+            names.join(", ")
+        );
+    }
+
+    // Any independent member NOT covered by a --skip-member still aborts.
+    let unhandled: Vec<&cargo::IndependentVersionMember> = independent_members
+        .iter()
+        .filter(|m| !skip_members.iter().any(|s| s == &m.name))
+        .collect();
+    if !unhandled.is_empty() {
+        let member_list: Vec<String> = unhandled
+            .iter()
+            .map(|m| format!("  - {} ({}): {}", m.name, m.path, m.version))
+            .collect();
+        warn!("validate_project: {} unhandled independent member(s)", unhandled.len());
+        bail!(
+            "Workspace members have independent versions (not using version.workspace = true):\n{}\n\n\
+             bump only supports workspaces with a unified version in [workspace.package].\n\
+             Use --skip-member <name> for a contractually-pinned member.",
+            member_list.join("\n")
+        );
+    }
+
+    // Every independent member is accounted for: announce each skip to the terminal.
+    for member in &independent_members {
+        println!("{}", skip_message(member));
+    }
+    debug!(
+        "validate_project: proceeding, {} member(s) skipped",
+        independent_members.len()
+    );
     Ok(())
 }
 
@@ -578,7 +644,7 @@ fn process_directory(dir: &Path, cli: &Cli, bump_type: BumpType) -> Result<()> {
     info!("Detected project type: {}", project_type);
 
     // 3. Project-specific validation
-    validate_project(dir, project_type)?;
+    validate_project(dir, project_type, &cli.skip_member)?;
 
     // 4. Read file version and determine version action
     let file_version = read_file_version(dir, project_type)?.and_then(|v| version::parse_version(&v).ok());
@@ -889,6 +955,42 @@ name = "test-pkg"
             .to_string(),
         };
         fs::write(dir.join("Cargo.toml"), content).unwrap();
+    }
+
+    /// Build a Cargo workspace at `dir`: a workspace-only root at `ws_version`, an
+    /// `app` member that inherits `version.workspace = true`, and a `pricing` member
+    /// whose package is `claude-pricing` pinned to its own literal `version = "2.0.0"`
+    /// (the clyde case: member path != package name, so skip must match on name).
+    fn create_independent_workspace(dir: &Path, ws_version: &str) {
+        fs::write(
+            dir.join("Cargo.toml"),
+            format!(
+                r#"[workspace]
+members = ["app", "pricing"]
+resolver = "2"
+
+[workspace.package]
+version = "{ws_version}"
+"#
+            ),
+        )
+        .unwrap();
+
+        let app = dir.join("app");
+        fs::create_dir_all(&app).unwrap();
+        fs::write(
+            app.join("Cargo.toml"),
+            "[package]\nname = \"app\"\nversion.workspace = true\n",
+        )
+        .unwrap();
+
+        let pricing = dir.join("pricing");
+        fs::create_dir_all(&pricing).unwrap();
+        fs::write(
+            pricing.join("Cargo.toml"),
+            "[package]\nname = \"claude-pricing\"\nversion = \"2.0.0\"\n",
+        )
+        .unwrap();
     }
 
     fn create_pyproject_toml(dir: &Path, version: Option<&str>) {
@@ -1804,5 +1906,165 @@ name = "test-pkg"
             restore_probe(prev);
             assert!(result.is_ok(), "report_gates must succeed for {probe}: {result:?}");
         }
+    }
+
+    // =========================================================================
+    // --skip-member: tolerate an independently-versioned workspace member
+    // =========================================================================
+
+    /// The skip line names the package and its pinned version, verbatim.
+    #[test]
+    fn skip_message_names_member_and_version() {
+        let member = cargo::IndependentVersionMember {
+            name: "claude-pricing".to_string(),
+            path: "pricing".to_string(),
+            version: "2.0.0".to_string(),
+        };
+        assert_eq!(
+            skip_message(&member),
+            "skipping claude-pricing (independent version 2.0.0)"
+        );
+    }
+
+    /// No flag: an independent member still aborts (guard unchanged), and the message
+    /// teaches --skip-member.
+    #[test]
+    fn validate_independent_member_without_skip_aborts() {
+        let tmp = TempDir::new().unwrap();
+        create_independent_workspace(tmp.path(), "0.5.0");
+
+        let err = validate_project(tmp.path(), ProjectType::Rust, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("independent versions"), "got: {err}");
+        assert!(err.contains("claude-pricing"), "must name the offending member: {err}");
+        assert!(err.contains("--skip-member"), "must teach the flag: {err}");
+    }
+
+    /// --skip-member claude-pricing lets the workspace past validation.
+    #[test]
+    fn validate_skip_member_allows_pass() {
+        let tmp = TempDir::new().unwrap();
+        create_independent_workspace(tmp.path(), "0.5.0");
+
+        let result = validate_project(tmp.path(), ProjectType::Rust, &["claude-pricing".to_string()]);
+        assert!(result.is_ok(), "skipping the pinned member must pass: {result:?}");
+    }
+
+    /// The skip matches the package name, not the member path: `--skip-member pricing`
+    /// (the path) is a stale/wrong name and fails closed.
+    #[test]
+    fn validate_skip_matches_name_not_path() {
+        let tmp = TempDir::new().unwrap();
+        create_independent_workspace(tmp.path(), "0.5.0");
+
+        let err = validate_project(tmp.path(), ProjectType::Rust, &["pricing".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not independently versioned"), "got: {err}");
+        assert!(err.contains("pricing"), "must name the stale skip: {err}");
+    }
+
+    /// A --skip-member naming no independent member aborts (fail closed on a stale flag).
+    #[test]
+    fn validate_stale_skip_member_aborts() {
+        let tmp = TempDir::new().unwrap();
+        create_independent_workspace(tmp.path(), "0.5.0");
+
+        let err = validate_project(
+            tmp.path(),
+            ProjectType::Rust,
+            &["claude-pricing".to_string(), "nonexistent".to_string()],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("nonexistent"), "must name the unmatched skip: {err}");
+    }
+
+    /// Normal (tag-creating) flow with --skip-member on an ungated repo: workspace
+    /// version bumps and is tagged; the pinned member is byte-for-byte untouched; the
+    /// skip is printed to the terminal.
+    #[test]
+    fn skip_member_normal_flow_tags_and_leaves_member_untouched() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        setup_git_repo(dir);
+        create_independent_workspace(dir, "0.5.0");
+        create_initial_commit(dir);
+        create_git_tag(dir, "v0.5.0");
+        // Pending work so we take the standard (uncommitted-changes) workflow; -a
+        // avoids opening an editor for the non-version-only staged set.
+        fs::write(dir.join("feature.txt"), "work").unwrap();
+        let pricing_before = fs::read(dir.join("pricing").join("Cargo.toml")).unwrap();
+
+        let cli = Cli::try_parse_from(["bump", "-a", "--skip-member", "claude-pricing"]).unwrap();
+        let prev = set_probe("ungated");
+        let result = process_directory(dir, &cli, BumpType::Patch);
+        restore_probe(prev);
+
+        assert!(result.is_ok(), "skip-member normal flow must proceed: {result:?}");
+        assert!(git::tag_exists(dir, "v0.5.1").unwrap(), "workspace must be tagged");
+        assert_eq!(
+            read_file_version(dir, ProjectType::Rust).unwrap().unwrap(),
+            "0.5.1",
+            "workspace version must bump"
+        );
+        let pricing_after = fs::read(dir.join("pricing").join("Cargo.toml")).unwrap();
+        assert_eq!(
+            pricing_before, pricing_after,
+            "pinned member Cargo.toml must be byte-for-byte untouched"
+        );
+    }
+
+    /// --no-tag flow with --skip-member: workspace version bumps and commits, no tag;
+    /// the pinned member is left untouched.
+    #[test]
+    fn skip_member_no_tag_flow_bumps_workspace_leaves_member_untouched() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        setup_git_repo(dir);
+        create_independent_workspace(dir, "0.5.0");
+        create_initial_commit(dir);
+        create_git_tag(dir, "v0.5.0");
+        fs::write(dir.join("feature.txt"), "work").unwrap();
+        let pricing_before = fs::read(dir.join("pricing").join("Cargo.toml")).unwrap();
+
+        let cli = Cli::try_parse_from(["bump", "--no-tag", "-a", "--skip-member", "claude-pricing"]).unwrap();
+        process_directory(dir, &cli, BumpType::Patch).unwrap();
+
+        assert!(!git::tag_exists(dir, "v0.5.1").unwrap(), "no tag under --no-tag");
+        assert!(git::tag_exists(dir, "v0.5.0").unwrap(), "prior tag untouched");
+        assert_eq!(
+            read_file_version(dir, ProjectType::Rust).unwrap().unwrap(),
+            "0.5.1",
+            "workspace version must still bump under --no-tag"
+        );
+        let pricing_after = fs::read(dir.join("pricing").join("Cargo.toml")).unwrap();
+        assert_eq!(pricing_before, pricing_after, "pinned member must be untouched");
+    }
+
+    /// An independent member not named by --skip-member aborts BEFORE any mutation:
+    /// the workspace version is left unchanged. (--no-tag skips the gate probe, so no
+    /// network / ENV_LOCK is needed.)
+    #[test]
+    fn independent_member_without_skip_aborts_before_mutation() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        setup_git_repo(dir);
+        create_independent_workspace(dir, "0.5.0");
+        create_initial_commit(dir);
+        create_git_tag(dir, "v0.5.0");
+        fs::write(dir.join("feature.txt"), "work").unwrap();
+
+        let cli = Cli::try_parse_from(["bump", "--no-tag", "-a"]).unwrap();
+        let result = process_directory(dir, &cli, BumpType::Patch);
+
+        assert!(result.is_err(), "unnamed independent member must abort");
+        assert_eq!(
+            read_file_version(dir, ProjectType::Rust).unwrap().unwrap(),
+            "0.5.0",
+            "workspace version must be unchanged when the guard aborts"
+        );
     }
 }
