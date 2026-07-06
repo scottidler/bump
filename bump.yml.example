@@ -1,0 +1,19 @@
+# bump.yml -- per-repo facts for bump. Facts only; flows (gated | ungated) are
+# hard-coded in bump itself, never configured here.
+#
+# Copy this file to bump.yml at the repo ROOT (same directory as Cargo.toml /
+# pyproject.toml / package.json) to opt in. A missing bump.yml is fine -- both keys
+# default to empty/none.
+#
+# Precedence: CLI flags > this file > defaults.
+
+# Workspace members with an independent (literal) version, matched by package name
+# (not the member's path). Same contract as `--skip-member`; the flag, when given,
+# overrides this list wholesale rather than merging with it.
+skip-members:
+  - claude-pricing
+
+# Command run by `bump release` / `bump finish` after a successful release. Omit this
+# key (or the whole file) to use each verb's own default install step; pass
+# `--no-install` on the CLI to opt out entirely regardless of this file.
+install: cargo install --path .

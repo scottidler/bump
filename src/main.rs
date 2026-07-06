@@ -1,6 +1,6 @@
 use clap::Parser;
 use eyre::{Context, Result, bail};
-use log::{info, warn};
+use log::{debug, info, warn};
 use semver::Version;
 use std::env;
 use std::fs;
@@ -9,6 +9,7 @@ use std::process::Command;
 use tempfile::NamedTempFile;
 
 mod cli;
+mod config;
 mod git;
 mod github;
 mod lang;
@@ -486,14 +487,24 @@ fn process_directory(dir: &Path, cli: &Cli, bump_type: BumpType) -> Result<()> {
         manifests.len()
     );
 
+    // 2b. Repo-local facts (`bump.yml` at this dir's root). Missing file = defaults.
+    //     Precedence: CLI flags > config file > defaults (general.md) --
+    //     `effective_skip_members` applies that; `--install`/`--no-install` land with
+    //     the release verbs (Phase 5-7), this phase only loads and exposes the fact.
+    let repo_config = config::load(dir)?;
+    if let Some(install) = &repo_config.install {
+        debug!("bump.yml install command for {}: {}", dir.display(), install);
+    }
+    let skip_members = config::effective_skip_members(&cli.skip_member, &repo_config);
+
     // 3. Project-specific validation. Each detected manifest validates itself (the
     //    Cargo workspace independent-version guard lives in the cargo adapter); a
     //    generic repo (no manifest) still fails closed on a stale --skip-member.
     if manifests.is_empty() {
-        validate_project(dir, project_type, &cli.skip_member)?;
+        validate_project(dir, project_type, &skip_members)?;
     } else {
         for m in &manifests {
-            m.validate(&cli.skip_member)?;
+            m.validate(&skip_members)?;
         }
     }
 
@@ -1953,6 +1964,88 @@ name = "test-pkg"
             read_file_version(dir, ProjectType::Rust).unwrap().unwrap(),
             "0.5.0",
             "workspace version must be unchanged when the guard aborts"
+        );
+    }
+
+    // =========================================================================
+    // bump.yml: repo-local facts config (Phase 4)
+    // =========================================================================
+
+    /// A repo-root `bump.yml` with `skip-members: [claude-pricing]` lets the workspace
+    /// pass validation with NO `--skip-member` flag at all -- config supplies the fact
+    /// the flag would otherwise carry. (--no-tag avoids the gate probe / ENV_LOCK.)
+    #[test]
+    fn config_skip_members_allows_pass_without_flag() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        setup_git_repo(dir);
+        create_independent_workspace(dir, "0.5.0");
+        fs::write(dir.join("bump.yml"), "skip-members:\n  - claude-pricing\n").unwrap();
+        create_initial_commit(dir);
+        create_git_tag(dir, "v0.5.0");
+        fs::write(dir.join("feature.txt"), "work").unwrap();
+        let pricing_before = fs::read(dir.join("pricing").join("Cargo.toml")).unwrap();
+
+        let cli = Cli::try_parse_from(["bump", "--no-tag", "-a"]).unwrap();
+        let result = process_directory(dir, &cli, BumpType::Patch);
+
+        assert!(result.is_ok(), "config skip-members must pass validation: {result:?}");
+        assert_eq!(
+            read_file_version(dir, ProjectType::Rust).unwrap().unwrap(),
+            "0.5.1",
+            "workspace version must bump"
+        );
+        let pricing_after = fs::read(dir.join("pricing").join("Cargo.toml")).unwrap();
+        assert_eq!(
+            pricing_before, pricing_after,
+            "pinned member must be untouched when config (not the flag) supplies the skip"
+        );
+    }
+
+    /// `--skip-member` overrides `bump.yml` wholesale (never merges): a config naming
+    /// the WRONG member is ignored once the flag is present, and the flag's correct
+    /// name is what lets validation pass.
+    #[test]
+    fn config_skip_members_overridden_by_cli_flag() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        setup_git_repo(dir);
+        create_independent_workspace(dir, "0.5.0");
+        fs::write(dir.join("bump.yml"), "skip-members:\n  - not-the-real-member\n").unwrap();
+        create_initial_commit(dir);
+        create_git_tag(dir, "v0.5.0");
+        fs::write(dir.join("feature.txt"), "work").unwrap();
+
+        let cli = Cli::try_parse_from(["bump", "--no-tag", "-a", "--skip-member", "claude-pricing"]).unwrap();
+        let result = process_directory(dir, &cli, BumpType::Patch);
+
+        assert!(
+            result.is_ok(),
+            "the CLI flag's correct member name must win over the config's wrong one: {result:?}"
+        );
+    }
+
+    /// A `bump.yml` with an unknown key aborts BEFORE any mutation: this phase's wiring
+    /// surfaces `config::load`'s deny_unknown_fields error through `process_directory`.
+    #[test]
+    fn config_unknown_key_aborts_before_mutation() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        setup_git_repo(dir);
+        create_cargo_toml(dir, Some("0.5.0"));
+        fs::write(dir.join("bump.yml"), "flows:\n  - gated\n").unwrap();
+        create_initial_commit(dir);
+        create_git_tag(dir, "v0.5.0");
+        fs::write(dir.join("feature.txt"), "work").unwrap();
+
+        let cli = Cli::try_parse_from(["bump", "--no-tag", "-a"]).unwrap();
+        let err = process_directory(dir, &cli, BumpType::Patch).unwrap_err().to_string();
+
+        assert!(err.contains("flows"), "must name the offending key: {err}");
+        assert_eq!(
+            read_file_version(dir, ProjectType::Rust).unwrap().unwrap(),
+            "0.5.0",
+            "version must be unchanged when config parsing aborts"
         );
     }
 }

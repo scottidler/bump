@@ -254,3 +254,61 @@ per phase.
 ### Open questions
 - None. (Cross-repo/system-mutating steps like retiring the bash driver are Phase 9,
   not executable here; no such work was needed for Phase 3.)
+
+## Phase 4: Repo-local facts config
+
+### Design decisions
+- `src/config.rs`: `Config { skip_members: Vec<String>, install: Option<String> }`,
+  `#[serde(rename_all = "kebab-case", deny_unknown_fields)]` (`skip-members`,
+  `install` in YAML). `load(dir: &Path) -> Result<Config>` reads `<dir>/bump.yml`;
+  missing file returns `Config::default()` (not an error) and logs at `info!` that
+  none was found; a present file logs at `info!` which path loaded and at `debug!`
+  the parsed `skip_members`/`install`.
+- Deliberate exception to `rules/rust.md`'s "never load config from CWD as a silent
+  fallback": `load` is documented in the module doc-comment as the doc-sanctioned
+  repo-COMMITTED facts file (same trust model as `.otto.yml`), loaded from the root of
+  the directory bump is PROCESSING (`process_directory`'s `dir` argument), never XDG,
+  never a re-rooted CWD search. This matches the design doc's Resolved Decisions
+  ("install is a repo-committed config fact").
+- Precedence wired in `config::effective_skip_members(cli_skip_member, &config)`
+  (`src/config.rs`): CLI flag non-empty -> use it wholesale (never merged with
+  config); flag empty -> config's `skip_members`; both empty -> `vec![]`. Called from
+  `process_directory` (`src/main.rs`) right after `lang::detect`, feeding both the
+  `manifests.is_empty()` (`validate_project`) and non-empty (`m.validate`) branches --
+  the single seam both paths already shared for `cli.skip_member`.
+- `install` is loaded and exposed (`repo_config.install`) but not otherwise consumed
+  this phase, per the bullet ("this phase just defines/loads/exposes it"); it is
+  `debug!`-logged when present in `process_directory` so the field is genuinely read
+  (a bin crate's `-D warnings` flags an unread pub struct field as dead_code) without
+  inventing release-verb behavior that belongs to Phase 5-7.
+- The unknown-key error is surfaced from `serde_yaml`'s own `Display` embedded
+  directly into the top-level `eyre::eyre!` message (`config::load`), not left in the
+  eyre context chain -- `eyre::Report::to_string()` (and `process_directory`'s error
+  path, which callers read via `.to_string()`/`{:#}`) shows only the top message by
+  default, so the offending key name (`deny_unknown_fields`'s payload) must live
+  there to be assertable without unwrapping a Debug chain.
+
+### Deviations
+- None against this phase's bullet. `--install`/`--no-install` CLI flags are
+  explicitly NOT added here (the bullet reserves them for Phase 5); only the config
+  key is loaded and made available.
+
+### Tradeoffs
+- Config tests live in `src/config/tests.rs` (rules/rust.md 2018+ test-file
+  placement, since `config.rs` is a new module) -- unlike Phase 1-3's carve-out for
+  pre-existing inline `mod tests` blocks, there is no existing inline convention to
+  match here, so the tree-wide-standard placement applies directly.
+- Kept the integration-level `bump.yml` tests (`config_skip_members_allows_pass_
+  without_flag`, `config_skip_members_overridden_by_cli_flag`,
+  `config_unknown_key_aborts_before_mutation`) inline in `src/main.rs`'s existing
+  `#[cfg(test)] mod tests`, matching that file's established convention (same
+  reasoning as Phase 1-3's `main.rs`/`lang.rs` test placement) -- only the genuinely
+  NEW module (`config.rs`) gets the 2018+ file split.
+- `create_independent_workspace` (`src/main.rs`, pre-existing from the
+  `--skip-member` phase) doubled as the "clyde-style workspace fixture" the success
+  criteria call for, rather than writing a second near-duplicate fixture builder.
+
+### Open questions
+- None. (Deleting the stale `bump.yml` sample and replacing it with
+  `bump.yml.example` was executed directly -- it is a repo-local file rename/rewrite,
+  not a cross-repo/system-mutating step.)
