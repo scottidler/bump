@@ -371,9 +371,126 @@ fn is_retryable_error(error: &str) -> bool {
     retryable_patterns.iter().any(|pattern| error_lower.contains(pattern))
 }
 
+/// The `gh` argv for the OPEN-PR existence probe on `branch`.
+///
+/// Phase 0 finding (supersedes the API Design table's `gh pr view`): `gh pr view` returns
+/// exit 0 for a MERGED/closed PR, so it CANNOT distinguish an open PR from a stale merged
+/// one on a reused branch name. `gh pr list --head <branch> --state open --json number`
+/// exits 0 in every case and returns a JSON array whose emptiness IS the verdict.
+///
+/// Gated `#[cfg(test)]` this phase: only the (also `#[cfg(test)]`) `release::GhPr` calls
+/// the PR seam until Phase 8 wires the subcommand.
+#[cfg(test)]
+fn pr_list_args(branch: &str) -> Vec<String> {
+    ["pr", "list", "--head", branch, "--state", "open", "--json", "number"]
+        .into_iter()
+        .map(String::from)
+        .collect()
+}
+
+/// Interpret the `gh pr list --json number` stdout: a NON-empty JSON array means an open
+/// PR exists (skip create); an empty array means none (create). Empty stdout is treated as
+/// "no PR". Any non-array / non-JSON payload is a loud error, never a silent false.
+#[cfg(test)]
+fn open_pr_exists_from_json(stdout: &str) -> Result<bool> {
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return Ok(false);
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(trimmed).with_context(|| format!("gh pr list returned non-JSON: {trimmed}"))?;
+    match value.as_array() {
+        Some(arr) => Ok(!arr.is_empty()),
+        None => eyre::bail!("gh pr list JSON was not an array: {trimmed}"),
+    }
+}
+
+/// Does an OPEN pull request exist for `branch`? Runs the `pr_list_args` probe in the
+/// repo at `path` (gh infers the repo from its remote), per-org token-authed. Gated
+/// `#[cfg(test)]` this phase for the same reason as the git push helpers.
+#[cfg(test)]
+pub fn open_pr_exists(path: &Path, branch: &str) -> Result<bool> {
+    debug!("open_pr_exists: path={} branch={}", path.display(), branch);
+    let org = remote_slug(path).map(|s| org_of(&s).to_string()).unwrap_or_default();
+    let args = pr_list_args(branch);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let output = gh_command(&org)
+        .args(&arg_refs)
+        .current_dir(path)
+        .output()
+        .context("Failed to run gh pr list")?;
+    if !output.status.success() {
+        eyre::bail!("gh pr list failed: {}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    let exists = open_pr_exists_from_json(&String::from_utf8_lossy(&output.stdout))?;
+    debug!("open_pr_exists: branch={branch} exists={exists}");
+    Ok(exists)
+}
+
+/// Open a PR for the current branch with `gh pr create --fill`. Only ever called behind
+/// `open_pr_exists` returning false -- `gh pr create --fill` ERRORS on an existing open PR
+/// (known gh behavior, Phase 0 addendum), so this is a race backstop, not the primary
+/// guard. Gated `#[cfg(test)]` this phase.
+#[cfg(test)]
+pub fn create_pr(path: &Path, branch: &str) -> Result<()> {
+    debug!("create_pr: path={} branch={}", path.display(), branch);
+    let org = remote_slug(path).map(|s| org_of(&s).to_string()).unwrap_or_default();
+    let output = gh_command(&org)
+        .args(["pr", "create", "--fill"])
+        .current_dir(path)
+        .output()
+        .context("Failed to run gh pr create")?;
+    if !output.status.success() {
+        eyre::bail!(
+            "gh pr create --fill failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pr_list_args_is_the_open_pr_probe() {
+        // The load-bearing Phase 0 decision: list (not view), scoped to --state open.
+        assert_eq!(
+            pr_list_args("my-feature"),
+            vec![
+                "pr",
+                "list",
+                "--head",
+                "my-feature",
+                "--state",
+                "open",
+                "--json",
+                "number"
+            ]
+        );
+    }
+
+    #[test]
+    fn open_pr_from_json_empty_array_is_false() {
+        assert!(!open_pr_exists_from_json("[]").unwrap());
+        assert!(!open_pr_exists_from_json("  []  \n").unwrap());
+        // Empty stdout (no output) is treated as "no open PR", not an error.
+        assert!(!open_pr_exists_from_json("").unwrap());
+    }
+
+    #[test]
+    fn open_pr_from_json_nonempty_array_is_true() {
+        assert!(open_pr_exists_from_json("[{\"number\":7}]").unwrap());
+        assert!(open_pr_exists_from_json("[{\"number\":7},{\"number\":8}]").unwrap());
+    }
+
+    #[test]
+    fn open_pr_from_json_non_array_is_loud_error() {
+        // A non-array payload must fail loudly, never be read as a silent false.
+        assert!(open_pr_exists_from_json("{\"number\":7}").is_err());
+        assert!(open_pr_exists_from_json("not json").is_err());
+    }
 
     #[test]
     fn parse_slug_scp_ssh() {

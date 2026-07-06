@@ -154,7 +154,7 @@ pub(crate) struct VersionAction {
 }
 
 /// The default "untouched" version in Cargo.toml
-const DEFAULT_UNTOUCHED_VERSION: Version = Version::new(0, 1, 0);
+pub(crate) const DEFAULT_UNTOUCHED_VERSION: Version = Version::new(0, 1, 0);
 
 /// Determine what version action to take
 pub(crate) fn determine_version_action(

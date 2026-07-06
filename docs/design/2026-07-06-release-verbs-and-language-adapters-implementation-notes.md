@@ -412,3 +412,116 @@ per phase.
   `--no-install` flags (constructing `ReleaseOpts`), and calls `release(dir, &opts,
   &GitPusher, &ShellInstaller)` -- these are the only steps that turn this phase's
   test-built scaffold into shipped, main-reachable code.
+
+## Phase 6: `bump release` -- gated flow
+
+### Design decisions
+- Extended the Phase 5 state machine with the GATED rows on typed state -- `classify`
+  now routes a `Gate::Gated(_)` verdict into `classify_gated` (`src/release.rs`) instead
+  of the Phase-5 "not this phase" placeholder. `classify_gated` resolves+fetches the
+  default (like the ungated path) then splits: on the default branch it is a stranded
+  refusal (`HeadRemote::Ahead`/`Diverged` -> `GatedStranded`), a behind refusal (reuses
+  the ungated `Behind` row), or the "bump rides a PR" refusal (`Equal` ->
+  `GatedDefaultClean`); on a feature branch `classify_gated_feature` decides fresh vs
+  already-bumped vs level-mismatch vs generic-unsupported.
+- Fresh-vs-already-bumped discriminator (`classify_gated_feature`, `src/release.rs`):
+  compares the agreed manifest version `V` to the last released tag `T`. `V == T` (or a
+  Rust untouched-default 0.1.0, which defers to the tag) -> `GatedFresh`, target computed
+  by bump's own `compute_target_tag`/`determine_version_action` (no re-derivation). `V !=
+  T` and not untouched-default -> a prior gated `--no-tag` bump already rode the branch;
+  if the requested level's implied version (`bump_version(T, level)`) equals `V` it is an
+  idempotent `GatedAlreadyBumped`, otherwise `GatedLevelMismatch { riding, implied }`.
+- `execute_gated` (`src/release.rs`) is the shared fresh/already-bumped executor: for
+  fresh it runs the internal `--no-tag` `version_commit` (reused verbatim from Phase 5 --
+  the version bump rides the branch, NO tag); for a re-run it skips the re-bump; then in
+  BOTH cases it pushes the feature branch (`--no-follow-tags -u`) and ensures an OPEN PR
+  (list-probe -> create-only-if-none), then prints the pause message and returns a
+  `ReleaseReport { paused: true, install_command: None }` (exit 0). No tag, no install
+  in any gated path -- those are `bump finish`'s (Phase 7).
+- The open-PR probe uses `gh pr list --head <branch> --state open --json number`
+  (`github::pr_list_args` + `open_pr_exists`, `src/github.rs`), NOT `gh pr view` -- see
+  Deviations. `create_pr` is `gh pr create --fill`, only reached when the probe returns
+  empty. The JSON verdict is a pure helper (`open_pr_exists_from_json`): non-empty array
+  = open PR (skip create), empty array/empty stdout = none (create), any non-array/non-
+  JSON = a loud error (never a silent false).
+- New `Pr` port (trait) with production `GhPr` and a test `RecordingPr`
+  (`src/release.rs`, `src/release/tests.rs`), mirroring Phase 5's `Pusher`/`Installer`:
+  `open_pr_exists(dir, branch) -> Result<bool>` and `create_pr(dir, branch) ->
+  Result<()>`. Threaded through `release(dir, &opts, &pusher, &installer, &pr)` via the
+  Phase-5 `Ports` bundle, now `Ports<'a, P: Pusher, I: Installer, R: Pr>` (rules/rust.md
+  generics-over-`dyn`; the `Deps`-style bundle keeps the execution fns under the arg-count
+  limit).
+- New git helper `git::push_feature_branch` (`git push --no-follow-tags -u origin
+  <branch>`) is SEPARATE from Phase 5's `push_branch` so the gated `--no-follow-tags`
+  invariant cannot leak into the ungated default-branch push, and vice versa. Gated
+  `#[cfg(test)]` like `push_branch`/`push_tag`.
+- Stranded rescue prints the LITERAL runnable commands (`git branch stranded-<sha8>`,
+  `git reset --hard origin/<default>`, `git checkout stranded-<sha8>`, `bump release`) --
+  never a prose description; the suggested branch name is derived deterministically from
+  the stranded HEAD's short SHA (`suggest_rescue_branch`) and the verb NEVER creates a
+  branch or resets history itself (panel consensus, replacing the bash driver's
+  auto-rescue).
+- `ReleaseReport` gained a `paused: bool` field (true only on a gated pause); the four
+  Phase-5 construction sites set `paused: false`. Phase 5 tests read fields individually,
+  so the added field did not touch their assertions.
+- `DEFAULT_UNTOUCHED_VERSION` (main.rs) widened private -> `pub(crate)` so the gated
+  feature-branch classifier reuses the one untouched-default constant instead of inlining
+  a magic `0.1.0` (still used by production `determine_version_action`, so no new dead
+  code).
+
+### Deviations
+- PROBE SUPERSEDES THE API DESIGN TABLE: the table's gated rows say "`gh pr view`
+  existence check FIRST"; the Phase 0 addendum ("gh open-PR probe") supersedes that with
+  `gh pr list --head <branch> --state open --json number` -- `gh pr view` returns exit 0
+  for a MERGED PR and cannot distinguish open from merged, so a reused branch name would
+  falsely read as "PR exists". Implemented the list-probe (same effect, correct/observed
+  seam). `gh pr create --fill` is the race backstop behind the probe (known to error on
+  an existing open PR; not live-observed, per the addendum).
+- PORT over env seam: the doc offers a `BUMP_PR_PROBE` env seam "matching the gates
+  precedent"; chose the DI `Pr` port for consistency with Phase 5's `Pusher`/`Installer`
+  (the phase instruction's stated preference), no concrete blocker hit.
+- Refusal MESSAGES implemented as typed `ReleaseState` variants each `bail!`ing its exact
+  command (same seam as Phase 5's ungated refusals), rather than free-form strings, so
+  each row is individually classifiable and asserted in a dedicated test.
+- Added a `GatedGeneric` refusal row NOT in the phase's 4-row list: a gated repo with no
+  manifest is unsupported per Resolved Decisions ("both verbs refuse on gated+generic").
+  This is the fail-closed behavior (bump finish cannot derive a version); without it a
+  gated generic repo would fall into the fresh path and bump nothing. Same intent as the
+  doc's resolved decision, surfaced as an explicit typed refusal + test.
+- Repurposed Phase 5's now-stale `refuses_when_gated_this_phase` test (which asserted the
+  "gated flow is a later phase" refusal) into `gated_on_default_clean_refuses_bump_rides_
+  a_pr`, asserting the new on-default-clean row -- the behavior it pinned by name is gone,
+  so the test was inverted to the new behavior rather than left green by accident.
+
+### Tradeoffs
+- Reused `version_commit` (`--no-tag` `process_directory`) for the fresh gated bump: on a
+  clean tree with an unpushed feature commit it AMENDS the caller's code commit with the
+  version bump (Phase 5's mechanic). The version bump still rides the branch in one
+  commit, which satisfies "version commit joins the branch"; chose this over a separate
+  bump commit to avoid duplicating the amend-vs-new-commit logic.
+- `RecordingPr` models real `gh` behavior (after `create_pr`, `open_pr_exists` returns
+  true) so "create exactly once across two runs" is assertable with ONE instance shared
+  across both `release` calls -- first run creates (probe empty), second run sees the open
+  PR via the probe and skips. This tests the idempotency without a real `gh` or a fake-gh
+  PATH shim.
+- `GhPr` production impl is compiled but never invoked by tests (no real `gh`/network):
+  it is constructed once (in the ungated real-pusher test, whose path never touches the
+  PR seam) to satisfy dead-code, and its command/JSON seams are covered by pure unit tests
+  in `src/github.rs` (`pr_list_args` argv == the list-probe; `open_pr_exists_from_json`
+  for empty/non-empty/non-array/empty-stdout). This is the "test request-building, not
+  just the happy path" seam without an outward gh call.
+- New gh helpers (`open_pr_exists`, `create_pr`, `pr_list_args`,
+  `open_pr_exists_from_json`) and `git::push_feature_branch` are `#[cfg(test)]`-gated (bin
+  crate, `-D warnings` flags anything unreachable from `main`), consistent with how Phase
+  5 gated `mod release` and `git::push_branch`/`push_tag`. Phase 8 ungates and wires the
+  real `GhPr`.
+- New gated tests appended INLINE to `src/release/tests.rs` (the module's existing
+  test-file, already the 2018+ submodule split); new gh-seam tests appended to
+  `src/github.rs`'s existing inline `#[cfg(test)] mod tests` to match that file's current
+  convention (a tree-wide extraction is a separate mechanical pass, not this phase's job).
+
+### Open questions
+- Cross-repo/system-mutating steps (retiring the bash driver, re-pointing skills/agent,
+  the git-release-guard hook allowing the two verbs) are Phase 9 -- NOT executable here.
+  Phase 7 (`bump finish`) owns the tag-on-merge step this flow pauses for; nothing in
+  Phase 6 pre-empts it.

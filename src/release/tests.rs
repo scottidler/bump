@@ -66,6 +66,58 @@ impl Pusher for RecordingPusher {
         self.calls.borrow_mut().push(format!("tag:{tag}"));
         git::push_tag(dir, tag)
     }
+    fn push_feature_branch(&self, dir: &Path, branch: &str) -> Result<()> {
+        self.calls.borrow_mut().push(format!("feature:{branch}"));
+        if self.fail_branch {
+            bail!("simulated branch push rejection");
+        }
+        git::push_feature_branch(dir, branch)
+    }
+}
+
+/// Records the OPEN-PR probe + create calls, and models `gh`'s own behavior: once
+/// `create_pr` runs, an open PR EXISTS, so a subsequent `open_pr_exists` returns true.
+/// This is exactly what makes "create exactly once across two runs" assertable with the
+/// SAME instance across both runs -- no real `gh`.
+struct RecordingPr {
+    exists: RefCell<bool>,
+    list_calls: RefCell<u32>,
+    create_calls: RefCell<u32>,
+}
+
+impl RecordingPr {
+    fn new() -> Self {
+        Self {
+            exists: RefCell::new(false),
+            list_calls: RefCell::new(0),
+            create_calls: RefCell::new(0),
+        }
+    }
+    fn create_calls(&self) -> u32 {
+        *self.create_calls.borrow()
+    }
+    fn list_calls(&self) -> u32 {
+        *self.list_calls.borrow()
+    }
+}
+
+impl Pr for RecordingPr {
+    fn open_pr_exists(&self, _dir: &Path, _branch: &str) -> Result<bool> {
+        *self.list_calls.borrow_mut() += 1;
+        Ok(*self.exists.borrow())
+    }
+    fn create_pr(&self, _dir: &Path, _branch: &str) -> Result<()> {
+        *self.create_calls.borrow_mut() += 1;
+        // An open PR now exists (models gh): the next probe returns true.
+        *self.exists.borrow_mut() = true;
+        Ok(())
+    }
+}
+
+/// A fresh no-op `Pr` for the UNGATED tests, whose paths never touch the PR seam. Bundled
+/// as a helper so each ungated `release(...)` call can pass `&no_pr()` inline.
+fn no_pr() -> RecordingPr {
+    RecordingPr::new()
 }
 
 /// Records the RESOLVED install command WITHOUT executing it (no real `cargo install`).
@@ -188,7 +240,7 @@ fn ungated_release_pushes_branch_then_tag_in_order() {
     let pusher = RecordingPusher::new(false);
     let installer = RecordingInstaller::new();
     let prev = set_probe("ungated");
-    let report = release(dir, &auto_opts(BumpType::Patch, false), &pusher, &installer);
+    let report = release(dir, &auto_opts(BumpType::Patch, false), &pusher, &installer, &no_pr());
     restore_probe(prev);
 
     let report = report.expect("ungated release must succeed");
@@ -226,7 +278,7 @@ fn ungated_release_with_real_pusher_and_installer() {
         install: InstallChoice::Command("touch install-marker".to_string()),
     };
     let prev = set_probe("ungated");
-    let report = release(dir, &opts, &GitPusher, &ShellInstaller);
+    let report = release(dir, &opts, &GitPusher, &ShellInstaller, &GhPr);
     restore_probe(prev);
 
     let report = report.expect("real-pusher release must succeed");
@@ -261,7 +313,7 @@ fn rejected_branch_push_leaves_no_tag() {
     let pusher = RecordingPusher::new(true); // branch push is rejected
     let installer = RecordingInstaller::new();
     let prev = set_probe("ungated");
-    let result = release(dir, &auto_opts(BumpType::Patch, false), &pusher, &installer);
+    let result = release(dir, &auto_opts(BumpType::Patch, false), &pusher, &installer, &no_pr());
     restore_probe(prev);
 
     assert!(result.is_err(), "a rejected branch push must fail the release");
@@ -298,7 +350,7 @@ fn resume_local_tag_absent_creates_and_pushes() {
     let pusher = RecordingPusher::new(false);
     let installer = RecordingInstaller::new();
     let prev = set_probe("ungated");
-    let report = release(dir, &auto_opts(BumpType::Patch, false), &pusher, &installer);
+    let report = release(dir, &auto_opts(BumpType::Patch, false), &pusher, &installer, &no_pr());
     restore_probe(prev);
 
     let report = report.expect("resume must complete");
@@ -327,7 +379,7 @@ fn resume_local_tag_present_pushes_only() {
     let pusher = RecordingPusher::new(false);
     let installer = RecordingInstaller::new();
     let prev = set_probe("ungated");
-    let report = release(dir, &auto_opts(BumpType::Patch, false), &pusher, &installer);
+    let report = release(dir, &auto_opts(BumpType::Patch, false), &pusher, &installer, &no_pr());
     restore_probe(prev);
 
     let report = report.expect("resume must complete");
@@ -357,9 +409,9 @@ fn resume_completes_then_second_run_refuses_without_rebump() {
     let pusher = RecordingPusher::new(false);
     let installer = RecordingInstaller::new();
     let prev = set_probe("ungated");
-    let first = release(dir, &auto_opts(BumpType::Patch, false), &pusher, &installer);
+    let first = release(dir, &auto_opts(BumpType::Patch, false), &pusher, &installer, &no_pr());
     // Second run: the remote now carries the tag, so there is nothing left to do.
-    let second = release(dir, &auto_opts(BumpType::Patch, false), &pusher, &installer);
+    let second = release(dir, &auto_opts(BumpType::Patch, false), &pusher, &installer, &no_pr());
     restore_probe(prev);
 
     assert!(first.expect("first resume completes").resumed);
@@ -389,7 +441,7 @@ fn dry_run_executes_nothing() {
     let pusher = RecordingPusher::new(false);
     let installer = RecordingInstaller::new();
     let prev = set_probe("ungated");
-    let report = release(dir, &auto_opts(BumpType::Patch, true), &pusher, &installer);
+    let report = release(dir, &auto_opts(BumpType::Patch, true), &pusher, &installer, &no_pr());
     restore_probe(prev);
 
     let report = report.expect("dry-run must succeed");
@@ -416,9 +468,15 @@ fn refuses_when_not_a_git_repo() {
     let tmp = TempDir::new().unwrap();
     let pusher = RecordingPusher::new(false);
     let installer = RecordingInstaller::new();
-    let err = release(tmp.path(), &auto_opts(BumpType::Patch, false), &pusher, &installer)
-        .expect_err("must refuse outside a git repo")
-        .to_string();
+    let err = release(
+        tmp.path(),
+        &auto_opts(BumpType::Patch, false),
+        &pusher,
+        &installer,
+        &no_pr(),
+    )
+    .expect_err("must refuse outside a git repo")
+    .to_string();
     assert!(err.contains("not a git repository"), "got: {err}");
 }
 
@@ -433,7 +491,7 @@ fn refuses_dirty_tree() {
     let pusher = RecordingPusher::new(false);
     let installer = RecordingInstaller::new();
     let prev = set_probe("ungated");
-    let err = release(dir, &auto_opts(BumpType::Patch, false), &pusher, &installer)
+    let err = release(dir, &auto_opts(BumpType::Patch, false), &pusher, &installer, &no_pr())
         .expect_err("dirty tree must refuse")
         .to_string();
     restore_probe(prev);
@@ -453,7 +511,7 @@ fn refuses_when_not_on_default() {
     let pusher = RecordingPusher::new(false);
     let installer = RecordingInstaller::new();
     let prev = set_probe("ungated");
-    let err = release(dir, &auto_opts(BumpType::Patch, false), &pusher, &installer)
+    let err = release(dir, &auto_opts(BumpType::Patch, false), &pusher, &installer, &no_pr())
         .expect_err("off-default must refuse")
         .to_string();
     restore_probe(prev);
@@ -475,7 +533,7 @@ fn refuses_when_behind_origin() {
     let pusher = RecordingPusher::new(false);
     let installer = RecordingInstaller::new();
     let prev = set_probe("ungated");
-    let err = release(dir, &auto_opts(BumpType::Patch, false), &pusher, &installer)
+    let err = release(dir, &auto_opts(BumpType::Patch, false), &pusher, &installer, &no_pr())
         .expect_err("behind must refuse")
         .to_string();
     restore_probe(prev);
@@ -499,7 +557,7 @@ fn refuses_when_nothing_to_release() {
     let pusher = RecordingPusher::new(false);
     let installer = RecordingInstaller::new();
     let prev = set_probe("ungated");
-    let err = release(dir, &auto_opts(BumpType::Patch, false), &pusher, &installer)
+    let err = release(dir, &auto_opts(BumpType::Patch, false), &pusher, &installer, &no_pr())
         .expect_err("nothing-to-release must refuse")
         .to_string();
     restore_probe(prev);
@@ -519,7 +577,7 @@ fn refuses_when_gate_unknown() {
     let pusher = RecordingPusher::new(false);
     let installer = RecordingInstaller::new();
     let prev = set_probe("unknown:offline");
-    let err = release(dir, &auto_opts(BumpType::Patch, false), &pusher, &installer)
+    let err = release(dir, &auto_opts(BumpType::Patch, false), &pusher, &installer, &no_pr())
         .expect_err("unknown gate must fail closed")
         .to_string();
     restore_probe(prev);
@@ -540,7 +598,7 @@ fn refuses_on_detached_head() {
     let pusher = RecordingPusher::new(false);
     let installer = RecordingInstaller::new();
     let prev = set_probe("ungated");
-    let err = release(dir, &auto_opts(BumpType::Patch, false), &pusher, &installer)
+    let err = release(dir, &auto_opts(BumpType::Patch, false), &pusher, &installer, &no_pr())
         .expect_err("detached HEAD must refuse")
         .to_string();
     restore_probe(prev);
@@ -548,22 +606,224 @@ fn refuses_on_detached_head() {
     drop(origin);
 }
 
-/// A gated verdict refuses (the gated flow is a later phase).
+/// Gated, on the default branch, clean, HEAD == origin: refuse -- bump rides a feature PR,
+/// never the default branch. (Phase 6 replaces Phase 5's "not this phase" gated refusal.)
 #[test]
-fn refuses_when_gated_this_phase() {
+fn gated_on_default_clean_refuses_bump_rides_a_pr() {
     let _guard = crate::ENV_LOCK.lock().unwrap();
     let (origin, work) = setup_released("0.1.5");
     let dir = work.path();
 
     let pusher = RecordingPusher::new(false);
     let installer = RecordingInstaller::new();
+    let pr = RecordingPr::new();
     let prev = set_probe("gated:pull_request");
-    let err = release(dir, &auto_opts(BumpType::Patch, false), &pusher, &installer)
-        .expect_err("gated must refuse this phase")
+    let err = release(dir, &auto_opts(BumpType::Patch, false), &pusher, &installer, &pr)
+        .expect_err("gated on default clean must refuse")
         .to_string();
     restore_probe(prev);
-    assert!(err.contains("GATED"), "got: {err}");
+    assert!(err.contains("bump rides a feature PR"), "got: {err}");
     assert!(pusher.calls().is_empty());
+    assert_eq!(pr.create_calls(), 0, "no PR touched on a refusal");
+    // NO tag created on this gated path either.
+    assert!(!git::tag_exists(dir, "v0.1.6").unwrap());
+    drop(origin);
+}
+
+// ===================================================================================
+// GATED flow (Phase 6): feature-branch fresh + idempotent re-run, level mismatch,
+// stranded commits, gated generic. Real git in TempDirs + fake `Pr`; probe forced gated.
+// ===================================================================================
+
+/// setup_released + a feature branch carrying an unpushed code commit (the caller's
+/// contract: the code change is already committed; the verb owns everything mechanical).
+fn setup_gated_feature_branch(version: &str) -> (TempDir, TempDir) {
+    let (origin, work) = setup_released(version);
+    let w = work.path();
+    git_ok(w, &["checkout", "-b", "feature"]);
+    fs::write(w.join("feature.txt"), "work").unwrap();
+    git_ok(w, &["add", "-A"]);
+    git_ok(w, &["commit", "-m", "feature work"]);
+    (origin, work)
+}
+
+/// setup_released at `base_tag` + a feature branch whose manifest is ALREADY bumped to
+/// `bumped` (a prior gated run's `--no-tag` bump rode the branch).
+fn setup_gated_already_bumped(base_tag: &str, bumped: &str) -> (TempDir, TempDir) {
+    let (origin, work) = setup_released(base_tag);
+    let w = work.path();
+    git_ok(w, &["checkout", "-b", "feature"]);
+    write_cargo(w, bumped);
+    git_ok(w, &["commit", "-am", &format!("Bump version to {bumped}")]);
+    (origin, work)
+}
+
+/// A generic (no-manifest) repo on a feature branch, pushed default + origin/HEAD set.
+fn setup_generic_gated_feature() -> (TempDir, TempDir) {
+    let origin = TempDir::new().unwrap();
+    Command::new("git")
+        .args(["init", "--bare", "-b", "main"])
+        .current_dir(origin.path())
+        .output()
+        .unwrap();
+    let work = TempDir::new().unwrap();
+    let w = work.path();
+    git_ok(w, &["init", "-b", "main"]);
+    git_ok(w, &["config", "user.email", "test@test.com"]);
+    git_ok(w, &["config", "user.name", "Test"]);
+    fs::write(w.join("README.md"), "# generic").unwrap();
+    git_ok(w, &["add", "-A"]);
+    git_ok(w, &["commit", "-m", "init"]);
+    git_ok(w, &["remote", "add", "origin", origin.path().to_str().unwrap()]);
+    git_ok(w, &["push", "-u", "origin", "main"]);
+    git_ok(w, &["remote", "set-head", "origin", "main"]);
+    git_ok(w, &["checkout", "-b", "feature"]);
+    fs::write(w.join("feature.txt"), "x").unwrap();
+    git_ok(w, &["add", "-A"]);
+    git_ok(w, &["commit", "-m", "feature"]);
+    (origin, work)
+}
+
+/// Gated e2e: two runs, PAUSED both times, branch pushed, PR-create invoked EXACTLY ONCE
+/// (first run creates; second sees the open PR via the list-probe fake and skips), and NO
+/// tag anywhere across the fresh + resume paths.
+#[test]
+fn gated_release_pauses_and_creates_pr_once_across_two_runs() {
+    let _guard = crate::ENV_LOCK.lock().unwrap();
+    let (origin, work) = setup_gated_feature_branch("0.1.5");
+    let dir = work.path();
+
+    let pusher = RecordingPusher::new(false);
+    let installer = RecordingInstaller::new();
+    let pr = RecordingPr::new(); // ONE instance across both runs
+    let prev = set_probe("gated:pull_request");
+    let first = release(dir, &auto_opts(BumpType::Patch, false), &pusher, &installer, &pr);
+    let second = release(dir, &auto_opts(BumpType::Patch, false), &pusher, &installer, &pr);
+    restore_probe(prev);
+
+    let first = first.expect("first gated run pauses");
+    assert!(first.paused, "gated run must PAUSE (exit-0 semantics)");
+    assert!(!first.dry_run);
+    assert_eq!(first.tag, "v0.1.6");
+    assert!(first.install_command.is_none(), "no install on a paused gated run");
+    // Fresh run bumped the version onto the branch.
+    assert_eq!(read_cargo_version(dir), "0.1.6", "version bump rode the branch");
+
+    let second = second.expect("second gated run also pauses (idempotent)");
+    assert!(second.paused);
+
+    // PR created EXACTLY ONCE across two runs; the probe ran on each.
+    assert_eq!(pr.create_calls(), 1, "PR create must run exactly once");
+    assert!(pr.list_calls() >= 2, "the open-PR probe runs on every run");
+
+    // Only feature-branch pushes, NEVER a tag push.
+    assert!(
+        !pusher.calls().is_empty() && pusher.calls().iter().all(|c| c.starts_with("feature:")),
+        "only feature-branch pushes: {:?}",
+        pusher.calls()
+    );
+    assert!(
+        !pusher.calls().iter().any(|c| c.starts_with("tag:")),
+        "no tag push in the gated flow"
+    );
+
+    // NO tag anywhere -- gated release never tags (that is bump finish's job).
+    assert!(
+        !git::tag_exists(dir, "v0.1.6").unwrap(),
+        "no local tag in the gated flow"
+    );
+    assert_eq!(git::remote_tag_sha(dir, "v0.1.6").unwrap(), None, "no remote tag");
+    // Install never runs on a paused gated release.
+    assert!(installer.calls().is_empty(), "no install on a paused gated release");
+    drop(origin);
+}
+
+/// A version already bumped to vX on the branch, re-run with a level implying vY != vX,
+/// refuses NAMING BOTH versions -- never silently keeps either.
+#[test]
+fn gated_level_mismatch_refuses_naming_both_versions() {
+    let _guard = crate::ENV_LOCK.lock().unwrap();
+    // minor bump (0.2.0) already rode the branch off tag 0.1.0.
+    let (origin, work) = setup_gated_already_bumped("0.1.0", "0.2.0");
+    let dir = work.path();
+
+    let pusher = RecordingPusher::new(false);
+    let installer = RecordingInstaller::new();
+    let pr = RecordingPr::new();
+    let prev = set_probe("gated:pull_request");
+    // Re-run with -M (major) -> implies v1.0.0, but v0.2.0 is riding.
+    let err = release(dir, &auto_opts(BumpType::Major, false), &pusher, &installer, &pr)
+        .expect_err("level mismatch must refuse")
+        .to_string();
+    restore_probe(prev);
+
+    assert!(err.contains("v0.2.0"), "must name the riding version: {err}");
+    assert!(err.contains("v1.0.0"), "must name the implied version: {err}");
+    // Nothing touched: no push, no PR, no re-bump.
+    assert!(pusher.calls().is_empty(), "nothing pushed on a mismatch refusal");
+    assert_eq!(pr.create_calls(), 0);
+    assert_eq!(
+        read_cargo_version(dir),
+        "0.2.0",
+        "version left as-is -- neither kept nor changed"
+    );
+    drop(origin);
+}
+
+/// On the gated default branch with local commits NOT on origin: refuse printing the
+/// LITERAL rescue commands, and NEVER create a branch or reset history.
+#[test]
+fn gated_stranded_commits_refuse_with_literal_rescue_commands() {
+    let _guard = crate::ENV_LOCK.lock().unwrap();
+    let (origin, work) = setup_with_pending_commit("0.1.5"); // on main, HEAD ahead of origin
+    let dir = work.path();
+    let head_before = git::head_sha(dir).unwrap();
+    let branches_before = git_ok(dir, &["branch", "--format=%(refname:short)"]);
+
+    let pusher = RecordingPusher::new(false);
+    let installer = RecordingInstaller::new();
+    let pr = RecordingPr::new();
+    let prev = set_probe("gated:pull_request");
+    let err = release(dir, &auto_opts(BumpType::Patch, false), &pusher, &installer, &pr)
+        .expect_err("stranded commits on the gated default must refuse")
+        .to_string();
+    restore_probe(prev);
+
+    // LITERAL runnable commands, never a prose description.
+    assert!(err.contains("git branch stranded-"), "literal `git branch` cmd: {err}");
+    assert!(err.contains("git reset --hard origin/main"), "literal reset cmd: {err}");
+    assert!(err.contains("bump release"), "the re-run instruction: {err}");
+    // The verb NEVER created a branch or reset history itself.
+    assert_eq!(git::head_sha(dir).unwrap(), head_before, "HEAD untouched (no reset)");
+    assert_eq!(
+        git_ok(dir, &["branch", "--format=%(refname:short)"]),
+        branches_before,
+        "no branch created by the verb"
+    );
+    assert!(pusher.calls().is_empty(), "nothing pushed");
+    drop(origin);
+}
+
+/// A gated repo with no version-bearing manifest is unsupported (bump finish cannot derive
+/// a version); both verbs refuse.
+#[test]
+fn gated_generic_repo_is_unsupported() {
+    let _guard = crate::ENV_LOCK.lock().unwrap();
+    let (origin, work) = setup_generic_gated_feature();
+    let dir = work.path();
+
+    let pusher = RecordingPusher::new(false);
+    let installer = RecordingInstaller::new();
+    let pr = RecordingPr::new();
+    let prev = set_probe("gated:pull_request");
+    let err = release(dir, &auto_opts(BumpType::Patch, false), &pusher, &installer, &pr)
+        .expect_err("gated generic must refuse")
+        .to_string();
+    restore_probe(prev);
+    assert!(err.contains("generic"), "got: {err}");
+    assert!(err.contains("unsupported"), "got: {err}");
+    assert!(pusher.calls().is_empty());
+    assert_eq!(pr.create_calls(), 0);
     drop(origin);
 }
 

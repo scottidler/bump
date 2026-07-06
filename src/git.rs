@@ -437,6 +437,35 @@ pub fn push_tag(path: &Path, tag: &str) -> Result<()> {
     Ok(())
 }
 
+/// Push a FEATURE branch to origin and set its upstream: `git push --no-follow-tags -u
+/// origin <branch>`. Used by the GATED `bump release` flow. `--no-follow-tags` is the
+/// invariant that matters here -- a stray local tag (e.g. an old `v*` on the branch tip)
+/// must NEVER ride the branch push in the gated flow, where tagging is `bump finish`'s
+/// job on the merged commit, never `release`'s. Never `--tags`, never `--force`.
+///
+/// Gated `#[cfg(test)]` this phase for the same reason as `push_branch`/`push_tag`: bump
+/// is a bin crate and this helper is only reached from the (also `#[cfg(test)]`) `release`
+/// module until Phase 8 wires the subcommand.
+#[cfg(test)]
+pub fn push_feature_branch(path: &Path, branch: &str) -> Result<()> {
+    debug!("push_feature_branch: path={} branch={}", path.display(), branch);
+    let output = Command::new("git")
+        .args(["push", "--no-follow-tags", "-u", "origin", branch])
+        .current_dir(path)
+        .output()
+        .context("Failed to run git push")?;
+
+    if !output.status.success() {
+        bail!(
+            "git push --no-follow-tags -u origin {} failed: {}",
+            branch,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
