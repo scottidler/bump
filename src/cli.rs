@@ -1,9 +1,11 @@
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::LazyLock;
 
 static HELP_TEXT: LazyLock<String> = LazyLock::new(get_tool_validation_help);
+static RELEASE_HELP_TEXT: LazyLock<String> = LazyLock::new(get_release_help);
+static FINISH_HELP_TEXT: LazyLock<String> = LazyLock::new(get_finish_help);
 
 #[derive(Parser)]
 #[command(
@@ -13,6 +15,14 @@ static HELP_TEXT: LazyLock<String> = LazyLock::new(get_tool_validation_help);
     after_help = HELP_TEXT.as_str()
 )]
 pub struct Cli {
+    /// The two release verbs (`release`, `finish`). Absent -> the legacy flag behavior
+    /// below, UNCHANGED. A directory literally named `release`/`finish` with no path
+    /// prefix (e.g. `bump release` meaning "process the dir named release") is the one
+    /// documented ambiguity this optional-subcommand pattern carries; prefix it
+    /// (`./release`) to disambiguate, exactly like any other clap subcommand CLI.
+    #[command(subcommand)]
+    pub command: Option<Commands>,
+
     /// Bump major version (X.0.0)
     #[arg(short = 'M', long, conflicts_with = "minor")]
     pub major: bool,
@@ -64,6 +74,135 @@ pub struct Cli {
     /// Paths to git repository roots
     #[arg(value_name = "DIRECTORIES")]
     pub directories: Vec<PathBuf>,
+}
+
+/// The two release verbs. `None` (no subcommand) is today's legacy `bump` behavior,
+/// untouched. See the design doc's API Design section for the full state tables these
+/// verbs implement; `--help` on each subcommand summarizes them.
+#[derive(Subcommand, Debug)]
+pub enum Commands {
+    /// Release the current repo: on ungated main this lands a version commit, pushes it,
+    /// then tags and pushes the tag; on a gated repo it rides the bump on a feature branch,
+    /// pushes it, opens a PR if none is open, and pauses for `bump finish` after merge.
+    #[command(after_help = RELEASE_HELP_TEXT.as_str())]
+    Release(ReleaseArgs),
+
+    /// Post-merge step for gated repos: fast-forward to the merged default branch, tag the
+    /// merged version, and push the tag by name. No-op if it is already released; resumes
+    /// a local-only tag from a prior interrupted run.
+    #[command(after_help = FINISH_HELP_TEXT.as_str())]
+    Finish(FinishArgs),
+}
+
+/// `bump release [-m|-M] [-n] [--install "<cmd>"|--no-install]`
+#[derive(clap::Args, Debug)]
+pub struct ReleaseArgs {
+    /// Bump major version (X.0.0)
+    #[arg(short = 'M', long, conflicts_with = "minor")]
+    pub major: bool,
+
+    /// Bump minor version (x.Y.0)
+    #[arg(short = 'm', long, conflicts_with = "major")]
+    pub minor: bool,
+
+    /// Preview every command that would run; execute nothing
+    #[arg(short = 'n', long)]
+    pub dry_run: bool,
+
+    /// Run this exact command after a successful release, instead of the config/default
+    #[arg(long, value_name = "CMD", conflicts_with = "no_install")]
+    pub install: Option<String>,
+
+    /// Skip the post-release install step entirely
+    #[arg(long, conflicts_with = "install")]
+    pub no_install: bool,
+}
+
+/// `bump finish [-n] [--install "<cmd>"|--no-install]`
+#[derive(clap::Args, Debug)]
+pub struct FinishArgs {
+    /// Preview every command that would run; execute nothing
+    #[arg(short = 'n', long)]
+    pub dry_run: bool,
+
+    /// Run this exact command after a successful finish, instead of the config/default
+    #[arg(long, value_name = "CMD", conflicts_with = "no_install")]
+    pub install: Option<String>,
+
+    /// Skip the post-release install step entirely
+    #[arg(long, conflicts_with = "install")]
+    pub no_install: bool,
+}
+
+/// Generate the `bump release --help` after-help text: the state table (condensed) plus
+/// required tools and the runtime log path, matching `get_tool_validation_help`'s sources.
+fn get_release_help() -> String {
+    let git_status = check_tool_version("git", "--version", "2.20.0");
+    let gh_status = check_tool_version("gh", "--version", "2.0.0");
+    format!(
+        "STATE TABLE (see the design doc for the full table):\n\
+         \x20 ungated, on default, ahead of origin: version commit -> push branch -> confirm \
+         on origin -> tag -> push tag -> install\n\
+         \x20 ungated, not on default: refuse \"checkout <default>, then bump release\"\n\
+         \x20 ungated, behind origin: refuse \"git pull --ff-only origin <default>\"\n\
+         \x20 ungated, nothing ahead + already tagged: refuse \"nothing to release\"\n\
+         \x20 ungated RESUME (origin carries the version, remote tag missing): tag if \
+         absent, push tag, install -- never re-bumps, never claims \"already released\"\n\
+         \x20 gated, on a feature branch, fresh: bump rides the branch (--no-tag) -> push \
+         branch -> ensure PR open -> pause: \"merge the PR, then run: bump finish\"\n\
+         \x20 gated, on a feature branch, already bumped: skip re-bump, ensure branch/PR, \
+         same pause; a mismatched -m/-M level refuses naming both versions\n\
+         \x20 gated, on default with commits not on origin (stranded): refuse with the \
+         literal rescue commands (git branch/reset/checkout), never auto-rescued\n\
+         \x20 gated, on default, clean: refuse \"bump rides a feature PR; branch first\"\n\
+         \x20 gate unknown, dirty tree, detached HEAD: refuse with the one exact fix\n\n\
+         REQUIRED TOOLS:\n  {} {:<10} {}\n  {} {:<10} {}\n\n\
+         gh probes branch-protection gates and opens/lists PRs; `bump release` FAILS \
+         CLOSED on an unknown gate verdict (it pushes, unlike plain bump).\n\n\
+         Logs are written to: {}",
+        git_status.status_icon,
+        "git",
+        git_status.version,
+        gh_status.status_icon,
+        "gh",
+        gh_status.version,
+        log_path_for_help()
+    )
+}
+
+/// Generate the `bump finish --help` after-help text: the finish table plus tools/log path.
+fn get_finish_help() -> String {
+    let git_status = check_tool_version("git", "--version", "2.20.0");
+    let gh_status = check_tool_version("gh", "--version", "2.0.0");
+    format!(
+        "STATE TABLE (see the design doc for the full table):\n\
+         \x20 origin/<default> carries an untagged version (the merged bump): checkout -> \
+         pull --ff-only -> tag the merged commit -> push tag -> install\n\
+         \x20 origin/<default> version == last tag (nothing merged / bump never rode): \
+         refuse \"no untagged version on <default>; bump rides a feature PR\"\n\
+         \x20 tag vX exists on the remote at the merged commit: no-op \"already released\"\n\
+         \x20 tag vX exists LOCALLY only (prior run died before/during the tag push): \
+         resume -- push tag by name, install; never reported as already released\n\
+         \x20 generic repo (no manifest), gated: refuse -- finish cannot derive a version\n\
+         \x20 dirty tree: refuse before checkout (would clobber or carry strays)\n\n\
+         REQUIRED TOOLS:\n  {} {:<10} {}\n  {} {:<10} {}\n\n\
+         gh is used only indirectly (via `bump release`'s PR); finish itself only needs git.\n\n\
+         Logs are written to: {}",
+        git_status.status_icon,
+        "git",
+        git_status.version,
+        gh_status.status_icon,
+        "gh",
+        gh_status.version,
+        log_path_for_help()
+    )
+}
+
+/// The XDG log path, rendered from the SAME resolution `main.rs::xdg_data_dir` uses, so
+/// `--help` can never drift from where the logger actually writes (rules/rust.md: render
+/// at runtime, don't hardcode).
+fn log_path_for_help() -> String {
+    crate::log_file_path().display().to_string()
 }
 
 /// Generate tool validation help text (called once via LazyLock)
@@ -343,5 +482,145 @@ mod tests {
         let cli = Cli::try_parse_from(["bump", "./some-dir", "--skip-member", "claude-pricing"]).unwrap();
         assert_eq!(cli.skip_member, vec!["claude-pricing".to_string()]);
         assert_eq!(cli.directories.len(), 1);
+    }
+
+    // =========================================================================
+    // SUBCOMMAND WIRING: bump release / bump finish (Phase 8). Bare `bump` (no
+    // subcommand) must stay `command: None` on every legacy invocation -- these tests
+    // pin that ALONGSIDE the new subcommand parsing, so a future clap change that starts
+    // stealing a bare invocation or a positional directory is caught here.
+    // =========================================================================
+
+    #[test]
+    fn test_cli_no_subcommand_is_none_on_bare_bump() {
+        let cli = Cli::try_parse_from(["bump"]).unwrap();
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn test_cli_no_subcommand_is_none_with_legacy_flags() {
+        // The exact legacy matrix this phase's hard constraint pins byte-identical.
+        for args in [
+            vec!["bump"],
+            vec!["bump", "-m"],
+            vec!["bump", "-M"],
+            vec!["bump", "-n"],
+            vec!["bump", "--no-tag"],
+            vec!["bump", "--tag-only"],
+            vec!["bump", "--gates"],
+            vec!["bump", "--skip-member", "name"],
+            vec!["bump", "./some-dir"],
+            vec!["bump", "-a"],
+            vec!["bump", "--message", "msg"],
+        ] {
+            let cli = Cli::try_parse_from(&args).unwrap();
+            assert!(cli.command.is_none(), "expected no subcommand for {:?}", args);
+        }
+    }
+
+    #[test]
+    fn test_cli_release_subcommand_parses() {
+        let cli = Cli::try_parse_from(["bump", "release"]).unwrap();
+        match cli.command {
+            Some(Commands::Release(args)) => {
+                assert!(!args.major);
+                assert!(!args.minor);
+                assert!(!args.dry_run);
+                assert!(args.install.is_none());
+                assert!(!args.no_install);
+            }
+            other => panic!("expected Release, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_release_subcommand_flags() {
+        let cli = Cli::try_parse_from(["bump", "release", "-m", "-n"]).unwrap();
+        match cli.command {
+            Some(Commands::Release(args)) => {
+                assert!(args.minor);
+                assert!(args.dry_run);
+            }
+            other => panic!("expected Release, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_release_major_minor_conflict() {
+        assert!(Cli::try_parse_from(["bump", "release", "-m", "-M"]).is_err());
+    }
+
+    #[test]
+    fn test_cli_release_install_flag() {
+        let cli = Cli::try_parse_from(["bump", "release", "--install", "cargo install --path ."]).unwrap();
+        match cli.command {
+            Some(Commands::Release(args)) => {
+                assert_eq!(args.install, Some("cargo install --path .".to_string()));
+                assert!(!args.no_install);
+            }
+            other => panic!("expected Release, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_release_no_install_flag() {
+        let cli = Cli::try_parse_from(["bump", "release", "--no-install"]).unwrap();
+        match cli.command {
+            Some(Commands::Release(args)) => {
+                assert!(args.no_install);
+                assert!(args.install.is_none());
+            }
+            other => panic!("expected Release, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_release_install_and_no_install_conflict() {
+        assert!(Cli::try_parse_from(["bump", "release", "--install", "x", "--no-install"]).is_err());
+    }
+
+    #[test]
+    fn test_cli_finish_subcommand_parses() {
+        let cli = Cli::try_parse_from(["bump", "finish"]).unwrap();
+        match cli.command {
+            Some(Commands::Finish(args)) => {
+                assert!(!args.dry_run);
+                assert!(args.install.is_none());
+                assert!(!args.no_install);
+            }
+            other => panic!("expected Finish, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_finish_dry_run_flag() {
+        let cli = Cli::try_parse_from(["bump", "finish", "-n"]).unwrap();
+        match cli.command {
+            Some(Commands::Finish(args)) => assert!(args.dry_run),
+            other => panic!("expected Finish, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_finish_install_and_no_install_conflict() {
+        assert!(Cli::try_parse_from(["bump", "finish", "--install", "x", "--no-install"]).is_err());
+    }
+
+    #[test]
+    fn test_cli_finish_has_no_bump_level_flags() {
+        // `finish` never computes a bump; -m/-M/--major/--minor are not its flags.
+        assert!(Cli::try_parse_from(["bump", "finish", "-m"]).is_err());
+        assert!(Cli::try_parse_from(["bump", "finish", "-M"]).is_err());
+    }
+
+    /// The one documented ambiguity of the optional-subcommand pattern: a directory
+    /// literally named `release`/`finish` with NO path prefix is parsed as the
+    /// subcommand, not the directory positional. A `./`-prefixed (or any other) path is
+    /// unaffected -- this is the realistic invocation and it is unambiguous.
+    #[test]
+    fn test_cli_dir_named_release_needs_path_prefix_to_disambiguate() {
+        let cli = Cli::try_parse_from(["bump", "./release"]).unwrap();
+        assert!(cli.command.is_none());
+        assert_eq!(cli.directories, vec![PathBuf::from("./release")]);
     }
 }

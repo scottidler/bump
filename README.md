@@ -1,6 +1,9 @@
 # bump
 
-Rust CLI tool for bumping semantic versions in Cargo.toml, creating commits, and tagging releases.
+CLI tool for bumping semantic versions (Cargo.toml, pyproject.toml, package.json),
+creating commits, and tagging releases -- plus two release verbs, `bump release` and
+`bump finish`, that drive the whole mechanical release sequence (including pushes,
+PR handling, and install) for both ungated and PR-gated repos.
 
 ## Installation
 
@@ -8,7 +11,51 @@ Rust CLI tool for bumping semantic versions in Cargo.toml, creating commits, and
 cargo install --path .
 ```
 
-## Usage
+## The release verbs (recommended)
+
+For releasing a repo, use `bump release` / `bump finish` -- they absorb every mechanical
+step (pushes, PR open, install) that the primitives below (bare `bump`, `--no-tag`,
+`--tag-only`) otherwise leave to you. Run from inside the repo:
+
+```bash
+bump release [-m|-M] [-n] [--install "<cmd>"|--no-install]
+bump finish  [-n] [--install "<cmd>"|--no-install]
+```
+
+`bump release` inspects the repo's git + gate state and either executes the ONE correct
+sequence or refuses with the exact next command:
+
+| Situation | `bump release` does |
+|---|---|
+| Ungated, on default, ahead of origin | version commit -> push branch -> confirm on origin -> tag -> push tag -> install |
+| Ungated, not on default / behind origin / nothing to release | refuses with the exact fix |
+| Ungated RESUME (a prior run died between branch push and tag push) | tags (if needed) and pushes the tag, without re-bumping or falsely claiming "already released" |
+| Gated, on a feature branch, fresh | rides the bump on the branch (`--no-tag` internally), pushes it, opens a PR if none is open, then PAUSES: `merge the PR, then run: bump finish` |
+| Gated, on a feature branch, already bumped | skips the re-bump, ensures the branch/PR, same pause |
+| Gated, on default with stranded commits | refuses with the literal rescue commands (never auto-rescues) |
+
+After the PR merges, `bump finish` fast-forwards to the merged tip and tags it:
+
+| Situation | `bump finish` does |
+|---|---|
+| origin/`<default>` carries an untagged version (the merged bump) | checkout -> `pull --ff-only` -> tag the merged commit -> push tag -> install |
+| Nothing merged / bump never rode | refuses: "bump rides a feature PR -- run bump release on a branch" |
+| Already tagged at the merged commit | no-op: "already released" |
+| A tag exists locally only (a prior run died mid-push) | resumes: pushes the tag, never reports it as already released |
+
+Full state tables: `bump release --help` / `bump finish --help`, or the design doc
+(`docs/design/2026-07-06-release-verbs-and-language-adapters.md`).
+
+`--install <cmd>` / `--no-install` control the post-release install step (precedence:
+flag override > repo-root `bump.yml`'s `install:` key > `cargo install --path .` iff a
+Cargo.toml is present > skip). `-n` previews every command the verb would run and
+executes nothing.
+
+## Primitives (for humans / advanced or manual use)
+
+Everything below this point is the set of primitives the two verbs above are built on.
+Reach for these directly only when composing your own automation, debugging a release,
+or working a repo the verbs don't cover (e.g. multi-directory batch runs).
 
 ```bash
 bump [OPTIONS] [DIRECTORIES...]

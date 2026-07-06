@@ -8,25 +8,18 @@
 //! ZERO stdout scraping of any `bump`/`git` output.
 //!
 //! Scope: BOTH the ungated rows (Phase 5) and the gated / feature-branch / PR rows
-//! (Phase 6) of the `bump release` state table. `bump finish` (the post-merge tag step)
-//! is Phase 7. The clap `bump release` subcommand and the `--install`/`--no-install`
-//! flags are Phase 8 -- this phase's surface is the callable
-//! `release(dir, opts, pusher, installer, pr)` function, driven in tests via injected
-//! `Pusher`/`Installer`/`Pr` doubles.
+//! (Phase 6) of the `bump release` state table, plus `bump finish` (Phase 7, the
+//! post-merge tag step). Phase 8 wires the `bump release` / `bump finish` clap
+//! subcommands (`main.rs::dispatch_release`/`dispatch_finish`) and the
+//! `--install`/`--no-install` flags to the callable `release(dir, opts, pusher,
+//! installer, pr)` / `finish(dir, opts, pusher, installer)` functions; tests still drive
+//! them via injected `Pusher`/`Installer`/`Pr` doubles.
 //!
 //! GATED invariant (Phase 6): NO tag is ever created or pushed in the gated `release`
 //! flow -- the version commit rides the feature branch (internal `--no-tag`), the branch
 //! is pushed with `--no-follow-tags` so a stray local tag can't ride, a PR is opened if
 //! none is open, and the verb PAUSES (exit 0) for the human to merge. Tagging the merged
 //! commit is `bump finish`'s job (Phase 7), never `release`'s.
-//!
-//! Module gating: the whole module is `#[cfg(test)]` this phase. bump is a BIN crate,
-//! so any item not reached from `main` is `dead_code`, which `cargo clippy -- -D
-//! warnings` (this repo's CI, per Phase 3's notes) rejects. With no CLI wiring yet (a
-//! deliberate phase boundary), the only reachable callers are the tests. Phase 8 removes
-//! the `#[cfg(test)]` gate when it wires the subcommand and calls `release()` from
-//! `process`/`main`. The state machine is fully compiled (clippy `--all-targets` builds
-//! the test target) and fully tested; it is simply not yet in the shipped binary.
 //!
 //! Strengthened ordering invariant (git.md, enforced in code below, NOT prose): a tag is
 //! created ONLY after the commit it points to is confirmed on `origin/<default>`. Plain
@@ -752,6 +745,7 @@ fn execute_gated<P: Pusher, I: Installer, R: Pr>(
 fn version_commit(dir: &Path, bump_type: BumpType) -> Result<()> {
     debug!("version_commit: dir={} bump_type={:?}", dir.display(), bump_type);
     let cli = Cli {
+        command: None,
         major: bump_type == BumpType::Major,
         minor: bump_type == BumpType::Minor,
         dry_run: false,

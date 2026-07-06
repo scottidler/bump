@@ -390,9 +390,8 @@ pub fn remote_tag_sha(path: &Path, tag: &str) -> Result<Option<String>> {
 /// returns the annotated TAG-OBJECT sha (git omits the peeled `^{}` line for an exact
 /// match) -- this asks for the peeled ref too, so an annotated tag resolves to its
 /// underlying commit. `bump finish` needs the real commit to tell an at-HEAD remote tag
-/// (already released) from an at-other one (missed bump). Gated `#[cfg(test)]` this phase:
-/// only the (also `#[cfg(test)]`) `release::finish` reaches it until Phase 8.
-#[cfg(test)]
+/// (already released) from an at-other one (missed bump). Wired to `release::finish`'s
+/// remote-tag arm in production.
 pub fn remote_tag_commit(path: &Path, tag: &str) -> Result<Option<String>> {
     debug!("remote_tag_commit: path={} tag={}", path.display(), tag);
     let refspec = format!("refs/tags/{tag}");
@@ -433,11 +432,7 @@ pub fn remote_tag_commit(path: &Path, tag: &str) -> Result<Option<String>> {
 /// never `--force`. `bump release`'s strengthened ordering pushes the branch first and
 /// only tags after confirming it landed, so a rejected branch push can never strand a tag.
 ///
-/// Gated `#[cfg(test)]` this phase: the only consumers are the (also `#[cfg(test)]`)
-/// `release` module's `GitPusher` and these tests. bump is a bin crate, so an
-/// unreachable-from-`main` `pub fn` is `dead_code` under `clippy -D warnings`; Phase 6/7/8
-/// remove this gate when `release` is wired to a CLI subcommand and calls it in production.
-#[cfg(test)]
+/// Wired to `release::GitPusher::push_branch` in production.
 pub fn push_branch(path: &Path, branch: &str) -> Result<()> {
     debug!("push_branch: path={} branch={}", path.display(), branch);
     let output = Command::new("git")
@@ -459,9 +454,8 @@ pub fn push_branch(path: &Path, branch: &str) -> Result<()> {
 
 /// Push a single tag to origin BY EXPLICIT NAME. Never `git push --tags` / `--follow-tags`
 /// (those can land a tag even when the branch push was rejected -- the okta-auth-rs
-/// orphan). Never `--force`, never tag deletion. Gated `#[cfg(test)]` this phase for the
-/// same reason as `push_branch` above.
-#[cfg(test)]
+/// orphan). Never `--force`, never tag deletion. Wired to `release::GitPusher::push_tag`
+/// and `release::finish`'s tag-push arms in production.
 pub fn push_tag(path: &Path, tag: &str) -> Result<()> {
     debug!("push_tag: path={} tag={}", path.display(), tag);
     let output = Command::new("git")
@@ -487,10 +481,7 @@ pub fn push_tag(path: &Path, tag: &str) -> Result<()> {
 /// must NEVER ride the branch push in the gated flow, where tagging is `bump finish`'s
 /// job on the merged commit, never `release`'s. Never `--tags`, never `--force`.
 ///
-/// Gated `#[cfg(test)]` this phase for the same reason as `push_branch`/`push_tag`: bump
-/// is a bin crate and this helper is only reached from the (also `#[cfg(test)]`) `release`
-/// module until Phase 8 wires the subcommand.
-#[cfg(test)]
+/// Wired to `release::GitPusher::push_feature_branch` in production.
 pub fn push_feature_branch(path: &Path, branch: &str) -> Result<()> {
     debug!("push_feature_branch: path={} branch={}", path.display(), branch);
     let output = Command::new("git")
@@ -511,10 +502,7 @@ pub fn push_feature_branch(path: &Path, branch: &str) -> Result<()> {
 }
 
 /// Checkout an existing local branch. `bump finish` uses this to reach the default branch
-/// before fast-forwarding to the merged tip. Gated `#[cfg(test)]` this phase for the same
-/// reason as the push helpers: bump is a bin crate and this helper is only reached from the
-/// (also `#[cfg(test)]`) `release::finish` until Phase 8 wires the subcommand.
-#[cfg(test)]
+/// before fast-forwarding to the merged tip. Wired to `release::finish` in production.
 pub fn checkout(path: &Path, branch: &str) -> Result<()> {
     debug!("checkout: path={} branch={}", path.display(), branch);
     let output = Command::new("git")
@@ -536,9 +524,8 @@ pub fn checkout(path: &Path, branch: &str) -> Result<()> {
 
 /// Fast-forward-ONLY pull of `origin/<branch>` into the current branch: `git pull --ff-only
 /// origin <branch>`. Never a merge commit, never a rebase -- if the local branch can't
-/// fast-forward, it fails loudly, so `bump finish` never tags a diverged tree. Gated
-/// `#[cfg(test)]` this phase for the same reason as `checkout`.
-#[cfg(test)]
+/// fast-forward, it fails loudly, so `bump finish` never tags a diverged tree. Wired to
+/// `release::finish` in production.
 pub fn pull_ff_only(path: &Path, branch: &str) -> Result<()> {
     debug!("pull_ff_only: path={} branch={}", path.display(), branch);
     let output = Command::new("git")

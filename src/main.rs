@@ -15,13 +15,9 @@ mod github;
 mod lang;
 mod version;
 
-// The `bump release` state machine is built and tested this phase but not yet wired to a
-// CLI subcommand (that is Phase 8). bump is a BIN crate, so any item unreachable from
-// `main` is `dead_code`, which `cargo clippy -- -D warnings` rejects. Gating the module
-// `#[cfg(test)]` keeps it fully compiled + tested (clippy `--all-targets` builds the test
-// target) without shipping unreachable code; Phase 8 removes this gate when it wires the
-// subcommand and calls `release::release(...)`.
-#[cfg(test)]
+// The `bump release`/`bump finish` state machines, wired to the `bump release` / `bump
+// finish` clap subcommands below. Every port's production impl (`GitPusher`, `ShellInstaller`,
+// `GhPr`) is reached from `dispatch_release`/`dispatch_finish`.
 mod release;
 
 /// Serialize env-var-mutating tests (`BUMP_GATES_PROBE`) across ALL test modules in
@@ -58,15 +54,22 @@ fn xdg_data_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".local").join("share"))
 }
 
-fn setup_logging() -> Result<()> {
-    let log_dir = xdg_data_dir()
+/// The log file path: `<xdg_data_dir>/bump/logs/bump.log`. ONE source of truth, called by
+/// both `setup_logging` (which actually opens it) and `cli::log_path_for_help` (which just
+/// renders it for `--help`), so `--help` can never drift from where the logger writes.
+pub(crate) fn log_file_path() -> PathBuf {
+    xdg_data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("bump")
-        .join("logs");
+        .join("logs")
+        .join("bump.log")
+}
+
+fn setup_logging() -> Result<()> {
+    let log_file = log_file_path();
+    let log_dir = log_file.parent().unwrap_or(Path::new(".")).to_path_buf();
 
     fs::create_dir_all(&log_dir).context("Failed to create log directory")?;
-
-    let log_file = log_dir.join("bump.log");
 
     let target = Box::new(
         fs::OpenOptions::new()
@@ -783,6 +786,14 @@ fn main() -> Result<()> {
     setup_logging().context("Failed to setup logging")?;
 
     let cli = Cli::parse();
+
+    // `bump release` / `bump finish`: the two release verbs. Handled FIRST and returned
+    // from immediately -- every line below this block is the legacy bare-`bump` flow,
+    // reached only when `cli.command` is `None`, byte-identical to before this phase.
+    if let Some(command) = &cli.command {
+        return dispatch_command(command);
+    }
+
     let bump_type = BumpType::from_cli(cli.major, cli.minor);
 
     info!("Starting bump with type: {:?}", bump_type);
@@ -832,6 +843,68 @@ fn main() -> Result<()> {
         std::process::exit(1);
     }
 
+    Ok(())
+}
+
+/// Dispatch `bump release` / `bump finish` to the `release` module's state machines,
+/// wired to their PRODUCTION ports (`GitPusher`, `ShellInstaller`, `GhPr`). Both verbs
+/// operate on the current directory (the design doc's API contract takes no directory
+/// argument -- callers `cd` into the repo, matching the bash driver they replace).
+fn dispatch_command(command: &cli::Commands) -> Result<()> {
+    debug!("dispatch_command: command={:?}", command);
+    let dir = env::current_dir().context("Failed to get current directory")?;
+    match command {
+        cli::Commands::Release(args) => dispatch_release(&dir, args),
+        cli::Commands::Finish(args) => dispatch_finish(&dir, args),
+    }
+}
+
+/// The shared `--install`/`--no-install` -> `InstallChoice` mapping for both verbs.
+/// Clap's `conflicts_with` on the two flags means `(Some(_), true)` can never parse, so
+/// the override always wins when present.
+fn install_choice(install: &Option<String>, no_install: bool) -> release::InstallChoice {
+    match (install, no_install) {
+        (Some(cmd), _) => release::InstallChoice::Command(cmd.clone()),
+        (None, true) => release::InstallChoice::Skip,
+        (None, false) => release::InstallChoice::Auto,
+    }
+}
+
+/// `bump release`: build `ReleaseOpts` from the parsed args and run the verb against its
+/// production ports. Every refusal maps to a nonzero exit, exactly like `process_directory`
+/// errors do today; the gated happy-path pause and any no-op-shaped success exit 0.
+fn dispatch_release(dir: &Path, args: &cli::ReleaseArgs) -> Result<()> {
+    let opts = release::ReleaseOpts {
+        bump_type: BumpType::from_cli(args.major, args.minor),
+        dry_run: args.dry_run,
+        install: install_choice(&args.install, args.no_install),
+    };
+    debug!("dispatch_release: dir={} opts={:?}", dir.display(), opts);
+    if let Err(e) = release::release(
+        dir,
+        &opts,
+        &release::GitPusher,
+        &release::ShellInstaller,
+        &release::GhPr,
+    ) {
+        eprintln!("Error: {:#}", e);
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// `bump finish`: build `FinishOpts` from the parsed args and run the verb against its
+/// production ports. Same exit-code mapping as `dispatch_release`.
+fn dispatch_finish(dir: &Path, args: &cli::FinishArgs) -> Result<()> {
+    let opts = release::FinishOpts {
+        dry_run: args.dry_run,
+        install: install_choice(&args.install, args.no_install),
+    };
+    debug!("dispatch_finish: dir={} opts={:?}", dir.display(), opts);
+    if let Err(e) = release::finish(dir, &opts, &release::GitPusher, &release::ShellInstaller) {
+        eprintln!("Error: {:#}", e);
+        std::process::exit(1);
+    }
     Ok(())
 }
 
@@ -2128,5 +2201,44 @@ name = "test-pkg"
             "0.5.0",
             "version must be unchanged when config parsing aborts"
         );
+    }
+
+    // =========================================================================
+    // PHASE 8: --install / --no-install -> InstallChoice mapping (dispatch_release /
+    // dispatch_finish share this).
+    // =========================================================================
+
+    #[test]
+    fn install_choice_explicit_override_wins() {
+        let cmd = Some("touch marker".to_string());
+        assert_eq!(
+            install_choice(&cmd, false),
+            release::InstallChoice::Command("touch marker".to_string())
+        );
+        // Clap's `conflicts_with` makes (Some, true) unreachable at parse time, but the
+        // mapping still prefers the override defensively if ever called directly.
+        assert_eq!(
+            install_choice(&cmd, true),
+            release::InstallChoice::Command("touch marker".to_string())
+        );
+    }
+
+    #[test]
+    fn install_choice_no_install_is_skip() {
+        assert_eq!(install_choice(&None, true), release::InstallChoice::Skip);
+    }
+
+    #[test]
+    fn install_choice_neither_flag_is_auto() {
+        assert_eq!(install_choice(&None, false), release::InstallChoice::Auto);
+    }
+
+    /// `--help`'s log path must come from the SAME source `setup_logging` uses -- this
+    /// pins `cli::log_path_for_help`'s dependency, `log_file_path`, so the two can never
+    /// drift.
+    #[test]
+    fn log_file_path_ends_with_bump_logs_bump_log() {
+        let path = log_file_path();
+        assert!(path.ends_with("bump/logs/bump.log"), "got: {}", path.display());
     }
 }

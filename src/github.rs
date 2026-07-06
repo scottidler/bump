@@ -378,9 +378,7 @@ fn is_retryable_error(error: &str) -> bool {
 /// one on a reused branch name. `gh pr list --head <branch> --state open --json number`
 /// exits 0 in every case and returns a JSON array whose emptiness IS the verdict.
 ///
-/// Gated `#[cfg(test)]` this phase: only the (also `#[cfg(test)]`) `release::GhPr` calls
-/// the PR seam until Phase 8 wires the subcommand.
-#[cfg(test)]
+/// Wired to `release::GhPr::open_pr_exists` in production.
 fn pr_list_args(branch: &str) -> Vec<String> {
     ["pr", "list", "--head", branch, "--state", "open", "--json", "number"]
         .into_iter()
@@ -391,7 +389,6 @@ fn pr_list_args(branch: &str) -> Vec<String> {
 /// Interpret the `gh pr list --json number` stdout: a NON-empty JSON array means an open
 /// PR exists (skip create); an empty array means none (create). Empty stdout is treated as
 /// "no PR". Any non-array / non-JSON payload is a loud error, never a silent false.
-#[cfg(test)]
 fn open_pr_exists_from_json(stdout: &str) -> Result<bool> {
     let trimmed = stdout.trim();
     if trimmed.is_empty() {
@@ -406,9 +403,8 @@ fn open_pr_exists_from_json(stdout: &str) -> Result<bool> {
 }
 
 /// Does an OPEN pull request exist for `branch`? Runs the `pr_list_args` probe in the
-/// repo at `path` (gh infers the repo from its remote), per-org token-authed. Gated
-/// `#[cfg(test)]` this phase for the same reason as the git push helpers.
-#[cfg(test)]
+/// repo at `path` (gh infers the repo from its remote), per-org token-authed. Wired to
+/// `release::GhPr::open_pr_exists` in production.
 pub fn open_pr_exists(path: &Path, branch: &str) -> Result<bool> {
     debug!("open_pr_exists: path={} branch={}", path.display(), branch);
     let org = remote_slug(path).map(|s| org_of(&s).to_string()).unwrap_or_default();
@@ -430,8 +426,7 @@ pub fn open_pr_exists(path: &Path, branch: &str) -> Result<bool> {
 /// Open a PR for the current branch with `gh pr create --fill`. Only ever called behind
 /// `open_pr_exists` returning false -- `gh pr create --fill` ERRORS on an existing open PR
 /// (known gh behavior, Phase 0 addendum), so this is a race backstop, not the primary
-/// guard. Gated `#[cfg(test)]` this phase.
-#[cfg(test)]
+/// guard. Wired to `release::GhPr::create_pr` in production.
 pub fn create_pr(path: &Path, branch: &str) -> Result<()> {
     debug!("create_pr: path={} branch={}", path.display(), branch);
     let org = remote_slug(path).map(|s| org_of(&s).to_string()).unwrap_or_default();

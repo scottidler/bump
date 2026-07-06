@@ -621,3 +621,105 @@ per phase.
   the git-release-guard hook) remain Phase 9 -- NOT executable here. Phase 8 is the only
   step that turns finish's test-built scaffold into shipped code (ungate `mod release` +
   the new git helpers, wire the `bump finish` subcommand and its flags).
+
+## Phase 8: CLI surface + docs
+
+### Design decisions
+- Ungated everything Phases 5-7 gated `#[cfg(test)]`: `mod release;` (`src/main.rs`);
+  `git::push_branch`/`push_tag`/`push_feature_branch`/`checkout`/`pull_ff_only`/
+  `remote_tag_commit` (`src/git.rs`); `github::pr_list_args`/`open_pr_exists_from_json`/
+  `open_pr_exists`/`create_pr` (`src/github.rs`). Every one now has a real production
+  caller (below), so removing the gate creates zero new `dead_code` under `clippy
+  --all-targets -- -D warnings` -- verified: `otto ci` green with every gate off.
+- Clap wiring is the OPTIONAL-SUBCOMMAND pattern (`src/cli.rs`): `Cli.command:
+  Option<Commands>` sits ALONGSIDE the existing top-level flags and the `directories:
+  Vec<PathBuf>` positional. `Commands::Release(ReleaseArgs)` / `Commands::Finish
+  (FinishArgs)` are two new `clap::Args` structs carrying only their own flags
+  (`-m`/`-M`/`-n`/`--install`/`--no-install` for release; `-n`/`--install`/`--no-install`
+  for finish -- finish has no bump level, matching `FinishOpts` not carrying `bump_type`).
+  Verified BEFORE touching production code with a throwaway clap program
+  (`$TMPDIR/scratchpad/clap-test`): a bare positional token matches the subcommand ONLY
+  on an EXACT literal name match ("release", not "./release", not "release-notes"), so
+  `bump ./proj1 ./proj2`, `bump --skip-member a b`, and every existing invocation parse
+  identically whether or not the `Option<Commands>` field exists. The one documented
+  ambiguity (a directory literally named `release`/`finish` with no path prefix) is
+  covered by a dedicated test
+  (`cli::tests::test_cli_dir_named_release_needs_path_prefix_to_disambiguate`).
+- `main::dispatch_command` (`src/main.rs`) is the FIRST thing `main()` does after
+  `Cli::parse()`: `if let Some(command) = &cli.command { return dispatch_command(command);
+  }` -- an early return BEFORE any of the legacy bare-`bump` code runs, so the legacy path
+  is untouched code, not merely untouched behavior. `dispatch_release`/`dispatch_finish`
+  build `ReleaseOpts`/`FinishOpts` from the parsed args (via the shared `install_choice`
+  helper) and call `release::release(dir, &opts, &release::GitPusher,
+  &release::ShellInstaller, &release::GhPr)` / `release::finish(dir, &opts,
+  &release::GitPusher, &release::ShellInstaller)` against the CURRENT directory (the
+  design doc's API contract takes no directory argument for either verb -- callers `cd`
+  into the repo, matching the bash driver they replace).
+- Exit-code mapping mirrors `process_directory`'s existing pattern exactly, not `main`'s
+  `?`-propagation: `if let Err(e) = release::release(...) { eprintln!("Error: {:#}", e);
+  std::process::exit(1); }`. This keeps the error TEXT format ("Error: {:#}") identical to
+  the legacy path's `eprintln!("Error: {:#}", e)` in the per-directory loop, rather than
+  switching to eyre's own `main() -> Result<()>` Debug-formatted panic-style output. The
+  gated happy-path pause (`paused: true`, `Ok(report)`) and the finish no-op (`Ok(report)`,
+  `resumed: false`) both exit 0 for free, since `dispatch_*` only special-cases `Err`.
+- `--help` for both new subcommands (`cli::get_release_help`/`get_finish_help`) is a
+  condensed restatement of the state tables (one line per row, matching the design doc's
+  table order) plus the required-tools block (same `check_tool_version` machinery as the
+  top-level `--help`) and the log path. The log path is rendered at RUNTIME
+  (`cli::log_path_for_help` -> `crate::log_file_path()`), NOT hardcoded -- `log_file_path()`
+  is a new `pub(crate)` helper in `main.rs` that `setup_logging` now also calls, so the
+  logger and `--help` can never drift (rules/rust.md's "render at runtime from the same
+  source the logger uses"). Verified live: `bump release --help` prints
+  `/home/saidler/.local/share/bump/logs/bump.log` (the real resolved path), while the
+  PRE-EXISTING top-level `bump --help` text is left untouched (still the literal
+  `~/.local/share/bump/logs/bump.log` string) -- fixing that pre-existing hardcode was out
+  of this phase's scope and touching it would risk the byte-identical constraint on
+  `--help` output for no phase-assigned benefit.
+- README (`README.md`) gained a new "The release verbs (recommended)" section up top
+  documenting `bump release`/`bump finish`'s state tables and the `--install`/
+  `--no-install` precedence, and the old top-level usage/options/workflows/gated-repo
+  sections were re-labeled "Primitives (for humans / advanced or manual use)" with a
+  one-line reframe -- content otherwise UNCHANGED (still accurate: bare `bump`,
+  `--no-tag`, `--tag-only`, `--gates` all behave exactly as documented). The intro line
+  was corrected from "Rust CLI tool ... Cargo.toml" to name all three manifests
+  (Cargo.toml/pyproject.toml/package.json), since Phases 2-3 shipped Python/Node support
+  that the README never mentioned -- "keep it accurate to shipped reality" per this
+  phase's instruction.
+
+### Deviations
+- None against this phase's bullet list. Every item on the "ungate + wire" checklist was
+  executed exactly as enumerated (verified against source, not assumed): `mod release`;
+  git's 6 helpers; github's 4 helpers; `GitPusher`/`ShellInstaller`/`GhPr` (these were
+  never separately gated -- they became reachable, and thus non-dead-code, the moment
+  `mod release` was ungated and `dispatch_release`/`dispatch_finish` called them); the two
+  clap subcommands; `--install`/`--no-install`.
+
+### Tradeoffs
+- Left the pre-existing top-level `bump --help` log-path string hardcoded (see Design
+  decisions) rather than retrofitting it to `log_file_path()` in this phase: the
+  hard constraint is bare-`bump` BYTE-IDENTICAL, and the existing string already matches
+  `log_file_path()`'s default output when `$XDG_DATA_HOME`/`$HOME` are unmodified (the
+  only difference is the tilde vs the expanded path) -- rendering it at runtime would be
+  a strict improvement but is an edit to code this phase does not otherwise touch, and
+  the design doc's Phase 8 bullet scopes docs to `bump release --help` documenting the
+  state table, not a retrofit of the primitive's `--help`. Flagged, not silently skipped.
+- New tests for the subcommand wiring live inline in `src/cli.rs`'s existing
+  `#[cfg(test)] mod tests` (matching that file's pre-existing convention, same reasoning
+  as every prior phase's test-placement calls) rather than a `src/cli/tests.rs` split;
+  `install_choice`/`log_file_path` tests were appended to `src/main.rs`'s existing
+  inline `mod tests` for the same reason.
+- `dispatch_release`/`dispatch_finish` are thin (build opts, delegate, map the error to an
+  exit code) rather than printing a report summary from the returned `ReleaseReport`: both
+  verbs already `println!` every user-facing status line internally (Released/Resumed/
+  paused/already-released/etc, from Phases 5-7), so a second summary print at the
+  dispatch layer would duplicate output. `ReleaseReport` remains the TESTABLE surface
+  (already exercised by Phase 5-7's unit tests); production callers use it only for the
+  `Err` case.
+
+### Open questions
+- None. All seven acceptance-criteria-adjacent items for this phase (ungate checklist,
+  subcommand wiring, `--install`/`--no-install`, `--help` state tables, README, bare-bump
+  byte-identical) were verified directly (build, `otto ci`, and manual smoke on real
+  throwaway git repos with a bare remote) rather than assumed. Phase 9 (cross-repo
+  retirement of the bash driver, skills, and the git-release-guard hook) remains the
+  parent's/operator's step, not executable here.
