@@ -1,4 +1,5 @@
 use eyre::{Context, Result, bail};
+use log::debug;
 use std::path::Path;
 use std::process::Command;
 
@@ -171,6 +172,36 @@ pub fn has_uncommitted_changes(path: &Path) -> Result<bool> {
 
     let status = String::from_utf8_lossy(&output.stdout);
     Ok(!status.trim().is_empty())
+}
+
+/// List the paths git considers dirty (staged, modified, or untracked) via
+/// `git status --porcelain`. Captured BEFORE bump mutates anything so the lockfile
+/// guard can tell a bump-synced lockfile from one the user had already changed.
+pub fn dirty_files(path: &Path) -> Result<Vec<String>> {
+    debug!("dirty_files: path={}", path.display());
+    let output = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(path)
+        .output()
+        .context("Failed to run git status")?;
+
+    if !output.status.success() {
+        bail!("git status failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    let status = String::from_utf8_lossy(&output.stdout);
+    let mut files = Vec::new();
+    for line in status.lines() {
+        // Porcelain v1 lines are "XY <path>": two ASCII status columns + a space, so
+        // the path starts at byte 3 (always a valid char boundary). `get` avoids the
+        // string-slice panic footgun on any unexpected short line.
+        let Some(rest) = line.get(3..) else { continue };
+        // A rename/copy is "orig -> new"; the post-change name is what ends up staged.
+        let name = rest.rsplit(" -> ").next().unwrap_or(rest);
+        files.push(name.to_string());
+    }
+    debug!("dirty_files: {} dirty path(s)", files.len());
+    Ok(files)
 }
 
 /// Relation of local HEAD to the remote tracking branch.

@@ -247,6 +247,7 @@ fn determine_commit_message(
     staged_files: &[String],
     is_initial_tag: bool,
     project_type: ProjectType,
+    predirty_files: &[String],
 ) -> Result<String> {
     // Priority 1: User provided --message
     if let Some(ref msg) = cli.message {
@@ -263,7 +264,7 @@ fn determine_commit_message(
         return Ok(format!("Release {}", new_tag));
     }
 
-    if is_version_files_only(staged_files, project_type) {
+    if is_version_files_only(staged_files, project_type, predirty_files) {
         if is_initial_tag {
             return Ok(format!("Release {}", new_tag));
         } else {
@@ -512,6 +513,10 @@ fn process_directory(dir: &Path, cli: &Cli, bump_type: BumpType) -> Result<()> {
     // 7. Check for uncommitted changes to determine workflow
     let has_changes = git::has_uncommitted_changes(dir)?;
 
+    // Capture the pre-bump dirty set BEFORE any mutation, so the lockfile guard can
+    // distinguish a bump-synced lockfile from one the user had already changed.
+    let predirty_files = git::dirty_files(dir)?;
+
     // 8. Handle dry-run
     if cli.dry_run {
         if action.needs_file_update {
@@ -552,8 +557,14 @@ fn process_directory(dir: &Path, cli: &Cli, bump_type: BumpType) -> Result<()> {
 
         // Determine commit message
         let staged_files = git::get_staged_files(dir)?;
-        let commit_message =
-            determine_commit_message(cli, &new_tag, &staged_files, action.is_initial_tag, project_type)?;
+        let commit_message = determine_commit_message(
+            cli,
+            &new_tag,
+            &staged_files,
+            action.is_initial_tag,
+            project_type,
+            &predirty_files,
+        )?;
 
         // Commit
         if !staged_files.is_empty() {
@@ -597,8 +608,14 @@ fn process_directory(dir: &Path, cli: &Cli, bump_type: BumpType) -> Result<()> {
 
         if is_pushed {
             // HEAD is pushed - create a new commit
-            let commit_message =
-                determine_commit_message(cli, &new_tag, &staged_files, action.is_initial_tag, project_type)?;
+            let commit_message = determine_commit_message(
+                cli,
+                &new_tag,
+                &staged_files,
+                action.is_initial_tag,
+                project_type,
+                &predirty_files,
+            )?;
 
             if !staged_files.is_empty() {
                 git::commit(dir, &commit_message)?;

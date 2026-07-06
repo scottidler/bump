@@ -1,6 +1,8 @@
 use eyre::{Context, ContextCompat, Result, bail};
+use log::{debug, error};
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 use toml_edit::{DocumentMut, Item, Value};
 
 /// Check if pyproject.toml exists at the given path
@@ -17,22 +19,17 @@ pub fn pyproject_toml_path(dir: &Path) -> std::path::PathBuf {
 /// Checks [project].version (PEP 621) first, then [tool.poetry].version
 /// Returns None if version field is missing or dynamic
 pub fn read_version(pyproject_path: &Path) -> Result<Option<String>> {
+    debug!("read_version: pyproject_path={}", pyproject_path.display());
     let content = fs::read_to_string(pyproject_path).context(format!("Failed to read {}", pyproject_path.display()))?;
 
     let doc = content
         .parse::<DocumentMut>()
         .context("Failed to parse pyproject.toml")?;
 
-    // Check if version is declared dynamic (PEP 621)
-    if let Some(project) = doc.get("project")
-        && let Some(dynamic) = project.get("dynamic")
-        && let Some(arr) = dynamic.as_array()
-    {
-        for item in arr.iter() {
-            if item.as_str() == Some("version") {
-                return Ok(None);
-            }
-        }
+    // Check if version is declared dynamic (PEP 621). A dynamic version is owned
+    // elsewhere (build backend / SCM plugin), so there is no static version to read.
+    if has_dynamic_version(&doc) {
+        return Ok(None);
     }
 
     // Try [project].version first (PEP 621 - modern standard)
@@ -53,6 +50,21 @@ pub fn read_version(pyproject_path: &Path) -> Result<Option<String>> {
     }
 
     Ok(None)
+}
+
+/// True if this pyproject declares its version dynamically (`dynamic = ["version"]`
+/// under `[project]`). The version is then owned elsewhere (a build backend / SCM
+/// plugin such as hatch-vcs or setuptools-scm), so a static `[project].version` MUST
+/// NOT be written -- doing so produces PEP 621-invalid metadata (both a `version`
+/// field and a `"version"` entry in `dynamic`).
+fn has_dynamic_version(doc: &DocumentMut) -> bool {
+    if let Some(project) = doc.get("project")
+        && let Some(dynamic) = project.get("dynamic")
+        && let Some(arr) = dynamic.as_array()
+    {
+        return arr.iter().any(|item| item.as_str() == Some("version"));
+    }
+    false
 }
 
 /// Determine which section holds the version: "project" or "tool.poetry"
@@ -80,11 +92,37 @@ fn version_section(doc: &DocumentMut) -> Option<&'static str> {
 /// Update the version in pyproject.toml
 /// Creates the version field if it doesn't exist
 pub fn write_version(pyproject_path: &Path, new_version: &str) -> Result<()> {
+    debug!(
+        "write_version: pyproject_path={} new_version={}",
+        pyproject_path.display(),
+        new_version
+    );
     let content = fs::read_to_string(pyproject_path).context(format!("Failed to read {}", pyproject_path.display()))?;
 
     let mut doc = content
         .parse::<DocumentMut>()
         .context("Failed to parse pyproject.toml")?;
+
+    // Refuse (never corrupt) when the version is dynamic. `read_version` maps BOTH a
+    // genuinely-missing-but-writable version AND a dynamic version to `None`; they must
+    // diverge here at the write path -- dynamic REFUSES, plain-absent gets written.
+    if has_dynamic_version(&doc) {
+        error!(
+            "write_version: refusing to write static version to dynamic pyproject at {}",
+            pyproject_path.display()
+        );
+        bail!(
+            "Cannot write a version to {}: it declares `dynamic = [\"version\"]`.\n\
+             The version is owned elsewhere (a build backend / SCM plugin such as \
+             hatch-vcs or setuptools-scm), so writing a static `[project].version` would \
+             produce PEP 621-invalid metadata (a `version` field alongside a \"version\" \
+             entry in `dynamic`).\n\
+             For a dynamic-version project the git tag is the source of truth -- remove \
+             \"version\" from `dynamic` and add a static `version` field if you want bump \
+             to manage it.",
+            pyproject_path.display()
+        );
+    }
 
     match version_section(&doc) {
         Some("project") => {
@@ -127,9 +165,57 @@ pub fn write_version(pyproject_path: &Path, new_version: &str) -> Result<()> {
     Ok(())
 }
 
-/// Sync lockfile after version change (no-op for Python - lockfiles don't track project version)
-pub fn sync_lockfile(_dir: &Path) -> Result<()> {
-    Ok(())
+/// Sync Python lockfiles after a version change.
+///
+/// - `uv.lock` records the root project's OWN version at exactly one site (Phase 0
+///   spike, 2026-07-06), so a bump leaves it stale and `uv lock --check` /
+///   `uv sync --locked` fail in CI. Run `uv lock` to true it up. The `uv` binary
+///   absent while `uv.lock` is present is a LOUD error -- bump never leaves a
+///   silently stale lock.
+/// - `poetry.lock` does NOT record the root package version (verified), so it needs
+///   no sync and is left untouched.
+pub fn sync_lockfile(dir: &Path) -> Result<()> {
+    sync_lockfile_with(dir, "uv")
+}
+
+/// Testable seam for `sync_lockfile`: `uv_bin` is the uv executable to invoke, so a
+/// test can point it at a nonexistent binary to exercise the "uv missing but uv.lock
+/// present" loud-error path deterministically (no PATH mutation).
+fn sync_lockfile_with(dir: &Path, uv_bin: &str) -> Result<()> {
+    debug!("sync_lockfile_with: dir={} uv_bin={}", dir.display(), uv_bin);
+
+    let uv_lock = dir.join("uv.lock");
+    if !uv_lock.exists() {
+        debug!("sync_lockfile_with: no uv.lock, nothing to sync");
+        return Ok(());
+    }
+
+    debug!("sync_lockfile_with: uv.lock present, running `{} lock`", uv_bin);
+    let output = Command::new(uv_bin).arg("lock").current_dir(dir).output();
+
+    match output {
+        Ok(out) if out.status.success() => {
+            debug!("sync_lockfile_with: `{} lock` succeeded", uv_bin);
+            Ok(())
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            error!("sync_lockfile_with: `{} lock` failed: {}", uv_bin, stderr);
+            bail!(
+                "`uv lock` failed while syncing uv.lock after the version bump:\n{}",
+                stderr
+            )
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            error!("sync_lockfile_with: `{}` binary not found but uv.lock present", uv_bin);
+            bail!(
+                "uv.lock is present but the `uv` binary was not found on PATH.\n\
+                 bump will not leave a stale lockfile (CI `uv lock --check` would fail).\n\
+                 Install uv, or remove uv.lock if this project no longer uses uv."
+            )
+        }
+        Err(e) => Err(e).context("Failed to run `uv lock`"),
+    }
 }
 
 #[cfg(test)]
@@ -269,6 +355,44 @@ version = "2.0.0"
     }
 
     #[test]
+    fn test_write_version_dynamic_refuses_without_corrupting() {
+        // Regression (bite) test for the dynamic-version corruption bug: a
+        // `dynamic = ["version"]` pyproject with existing tags used to hit the
+        // `(None, Some(tag))` arm and get a STATIC `version` written next to the
+        // `dynamic` entry -- PEP 621-invalid metadata. The write path must REFUSE.
+        let dir = TempDir::new().unwrap();
+        let path = create_pyproject_toml(
+            dir.path(),
+            r#"
+[project]
+name = "my-package"
+dynamic = ["version"]
+"#,
+        );
+
+        let before = fs::read_to_string(&path).unwrap();
+        let result = write_version(&path, "1.2.3");
+
+        assert!(
+            result.is_err(),
+            "write_version must refuse on dynamic = [\"version\"], not write corrupt metadata"
+        );
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("dynamic = [\"version\"]"),
+            "refusal must name `dynamic = [\"version\"]`; got: {err}"
+        );
+
+        // The file must be untouched: no static `version` field injected.
+        let after = fs::read_to_string(&path).unwrap();
+        assert_eq!(after, before, "pyproject.toml must be left byte-identical on refusal");
+        assert!(
+            !after.contains("version = \"1.2.3\""),
+            "no static version may be written alongside dynamic"
+        );
+    }
+
+    #[test]
     fn test_write_version_creates_in_project() {
         let dir = TempDir::new().unwrap();
         let path = create_pyproject_toml(
@@ -292,6 +416,81 @@ name = "my-package"
 
         create_pyproject_toml(dir.path(), "[project]\nname = \"test\"");
         assert!(pyproject_toml_exists(dir.path()));
+    }
+
+    #[test]
+    fn test_sync_lockfile_no_uv_lock_is_noop() {
+        // No uv.lock present -> sync is a no-op and never shells out, even to a
+        // nonexistent uv binary.
+        let dir = TempDir::new().unwrap();
+        create_pyproject_toml(dir.path(), "[project]\nname = \"x\"\nversion = \"0.1.0\"\n");
+        sync_lockfile_with(dir.path(), "uv-does-not-exist-bump-test").unwrap();
+    }
+
+    #[test]
+    fn test_sync_lockfile_uv_missing_with_lock_present_is_loud_error() {
+        // uv.lock present but the uv binary is absent -> loud error, never a silently
+        // stale lock. A guaranteed-nonexistent binary name simulates NotFound
+        // deterministically without touching PATH.
+        let dir = TempDir::new().unwrap();
+        create_pyproject_toml(dir.path(), "[project]\nname = \"x\"\nversion = \"0.1.0\"\n");
+        fs::write(dir.path().join("uv.lock"), "version = 1\n").unwrap();
+
+        let err = sync_lockfile_with(dir.path(), "uv-does-not-exist-bump-test").unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("uv.lock is present") && msg.contains("was not found"),
+            "expected a loud uv-missing error; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_sync_lockfile_uv_lock_check_green() {
+        // Requires the real `uv` binary. Skip (do NOT fail) when uv is unavailable or
+        // the initial lock cannot be created (no python/network in CI), so the default
+        // suite stays green everywhere. The fixture is dep-free, so `uv lock` needs no
+        // network to resolve.
+        if Command::new("uv")
+            .arg("--version")
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            eprintln!("skipping test_sync_lockfile_uv_lock_check_green: `uv` not available");
+            return;
+        }
+
+        let dir = TempDir::new().unwrap();
+        let path = create_pyproject_toml(
+            dir.path(),
+            "[project]\nname = \"uv-fixture\"\nversion = \"0.1.0\"\nrequires-python = \">=3.8\"\n",
+        );
+
+        // Establish the initial lock. If this fails (no interpreter / offline), skip.
+        let init = Command::new("uv").arg("lock").current_dir(dir.path()).output().unwrap();
+        if !init.status.success() {
+            eprintln!(
+                "skipping test_sync_lockfile_uv_lock_check_green: initial `uv lock` failed: {}",
+                String::from_utf8_lossy(&init.stderr)
+            );
+            return;
+        }
+
+        // Bump the version, then sync the lock via the code under test.
+        write_version(&path, "0.1.1").unwrap();
+        sync_lockfile(dir.path()).unwrap();
+
+        // The lock must now be in sync: `uv lock --check` exits 0.
+        let check = Command::new("uv")
+            .args(["lock", "--check"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            check.status.success(),
+            "uv lock --check must be green after sync_lockfile: {}",
+            String::from_utf8_lossy(&check.stderr)
+        );
     }
 
     #[test]

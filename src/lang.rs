@@ -98,13 +98,55 @@ pub fn version_file_name(project_type: ProjectType) -> &'static str {
     }
 }
 
-/// Check if staged files are only version-related files
-pub fn is_version_files_only(staged_files: &[String], project_type: ProjectType) -> bool {
+/// Manifest files that carry the version for a project type. These are ALWAYS
+/// version-files (bump writes the version into them).
+fn manifest_files(project_type: ProjectType) -> &'static [&'static str] {
     match project_type {
-        ProjectType::Rust => staged_files.iter().all(|f| f == "Cargo.toml" || f == "Cargo.lock"),
-        ProjectType::Python => staged_files.iter().all(|f| f == "pyproject.toml"),
-        ProjectType::Generic => staged_files.is_empty(),
+        ProjectType::Rust => &["Cargo.toml"],
+        ProjectType::Python => &["pyproject.toml"],
+        ProjectType::Generic => &[],
     }
+}
+
+/// Lockfiles that bump SYNCS as part of a version bump (Cargo.lock, uv.lock). These
+/// count toward "version-files-only" only under the lockfile guard below. poetry.lock,
+/// pnpm-lock.yaml, yarn.lock are deliberately absent: bump never syncs them (they do
+/// not record the root package version), so a change to one is always the user's.
+fn synced_lockfiles(project_type: ProjectType) -> &'static [&'static str] {
+    match project_type {
+        ProjectType::Rust => &["Cargo.lock"],
+        ProjectType::Python => &["uv.lock"],
+        ProjectType::Generic => &[],
+    }
+}
+
+/// Check if the staged file set is only version-related files, which lets bump
+/// auto-generate the commit message instead of prompting the operator.
+///
+/// Lockfile guard (panel finding): a synced lockfile counts as version-only ONLY when
+/// bump's own sync produced the change on a previously-clean tree. `predirty_files` is
+/// the working-tree dirty set captured BEFORE bump mutated anything; a lockfile present
+/// there carries the user's dependency changes and must never be misclassified as a
+/// version-only bump. The manifest itself is always a version-file.
+pub fn is_version_files_only(staged_files: &[String], project_type: ProjectType, predirty_files: &[String]) -> bool {
+    debug!(
+        "is_version_files_only: project_type={} staged={:?} predirty={:?}",
+        project_type, staged_files, predirty_files
+    );
+    if project_type == ProjectType::Generic {
+        return staged_files.is_empty();
+    }
+    staged_files.iter().all(|f| {
+        let name = f.as_str();
+        if manifest_files(project_type).contains(&name) {
+            true
+        } else if synced_lockfiles(project_type).contains(&name) {
+            // Only a bump-synced lockfile (clean before bump ran) counts as version-only.
+            !predirty_files.iter().any(|d| d == f)
+        } else {
+            false
+        }
+    })
 }
 
 /// The terminal line announcing a member left untouched. Printed with `println!`
@@ -205,4 +247,78 @@ pub fn validate_project(dir: &Path, project_type: ProjectType, skip_members: &[S
         independent_members.len()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn test_version_only_rust_manifest_and_synced_lock() {
+        // Cargo.toml + a bump-synced Cargo.lock (clean before bump) => version-only.
+        assert!(is_version_files_only(
+            &s(&["Cargo.toml", "Cargo.lock"]),
+            ProjectType::Rust,
+            &[]
+        ));
+    }
+
+    #[test]
+    fn test_version_only_python_manifest_and_synced_uv_lock() {
+        // pyproject.toml + a bump-synced uv.lock (clean before bump) => version-only.
+        assert!(is_version_files_only(
+            &s(&["pyproject.toml", "uv.lock"]),
+            ProjectType::Python,
+            &[]
+        ));
+    }
+
+    #[test]
+    fn test_lockfile_guard_predirtied_uv_lock_not_version_only() {
+        // uv.lock was ALREADY dirty before bump (user dep changes) -> not version-only,
+        // so bump must not fold it into an auto "Bump version to X" commit.
+        assert!(!is_version_files_only(
+            &s(&["pyproject.toml", "uv.lock"]),
+            ProjectType::Python,
+            &s(&["uv.lock"])
+        ));
+    }
+
+    #[test]
+    fn test_lockfile_guard_predirtied_cargo_lock_not_version_only() {
+        assert!(!is_version_files_only(
+            &s(&["Cargo.toml", "Cargo.lock"]),
+            ProjectType::Rust,
+            &s(&["Cargo.lock"])
+        ));
+    }
+
+    #[test]
+    fn test_poetry_lock_never_version_only() {
+        // poetry.lock is never bump-synced, so it is always a non-version change.
+        assert!(!is_version_files_only(
+            &s(&["pyproject.toml", "poetry.lock"]),
+            ProjectType::Python,
+            &[]
+        ));
+    }
+
+    #[test]
+    fn test_unrelated_file_not_version_only() {
+        assert!(!is_version_files_only(
+            &s(&["Cargo.toml", "src/main.rs"]),
+            ProjectType::Rust,
+            &[]
+        ));
+    }
+
+    #[test]
+    fn test_generic_version_only_iff_empty() {
+        assert!(is_version_files_only(&[], ProjectType::Generic, &[]));
+        assert!(!is_version_files_only(&s(&["anything"]), ProjectType::Generic, &[]));
+    }
 }

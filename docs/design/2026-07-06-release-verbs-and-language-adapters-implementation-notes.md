@@ -106,3 +106,66 @@ per phase.
 
 ### Open questions
 - None.
+
+## Phase 2: Python fixes
+
+### Design decisions
+- uv.lock sync lives in `sync_lockfile` -> `sync_lockfile_with` (src/lang/python.rs):
+  when `uv.lock` exists, run `uv lock`; success = trued-up lock, non-zero exit = loud
+  error, `uv` binary NotFound while `uv.lock` present = loud error (never a silently
+  stale lock). No `uv.lock` = no-op. `poetry.lock` stays untouched (does not record
+  the root package version -- verified Phase 0).
+- Lockfile guard mechanism (src/lang.rs:`is_version_files_only`, src/git.rs:`dirty_files`,
+  src/main.rs `run`): the pre-bump working-tree dirty set is captured with
+  `git::dirty_files` BEFORE any mutation and threaded through
+  `determine_commit_message` into `is_version_files_only(staged, type, predirty)`. A
+  synced lockfile (`Cargo.lock`/`uv.lock`, from `synced_lockfiles`) counts toward
+  version-only ONLY when it is NOT in the pre-bump dirty set -- i.e. bump's own sync
+  produced it on a clean tree. A pre-dirtied lockfile (user dep changes) fails the
+  check and drops through to the editor prompt, so it can never be silently folded
+  into an auto "Bump version to X" commit. Manifest files (`Cargo.toml`/`pyproject.toml`,
+  from `manifest_files`) are always version-files; the guard is lockfile-scoped, matching
+  the phase bullet.
+- Dynamic-version refusal at the WRITE path (src/lang/python.rs:`write_version` +
+  `has_dynamic_version`): `read_version` maps both genuinely-missing and dynamic to
+  `None` (unchanged); they diverge at write. `write_version` bails when
+  `dynamic = ["version"]` is present, with a message that names `dynamic = ["version"]`,
+  and never touches the file. Plain-absent (no `dynamic`) still writes a new
+  `[project].version` (today's behavior, preserved).
+- `has_dynamic_version` extracted as one helper, used by both `read_version` (replacing
+  the old inline loop) and `write_version` -- single source of truth for "is this
+  dynamic," so the read/refuse decision cannot drift.
+
+### Deviations
+- Phase 1 deferred the `ManifestVersion` enum / `Manifest` trait from the Data Model,
+  so Phase 2 is implemented against the current plain-function shape (`read_version`
+  returns `Result<Option<String>>`, write dispatch is `lang::write_file_version`). Same
+  effect at the correct seam: the "dynamic REFUSES vs missing WRITES" divergence the
+  enum was meant to encode is realized at the write path instead of in the type. When
+  Phase 3 introduces the enum, this refusal collapses into the `Dynamic` variant.
+- `is_version_files_only` signature grew a third parameter (`predirty_files`). No
+  existing test called it directly (only `determine_commit_message` does), so no
+  existing test needed editing.
+
+### Tradeoffs
+- Testable-seam `sync_lockfile_with(dir, uv_bin)` vs PATH mutation in tests: added the
+  seam so the "uv missing + uv.lock present" loud-error path is exercised
+  deterministically by pointing at a nonexistent binary name, avoiding
+  `set_var("PATH", ...)` (unsafe in edition 2024, requires an env-lock, races parallel
+  tests). Production `sync_lockfile` calls it with `"uv"`.
+- uv-lock-check test is gated (skips, does not fail) when `uv` is absent or the initial
+  `uv lock` fails (no interpreter / offline). The fixture is dep-free so `uv lock`
+  needs no network to resolve; verified locally with uv 0.7.21 (test ran and passed,
+  not skipped). This keeps the default suite green on machines without uv while
+  exercising the real round-trip where uv exists.
+- Lockfile guard scoped to lockfiles only (not the manifest): the phase bullet and
+  panel finding are specifically about a pre-dirtied *lockfile*. A pre-dirtied manifest
+  is a separate concern not in this phase's scope.
+- New tests kept inline (`#[cfg(test)] mod tests`) in python.rs and lang.rs to match
+  the codebase's existing convention rather than introducing `python/tests.rs` /
+  `lang/tests.rs` mid-phase (per the phase instruction to match the file's existing
+  style). rules/rust.md's separate-file convention is a tree-wide mechanical pass, not
+  this phase's job.
+
+### Open questions
+- None.
