@@ -525,3 +525,99 @@ per phase.
   the git-release-guard hook allowing the two verbs) are Phase 9 -- NOT executable here.
   Phase 7 (`bump finish`) owns the tag-on-merge step this flow pauses for; nothing in
   Phase 6 pre-empts it.
+
+## Phase 7: `bump finish`
+
+### Design decisions
+- Factored the `--tag-only` verification ladder into ONE shared function
+  `crate::tag_ladder` (`src/main.rs`), consumed by BOTH `tag_only` (prints) and
+  `release::finish` (executes). The ladder runs the exact rungs it always did --
+  clean-tree, on-default, HEAD==origin/<default> EXACTLY (`git::compare_head_to_remote`),
+  manifest-version -> tag, then the remote-then-local tag-existence distinction -- and
+  returns a typed `TagCheck { tag, head, default, state: TagState }` instead of printing
+  or acting. `TagState` (`Absent` | `RemoteAtHead` | `RemoteAtOther(sha)` | `LocalAtHead`
+  | `LocalAtOther(sha)`) surfaces the remote-then-local classification; the CONSUMER
+  decides the action. This is the "reuse, don't duplicate" the phase demanded: the rungs
+  and the remote-then-local resolution live in one place.
+- `tag_only` (`src/main.rs`) is now a thin consumer that `match`es `TagState` and produces
+  BYTE-IDENTICAL output/refusals to before: `RemoteAtHead` -> "already tagged at HEAD on
+  origin. Nothing to do."; `RemoteAtOther`/`LocalAtOther` -> the exact manual-surgery
+  bail; `LocalAtHead` -> "already tagged at HEAD locally. Run: git push origin <tag>";
+  `Absent` -> create tag + "Tagged <tag> on merged <default> (<short>)" + push hint. Every
+  bail string in the ladder (dirty, off-default, behind/ahead/diverged, no-version) is
+  the original verbatim. Verified: all pre-existing `tag_only_*` tests stay green.
+- `release::finish(dir, &opts, pusher, installer) -> Result<ReleaseReport>`
+  (`src/release.rs`) mirrors `release`'s port-injection style but takes only `Pusher` +
+  `Installer` (no `Pr` -- finish does no PR ops). Flow: refuse git-repo/dirty/generic up
+  front (no mutation) -> `git::checkout(default)` -> `git::pull_ff_only(default)` ->
+  `tag_ladder` -> dispatch on `TagState`. The DIFFERENCE from `--tag-only`, per the phase:
+  finish EXECUTES the tag push via `Pusher::push_tag` (by explicit name) and runs install,
+  and does the checkout + `pull --ff-only` up front; `--tag-only` only PRINTS.
+- Finish state mapping (finish table): `Absent` -> tag the merged tip + push + install
+  (row 1); `LocalAtHead` -> RESUME (push only + install, `resumed: true`, NEVER reports
+  "already released") (row 4); remote-tag-present at HEAD -> NO-OP "already released"
+  (`resumed: false`, no install) (row 3); version == last tag / tag at another commit ->
+  `missed_bump()` refusal "no untagged version on <default>; bump rides a feature PR --
+  run bump release on a branch" (row 2); generic (no manifest) -> gated-generic-unsupported
+  refusal (row 5); dirty tree -> refuse before checkout (row 6).
+- New git helpers, all `#[cfg(test)]`-gated exactly like Phase 5-6's push helpers (bin
+  crate + `-D warnings`; only the also-`#[cfg(test)]` `finish` reaches them until Phase 8):
+  `git::checkout`, `git::pull_ff_only` (`git pull --ff-only origin <branch>` -- ff-only, no
+  merge/rebase, fails loudly on divergence so finish never tags a diverged tree), and
+  `git::remote_tag_commit` (see Deviations).
+- `FinishOpts { dry_run, install }` is a dedicated opts struct (NOT `ReleaseOpts`): finish
+  has no bump level, so carrying `bump_type` would be a name-that-lies. `-n` dry run
+  (`finish_dry_run`) echoes every command and mutates nothing (no checkout/pull/fetch);
+  the reported tag is read from the current manifest (best-effort preview).
+- Install reuses Phase 5's `resolve_install`/`run_install`/`echo_install` and
+  `InstallChoice` (override > config `install` > `cargo install --path .` iff Cargo.toml >
+  skip) unchanged.
+
+### Deviations
+- Added `git::remote_tag_commit` (NOT in the doc) and used it in finish's remote-tag arm
+  instead of the ladder's `RemoteAtHead`/`RemoteAtOther` verdict. Root cause: `git
+  ls-remote origin <exact-refspec>` omits the peeled `^{}` line, so `git::remote_tag_sha`
+  returns the annotated TAG-OBJECT sha, never the commit -- the ladder therefore can never
+  emit `RemoteAtHead` for a pushed annotated tag (empirically verified; also the reason
+  the existing tests assert `remote_tag_sha(..).is_some()`, not commit equality). I could
+  NOT fix this in `remote_tag_sha`/the ladder without changing `tag_only`'s byte-identical
+  output for the remote-tag-at-HEAD case, which the phase forbids. So finish keeps the
+  shared ladder for clean-tree/on-default/HEAD==origin/version/local-tag classification
+  and resolves the remote tag's ACTUAL commit (querying the `^{}` peeled ref) only to split
+  the remote-present case into no-op (commit==HEAD) vs missed-bump. Same effect at the
+  correct seam; `tag_only` untouched.
+- The doc row 2 ("version == last tag") is realized as: the tag for the merged version
+  already exists at a commit OTHER than the merged tip (`LocalAtOther`, or remote tag whose
+  resolved commit != HEAD) -> `missed_bump`. This is the observable form of "no version
+  newer than the last tag" and correctly distinguishes it from an at-HEAD already-released
+  tag (no-op).
+- `finish` and the three new git helpers are `#[cfg(test)]`-gated this phase, consistent
+  with how Phase 5-6 gated `release`, the push helpers, and the gh PR helpers. Phase 8
+  ungates them, wires the `bump finish` subcommand + `-n`/`--install`/`--no-install`, and
+  calls `finish(dir, &opts, &GitPusher, &ShellInstaller)`.
+
+### Tradeoffs
+- Finish tests use real git in `TempDir`s against bare remotes with a `RecordingPusher`
+  (records the tag push order, performs a REAL push so the round-trip is genuine) and a
+  `RecordingInstaller` (captures the resolved command, never runs `cargo install`). Finish
+  reads NO process-global env (it never probes the gate -- it tags the merged tip via the
+  ladder and fails closed on divergence), so finish tests need neither `BUMP_GATES_PROBE`
+  nor `crate::ENV_LOCK` and are safe in parallel.
+- Row-1 and missed-bump fixtures rewind local `main` BEHIND origin and park HEAD on the
+  merged feature branch, so `checkout <default>` + `pull --ff-only` are genuinely
+  exercised (the realistic post-gated-release state) rather than being no-ops.
+- The annotated-tag e2e asserts `git cat-file -t v0.1.6 == "tag"` (annotated, not
+  lightweight) AND `git::tag_sha == origin/main` (points at the merged tip), so both halves
+  of "annotated tag on the merged tip" bite.
+- New finish tests + fixtures appended to the existing `src/release/tests.rs` (already the
+  2018+ submodule split); `remote_tag_commit`/`checkout`/`pull_ff_only` have no dedicated
+  git-module unit tests -- they are exercised end-to-end by the finish tests, and adding
+  standalone tests would duplicate that coverage. (The mechanic each carries is asserted by
+  the finish e2e: ff-only pull lands the merged version, checkout reaches main, the peeled
+  remote-tag resolution drives the no-op-vs-missed-bump split.)
+
+### Open questions
+- Cross-repo/system-mutating steps (retiring the bash driver, re-pointing skills/agent,
+  the git-release-guard hook) remain Phase 9 -- NOT executable here. Phase 8 is the only
+  step that turns finish's test-built scaffold into shipped code (ungate `mod release` +
+  the new git helpers, wire the `bump finish` subcommand and its flags).

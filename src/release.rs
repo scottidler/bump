@@ -40,7 +40,7 @@ use crate::git::{self, HeadRemote};
 use crate::github::{self, Gate};
 use crate::lang::{self, Manifest, ManifestVersion, ProjectType};
 use crate::version::{self, BumpType};
-use crate::{DEFAULT_UNTOUCHED_VERSION, determine_version_action, process_directory};
+use crate::{DEFAULT_UNTOUCHED_VERSION, TagState, determine_version_action, process_directory, tag_ladder};
 use eyre::{Context, Result, bail};
 use log::debug;
 use semver::Version;
@@ -73,6 +73,17 @@ pub enum InstallChoice {
 pub struct ReleaseOpts {
     /// The bump level (patch/minor/major) for a fresh release.
     pub bump_type: BumpType,
+    /// `-n`: echo every command that would run and execute NOTHING.
+    pub dry_run: bool,
+    /// How to resolve the post-release install step.
+    pub install: InstallChoice,
+}
+
+/// Inputs to a `bump finish` invocation. No bump level -- finish tags the version already
+/// merged onto the default branch; it NEVER computes a bump. A plain opts struct so tests
+/// (and the Phase 8 CLI) drive the verb without a clap dependency here.
+#[derive(Debug, Clone)]
+pub struct FinishOpts {
     /// `-n`: echo every command that would run and execute NOTHING.
     pub dry_run: bool,
     /// How to resolve the post-release install step.
@@ -769,6 +780,166 @@ fn confirm_on_origin(dir: &Path, default: &str) -> Result<()> {
              the branch push did not land, so NO tag was created."
         ),
     }
+}
+
+/// `bump finish`: the gated post-merge tag step the paused `bump release` points to. After
+/// the PR merges, finish checks out the default branch, fast-forwards to the merged tip,
+/// then -- reusing `crate::tag_ladder` (the SAME `--tag-only` verification ladder, never a
+/// duplicate) -- either tags the merged commit and pushes it BY NAME, resumes a local-only
+/// tag, no-ops an already-released tag, or refuses (missed bump / gated generic / dirty).
+///
+/// The DIFFERENCE from `bump --tag-only`: `--tag-only` only PRINTS the push command; finish
+/// EXECUTES the tag push via the `Pusher` port (by explicit name) and then runs install,
+/// and it does the checkout + `pull --ff-only` up front. NO tag is ever created on an
+/// unconfirmed commit -- the shared ladder requires HEAD == origin/<default>.
+pub fn finish<P: Pusher, I: Installer>(
+    dir: &Path,
+    opts: &FinishOpts,
+    pusher: &P,
+    installer: &I,
+) -> Result<ReleaseReport> {
+    debug!(
+        "finish: dir={} dry_run={} install={:?}",
+        dir.display(),
+        opts.dry_run,
+        opts.install
+    );
+    let config = config::load(dir)?;
+
+    if !git::is_git_repo(dir) {
+        bail!("not a git repository: {}", dir.display());
+    }
+
+    // Dirty tree: checking out the default branch would clobber tracked changes or carry
+    // strays onto the release. Refuse before ANY mutation, with the one exact fix.
+    if git::has_uncommitted_changes(dir)? {
+        bail!(
+            "the working tree is dirty; bump finish checks out the default branch, which would \
+             clobber or carry strays.\n\
+             Commit or stash your changes first, then bump finish"
+        );
+    }
+
+    // Generic repo (no version-bearing manifest): finish cannot derive a version to tag.
+    // Gated generic is unsupported per the design's Resolved Decisions -- fail closed.
+    let manifests = lang::detect(dir)?;
+    if manifests.is_empty() {
+        bail!(
+            "this repo has no version-bearing manifest (generic).\n\
+             Gated generic repos are unsupported: bump finish cannot derive a version without a manifest."
+        );
+    }
+
+    let default = git::remote_default_branch(dir)?;
+
+    if opts.dry_run {
+        return finish_dry_run(dir, opts, &config, &manifests, &default);
+    }
+
+    // Reach the merged tip: checkout the default branch, then fast-forward to origin.
+    // `pull --ff-only` does its own fetch; the shared ladder re-fetches before comparing.
+    git::checkout(dir, &default)?;
+    git::pull_ff_only(dir, &default)?;
+
+    // Reuse the --tag-only verification ladder (clean-tree, on-default, HEAD==origin,
+    // manifest-version -> tag, remote-then-local existence). The consumer decides the
+    // action; the ladder only classifies.
+    let check = tag_ladder(dir)?;
+    let tag = check.tag.clone();
+    debug!("finish: tag={} state={:?}", tag, check.state);
+
+    match check.state {
+        // Local-only tag at the merged commit: a prior run died before/during the tag push.
+        // RESUME -- push by name + install. A local-only tag is NOT released; NEVER report
+        // it as already released.
+        TagState::LocalAtHead => {
+            pusher.push_tag(dir, &tag)?;
+            println!("resumed release: pushed {tag} on {default}");
+            let install_command = run_install(dir, &opts.install, &config, installer)?;
+            Ok(ReleaseReport {
+                tag,
+                resumed: true,
+                paused: false,
+                install_command,
+                dry_run: false,
+            })
+        }
+        // origin/<default> carries an untagged version (the merged bump): tag the merged
+        // commit, push by name, install.
+        TagState::Absent => {
+            let message = format!("Release {tag}");
+            git::create_tag(dir, &tag, &message)?;
+            pusher.push_tag(dir, &tag)?;
+            println!("released {tag} on {default}");
+            let install_command = run_install(dir, &opts.install, &config, installer)?;
+            Ok(ReleaseReport {
+                tag,
+                resumed: false,
+                paused: false,
+                install_command,
+                dry_run: false,
+            })
+        }
+        // The tag exists on the REMOTE. `remote_tag_sha` (behind the ladder) returns the
+        // annotated TAG-OBJECT sha for an exact refspec, so the ladder can't tell an
+        // at-HEAD remote tag from an at-other one -- resolve the tag's actual COMMIT here.
+        // At the merged tip -> already released (NO-OP). Elsewhere -> the version wasn't
+        // bumped for this merge (missed bump).
+        TagState::RemoteAtHead | TagState::RemoteAtOther(_) => match git::remote_tag_commit(dir, &tag)? {
+            Some(commit) if commit == check.head => {
+                println!("already released {tag}");
+                Ok(ReleaseReport {
+                    tag,
+                    resumed: false,
+                    paused: false,
+                    install_command: None,
+                    dry_run: false,
+                })
+            }
+            _ => missed_bump(&default),
+        },
+        // The tag exists LOCALLY at a commit OTHER than the merged tip: the version equals
+        // the last released tag, so nothing new merged with a bump.
+        TagState::LocalAtOther(_) => missed_bump(&default),
+    }
+}
+
+/// The missed-bump refusal (finish table row 2): a commit merged to the default branch
+/// without a version bump, so origin/<default>'s version still equals the last tag. The
+/// bump rides the NEXT feature PR.
+fn missed_bump(default: &str) -> Result<ReleaseReport> {
+    bail!("no untagged version on {default}; bump rides a feature PR -- run bump release on a branch")
+}
+
+/// `-n` dry run for `bump finish`: echo every command it would run and mutate NOTHING (no
+/// checkout, no pull, no fetch). The reported tag is read from the CURRENT manifest version
+/// (a best-effort preview; the real run tags the merged version after the fast-forward).
+fn finish_dry_run(
+    dir: &Path,
+    opts: &FinishOpts,
+    config: &Config,
+    manifests: &[Box<dyn Manifest>],
+    default: &str,
+) -> Result<ReleaseReport> {
+    debug!("finish_dry_run: dir={} default={}", dir.display(), default);
+    let install_command = resolve_install(dir, &opts.install, config);
+    let tag = match agreed_file_version(manifests)? {
+        Some(v) => version::format_tag(&v),
+        None => "vX.Y.Z".to_string(),
+    };
+    println!("[dry-run] git checkout {default}");
+    println!("[dry-run] git pull --ff-only origin {default}");
+    println!("[dry-run] (tag-only ladder: require HEAD == origin/{default} before tagging)");
+    println!("[dry-run] git tag -a {tag} -m \"Release {tag}\"  (only if the merged version is untagged)");
+    println!("[dry-run] git push origin {tag}");
+    echo_install(&install_command);
+    Ok(ReleaseReport {
+        tag,
+        resumed: false,
+        paused: false,
+        install_command,
+        dry_run: true,
+    })
 }
 
 /// Resolve the install command (precedence: explicit override > config > default-if-Cargo

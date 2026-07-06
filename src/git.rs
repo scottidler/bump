@@ -385,6 +385,50 @@ pub fn remote_tag_sha(path: &Path, tag: &str) -> Result<Option<String>> {
     Ok(plain_sha)
 }
 
+/// The COMMIT a tag points to ON THE REMOTE (annotated tags dereferenced), or `None` if the
+/// remote has no such tag. Unlike `remote_tag_sha` -- which, queried with an EXACT refspec,
+/// returns the annotated TAG-OBJECT sha (git omits the peeled `^{}` line for an exact
+/// match) -- this asks for the peeled ref too, so an annotated tag resolves to its
+/// underlying commit. `bump finish` needs the real commit to tell an at-HEAD remote tag
+/// (already released) from an at-other one (missed bump). Gated `#[cfg(test)]` this phase:
+/// only the (also `#[cfg(test)]`) `release::finish` reaches it until Phase 8.
+#[cfg(test)]
+pub fn remote_tag_commit(path: &Path, tag: &str) -> Result<Option<String>> {
+    debug!("remote_tag_commit: path={} tag={}", path.display(), tag);
+    let refspec = format!("refs/tags/{tag}");
+    let peeled = format!("{refspec}^{{}}");
+    let output = Command::new("git")
+        .args(["ls-remote", "origin", &refspec, &peeled])
+        .current_dir(path)
+        .output()
+        .context("Failed to run git ls-remote")?;
+
+    if !output.status.success() {
+        bail!(
+            "git ls-remote origin {} failed: {}",
+            refspec,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut plain = None;
+    for line in stdout.lines() {
+        let Some((sha, name)) = line.split_once('\t') else {
+            continue;
+        };
+        if name == peeled {
+            // Peeled commit of an annotated tag: the commit the tag ultimately points to.
+            return Ok(Some(sha.trim().to_string()));
+        }
+        if name == refspec {
+            // A lightweight tag has no `^{}` line; its ref sha IS the commit.
+            plain = Some(sha.trim().to_string());
+        }
+    }
+    Ok(plain)
+}
+
 /// Push a single branch to origin BY NAME. Never `--tags`, never `--follow-tags`,
 /// never `--force`. `bump release`'s strengthened ordering pushes the branch first and
 /// only tags after confirming it landed, so a rejected branch push can never strand a tag.
@@ -458,6 +502,54 @@ pub fn push_feature_branch(path: &Path, branch: &str) -> Result<()> {
     if !output.status.success() {
         bail!(
             "git push --no-follow-tags -u origin {} failed: {}",
+            branch,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    Ok(())
+}
+
+/// Checkout an existing local branch. `bump finish` uses this to reach the default branch
+/// before fast-forwarding to the merged tip. Gated `#[cfg(test)]` this phase for the same
+/// reason as the push helpers: bump is a bin crate and this helper is only reached from the
+/// (also `#[cfg(test)]`) `release::finish` until Phase 8 wires the subcommand.
+#[cfg(test)]
+pub fn checkout(path: &Path, branch: &str) -> Result<()> {
+    debug!("checkout: path={} branch={}", path.display(), branch);
+    let output = Command::new("git")
+        .args(["checkout", branch])
+        .current_dir(path)
+        .output()
+        .context("Failed to run git checkout")?;
+
+    if !output.status.success() {
+        bail!(
+            "git checkout {} failed: {}",
+            branch,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    Ok(())
+}
+
+/// Fast-forward-ONLY pull of `origin/<branch>` into the current branch: `git pull --ff-only
+/// origin <branch>`. Never a merge commit, never a rebase -- if the local branch can't
+/// fast-forward, it fails loudly, so `bump finish` never tags a diverged tree. Gated
+/// `#[cfg(test)]` this phase for the same reason as `checkout`.
+#[cfg(test)]
+pub fn pull_ff_only(path: &Path, branch: &str) -> Result<()> {
+    debug!("pull_ff_only: path={} branch={}", path.display(), branch);
+    let output = Command::new("git")
+        .args(["pull", "--ff-only", "origin", branch])
+        .current_dir(path)
+        .output()
+        .context("Failed to run git pull --ff-only")?;
+
+    if !output.status.success() {
+        bail!(
+            "git pull --ff-only origin {} failed: {}",
             branch,
             String::from_utf8_lossy(&output.stderr)
         );

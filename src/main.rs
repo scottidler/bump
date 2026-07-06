@@ -349,11 +349,45 @@ fn report_gates(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// --tag-only: create the annotated tag for the current manifest version on HEAD,
-/// after verifying HEAD is exactly the merged default-branch commit. No version
-/// change, no commit. Every check must hold or it exits non-zero with no mutation.
-fn tag_only(dir: &Path) -> Result<()> {
-    info!("tag_only: dir={}", dir.display());
+/// The remote-then-local tag-existence classification produced by `tag_ladder`, after the
+/// clean-tree / on-default / HEAD==origin / manifest-version rungs have all passed. The
+/// CONSUMER decides the action -- `bump --tag-only` prints, `bump finish` executes -- but
+/// the remote-then-local distinction lives here, in ONE place, for both. (The distinction
+/// is the load-bearing detail from the original `tag_only`: remote-tag then local-tag,
+/// each split by HEAD-equality.)
+#[derive(Debug)]
+pub(crate) enum TagState {
+    /// No tag for this version exists on the remote or locally -> create it at HEAD.
+    Absent,
+    /// The tag is on the REMOTE, pointing at HEAD: already released.
+    RemoteAtHead,
+    /// The tag is on the REMOTE, pointing at a commit OTHER than HEAD (carries that sha).
+    RemoteAtOther(String),
+    /// The tag exists LOCALLY at HEAD and is absent on the remote: needs pushing only.
+    LocalAtHead,
+    /// The tag exists LOCALLY at a commit OTHER than HEAD (carries that sha).
+    LocalAtOther(String),
+}
+
+/// The result of `tag_ladder`: the resolved tag, HEAD sha, default branch, and the
+/// remote-then-local tag-existence classification.
+#[derive(Debug)]
+pub(crate) struct TagCheck {
+    pub(crate) tag: String,
+    pub(crate) head: String,
+    pub(crate) default: String,
+    pub(crate) state: TagState,
+}
+
+/// The `--tag-only` verification ladder, factored so `bump --tag-only` and `bump finish`
+/// SHARE it (never duplicate it). Rungs, in order: clean working tree, on the remote
+/// default branch, HEAD == origin/<default> EXACTLY (fetch first), manifest version -> tag
+/// name, then the remote-then-local tag-existence classification. Any failed rung bails
+/// with the exact refusal it warrants; success returns the tag/head/default and the
+/// `TagState`. Read-only except for the `git fetch origin <default>` the exactness check
+/// requires -- it NEVER creates or pushes a tag (the consumer does that).
+pub(crate) fn tag_ladder(dir: &Path) -> Result<TagCheck> {
+    debug!("tag_ladder: dir={}", dir.display());
 
     // 1. Working tree must be clean.
     if git::has_uncommitted_changes(dir)? {
@@ -402,40 +436,75 @@ fn tag_only(dir: &Path) -> Result<()> {
     let new_tag = version::format_tag(&file_version);
     let head = git::head_sha(dir)?;
 
-    // 5. Tag-existence check, remote then local.
-    if let Some(remote_sha) = git::remote_tag_sha(dir, &new_tag)? {
+    // 5. Tag-existence classification, remote then local.
+    let state = if let Some(remote_sha) = git::remote_tag_sha(dir, &new_tag)? {
         if remote_sha == head {
-            println!("{new_tag} is already tagged at HEAD on origin. Nothing to do.");
-            return Ok(());
+            TagState::RemoteAtHead
+        } else {
+            TagState::RemoteAtOther(remote_sha)
         }
-        bail!(
-            "Tag {new_tag} already exists on origin at {remote_sha}, not HEAD ({head}).\n\
-             Resolving that is manual tag surgery, not bump's job."
-        );
-    }
-
-    if git::tag_exists(dir, &new_tag)? {
+    } else if git::tag_exists(dir, &new_tag)? {
         let local_sha = git::tag_sha(dir, &new_tag)?;
         if local_sha == head {
-            println!("{new_tag} is already tagged at HEAD locally. Run: git push origin {new_tag}");
-            return Ok(());
+            TagState::LocalAtHead
+        } else {
+            TagState::LocalAtOther(local_sha)
         }
-        bail!(
+    } else {
+        TagState::Absent
+    };
+
+    Ok(TagCheck {
+        tag: new_tag,
+        head,
+        default,
+        state,
+    })
+}
+
+/// --tag-only: create the annotated tag for the current manifest version on HEAD,
+/// after verifying HEAD is exactly the merged default-branch commit. No version
+/// change, no commit. Every check must hold or it exits non-zero with no mutation.
+/// The verification ladder lives in `tag_ladder` (shared with `bump finish`); this
+/// consumer PRINTS the outcome and the push hint (finish executes them instead).
+fn tag_only(dir: &Path) -> Result<()> {
+    info!("tag_only: dir={}", dir.display());
+    let TagCheck {
+        tag: new_tag,
+        head,
+        default,
+        state,
+    } = tag_ladder(dir)?;
+
+    match state {
+        TagState::RemoteAtHead => {
+            println!("{new_tag} is already tagged at HEAD on origin. Nothing to do.");
+            Ok(())
+        }
+        TagState::RemoteAtOther(remote_sha) => bail!(
+            "Tag {new_tag} already exists on origin at {remote_sha}, not HEAD ({head}).\n\
+             Resolving that is manual tag surgery, not bump's job."
+        ),
+        TagState::LocalAtHead => {
+            println!("{new_tag} is already tagged at HEAD locally. Run: git push origin {new_tag}");
+            Ok(())
+        }
+        TagState::LocalAtOther(local_sha) => bail!(
             "Tag {new_tag} exists locally at {local_sha}, not HEAD ({head}).\n\
              Resolving that is manual tag surgery, not bump's job."
-        );
+        ),
+        TagState::Absent => {
+            // Create the annotated tag on the merged commit.
+            let message = format!("Release {new_tag}");
+            git::create_tag(dir, &new_tag, &message)?;
+            info!("tag_only: created tag {new_tag} at {head}");
+            let short: String = head.chars().take(12).collect();
+            println!("Tagged {new_tag} on merged {default} ({short})");
+            // Push hint (by explicit name; never --tags).
+            println!("Run: git push origin {new_tag}");
+            Ok(())
+        }
     }
-
-    // 6. Create the annotated tag on the merged commit.
-    let message = format!("Release {new_tag}");
-    git::create_tag(dir, &new_tag, &message)?;
-    info!("tag_only: created tag {new_tag} at {head}");
-    let short: String = head.chars().take(12).collect();
-    println!("Tagged {new_tag} on merged {default} ({short})");
-
-    // 7. Push hint (by explicit name; never --tags).
-    println!("Run: git push origin {new_tag}");
-    Ok(())
 }
 
 /// Process a single directory
