@@ -169,3 +169,88 @@ per phase.
 
 ### Open questions
 - None.
+
+## Phase 3: Node adapter
+
+### Design decisions
+- Introduced the deferred abstraction in `src/lang.rs`: the `ManifestVersion` enum
+  (`Static(Version)` | `Missing` | `Dynamic(String)`), the `Manifest` trait
+  (`path` + `read_version`/`write_version`/`sync_lockfiles`/`version_files`/`validate`),
+  `detect() -> Result<Vec<Box<dyn Manifest>>>` (ROOT-LEVEL only, never recursive),
+  `agreed_version()` (one repo = one version = one tag; loud refusal on disagreement),
+  and `write_all()` (lockstep write + lock sync across every detected manifest).
+- Node adapter `src/lang/node.rs`: READ the authoritative top-level version with
+  `serde_json::Value` + `value.get("version")` (`node::read_version`); WRITE via a
+  targeted string edit of the SHALLOWEST-indent `"version"` line
+  (`node::write_version` -> `locate_shallowest_version` / `parse_version_line`),
+  cross-checked against the parse and bailing loud on disagreement -- byte-exact, only
+  the one line changes. Lock sync via `npm install --package-lock-only`
+  (`node::sync_lockfile` -> `sync_lockfile_with(dir, npm_bin)` seam); npm absent while
+  package-lock.json present is a loud error; pnpm-lock.yaml/yarn.lock get no sync.
+- cargo/python implement `Manifest` (`cargo::CargoManifest`, `python::PythonManifest`),
+  each reusing the existing free functions. `python::PythonManifest::read_version`
+  re-parses to distinguish `Dynamic` (dynamic = ["version"]) from `Missing`, since the
+  free `python::read_version` still maps both to `None`.
+- `python::is_version_bearing` (src/lang/python.rs) gates Python detection on a
+  `[project]`/`[tool.poetry]` section, so a ruff-config-only pyproject next to
+  Cargo.toml does not trigger Python. `detect_project_type` now uses the SAME predicates
+  as `detect()` (added `ProjectType::Node`, switched Python to `is_version_bearing`) so
+  the policy type and the manifest set never diverge.
+- `process_directory` (src/main.rs) now wires the trait end-to-end in production:
+  `lang::detect` -> per-manifest `validate` -> `lang::agreed_version` (feeds
+  `file_version`, refuses on disagreement/dynamic) -> `lang::write_all` (replaces the
+  two `write_file_version` + `sync_lockfile` pairs) writing every manifest in lockstep.
+  `ProjectType` stays the POLICY marker for `determine_version_action` (untouched-0.1.0
+  default, generic-vs-managed `needs_file_update`) per the doc's Data Model.
+
+### Deviations
+- `Box<dyn Manifest>` is used deliberately, an EXPLICIT exception to rules/rust.md's
+  generics-over-`dyn` preference -- the design doc's Data Model sanctions it here for
+  the heterogeneous cargo/python/node collection `detect()` returns. Noted in the trait
+  doc-comment (src/lang.rs).
+- The package.json read carve-out: `node::read_version` uses `serde_json::Value` +
+  `value.get("version")` rather than a modeled struct, so unmodeled package.json fields
+  and nested `"version"` keys are tolerated (NO `deny_unknown_fields`, NO struct). Same
+  effect as the doc's "read struct without deny_unknown_fields" with one fewer dep
+  (serde derive is not pulled a phase early; serde arrives with config in Phase 4).
+- Added `path()` to the trait (not in the doc's trait sketch) so `agreed_version` can
+  name each offending file in the disagreement error -- same intent, needed seam.
+- Removed the now-dead `lang::write_file_version` and `lang::sync_lockfile` dispatch
+  wrappers (production now writes via `write_all`); no test called them directly, so no
+  test churn. `read_file_version` / `version_file_name` are kept (still used by
+  `tag_only` and `determine_version_action`).
+- Node bumping via bare `bump` works through the Generic-adjacent path: a node-only repo
+  reads its version via `agreed_version` and `determine_version_action` runs under
+  `ProjectType::Node` (needs_file_update true), so `write_all` bumps package.json.
+  Full node-flow polish is exercised by the release verbs (Phases 5-7) that consume
+  `detect()`; this phase delivers + tests the adapter and multi-manifest machinery.
+- `is_version_files_only` / `agreed_version` / `write_all` are wired into production
+  precisely because a bin crate flags test-only `pub`/trait methods as dead_code under
+  `-D warnings`; every trait method is reached via a `dyn` call in `process_directory`.
+
+### Tradeoffs
+- Trait `validate` delegates to the existing `validate_project` (CargoManifest -> Rust,
+  PythonManifest -> Python, NodeManifest -> Node), preserving the tested workspace
+  independent-version + stale-skip-member behavior exactly for single-manifest repos.
+  A hypothetical dual cargo+python repo passing a cargo `--skip-member` would have the
+  python manifest's validate refuse it (fail-closed, not corruption); no such repo
+  exists in the fleet, and refusing is the safer direction. Single-manifest behavior
+  (the only real/tested case) is byte-identical.
+- The real npm round-trip test (`npm_round_trip_updates_both_lock_sites`,
+  src/lang/node/tests.rs) GATES: it returns early (skips, never fails) when `npm` is
+  absent, when the initial `npm install --package-lock-only` errors (sandbox EROFS /
+  offline), or when no package-lock.json is produced -- so the default sandboxed
+  `otto ci` stays green. In THIS environment npm was available and could write the
+  lock, so the test RAN and PASSED (verified both root sites: top-level `version` and
+  `packages[""].version` update to 0.1.1). The deterministic coverage that ALWAYS runs
+  carries the mechanic: byte-exact 1-line targeted write incl. a nested `"version"`
+  key, shallowest-not-first anchoring, and the npm-missing loud error via the
+  nonexistent-binary seam.
+- New node tests live in `src/lang/node/tests.rs` (rules/rust.md 2018+ placement) since
+  node.rs is a new file. New multi-manifest tests were appended INLINE to `src/lang.rs`'s
+  existing `#[cfg(test)] mod tests` to match that file's current convention (Phase 1/2
+  kept the inline style there; a tree-wide extraction is a separate mechanical pass).
+
+### Open questions
+- None. (Cross-repo/system-mutating steps like retiring the bash driver are Phase 9,
+  not executable here; no such work was needed for Phase 3.)

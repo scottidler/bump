@@ -1,13 +1,35 @@
+use super::{Manifest, ManifestVersion};
 use eyre::{Context, ContextCompat, Result, bail};
 use log::{debug, error};
+use semver::Version;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use toml_edit::{DocumentMut, Item, Value};
 
 /// Check if pyproject.toml exists at the given path
 pub fn pyproject_toml_exists(dir: &Path) -> bool {
     dir.join("pyproject.toml").exists()
+}
+
+/// True iff pyproject.toml exists AND carries a version-bearing section (`[project]`
+/// or `[tool.poetry]`). A ruff-config-only pyproject (no `[project]`/`[tool.poetry]`)
+/// is NOT version-bearing and must not trigger the Python adapter. A dynamic-version
+/// `[project]` IS version-bearing (so bump can refuse it, not ignore it).
+pub fn is_version_bearing(dir: &Path) -> bool {
+    if !pyproject_toml_exists(dir) {
+        return false;
+    }
+    let path = pyproject_toml_path(dir);
+    let Ok(content) = fs::read_to_string(&path) else {
+        return false;
+    };
+    let Ok(doc) = content.parse::<DocumentMut>() else {
+        return false;
+    };
+    let has_project = doc.get("project").is_some();
+    let has_poetry = doc.get("tool").and_then(|t| t.get("poetry")).is_some();
+    has_project || has_poetry
 }
 
 /// Get the path to pyproject.toml in the given directory
@@ -215,6 +237,68 @@ fn sync_lockfile_with(dir: &Path, uv_bin: &str) -> Result<()> {
             )
         }
         Err(e) => Err(e).context("Failed to run `uv lock`"),
+    }
+}
+
+/// The Python manifest adapter (pyproject.toml, PEP 621 or Poetry, uv.lock sync).
+pub struct PythonManifest {
+    root: PathBuf,
+}
+
+impl PythonManifest {
+    pub fn new(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+        }
+    }
+}
+
+impl Manifest for PythonManifest {
+    fn path(&self) -> PathBuf {
+        pyproject_toml_path(&self.root)
+    }
+
+    fn read_version(&self) -> Result<ManifestVersion> {
+        // Distinguish dynamic (REFUSE) from missing (writable) -- the free
+        // `read_version` maps BOTH to None, so re-parse to tell them apart here.
+        let path = pyproject_toml_path(&self.root);
+        let content = fs::read_to_string(&path).context(format!("Failed to read {}", path.display()))?;
+        let doc = content
+            .parse::<DocumentMut>()
+            .context("Failed to parse pyproject.toml")?;
+        if has_dynamic_version(&doc) {
+            return Ok(ManifestVersion::Dynamic("dynamic = [\"version\"]".to_string()));
+        }
+        match read_version(&path)? {
+            Some(s) => Ok(ManifestVersion::Static(crate::version::parse_version(&s)?)),
+            None => Ok(ManifestVersion::Missing),
+        }
+    }
+
+    fn write_version(&self, new_version: &Version) -> Result<()> {
+        write_version(
+            &pyproject_toml_path(&self.root),
+            &crate::version::format_file_version(new_version),
+        )
+    }
+
+    fn sync_lockfiles(&self) -> Result<Vec<PathBuf>> {
+        sync_lockfile(&self.root)?;
+        let lock = self.root.join("uv.lock");
+        Ok(if lock.exists() { vec![lock] } else { vec![] })
+    }
+
+    fn version_files(&self) -> Vec<PathBuf> {
+        let mut files = vec![pyproject_toml_path(&self.root)];
+        let lock = self.root.join("uv.lock");
+        if lock.exists() {
+            files.push(lock);
+        }
+        files
+    }
+
+    fn validate(&self, skip_members: &[String]) -> Result<()> {
+        super::validate_project(&self.root, super::ProjectType::Python, skip_members)
     }
 }
 

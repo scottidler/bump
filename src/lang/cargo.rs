@@ -1,6 +1,8 @@
+use super::{Manifest, ManifestVersion};
 use eyre::{Context, ContextCompat, Result, bail};
+use semver::Version;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use toml_edit::{DocumentMut, Item, Value};
 
 /// Read the version from Cargo.toml
@@ -273,6 +275,59 @@ pub fn check_workspace_independent_versions(dir: &Path) -> Result<Vec<Independen
 /// Get the path to Cargo.toml in the given directory
 pub fn cargo_toml_path(dir: &Path) -> std::path::PathBuf {
     dir.join("Cargo.toml")
+}
+
+/// The Cargo manifest adapter. Reuses the free functions above; the workspace
+/// independent-version guard remains the cargo adapter's internal concern.
+pub struct CargoManifest {
+    root: PathBuf,
+}
+
+impl CargoManifest {
+    pub fn new(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+        }
+    }
+}
+
+impl Manifest for CargoManifest {
+    fn path(&self) -> PathBuf {
+        cargo_toml_path(&self.root)
+    }
+
+    fn read_version(&self) -> Result<ManifestVersion> {
+        match read_version(&cargo_toml_path(&self.root))? {
+            Some(s) => Ok(ManifestVersion::Static(crate::version::parse_version(&s)?)),
+            None => Ok(ManifestVersion::Missing),
+        }
+    }
+
+    fn write_version(&self, new_version: &Version) -> Result<()> {
+        write_version(
+            &cargo_toml_path(&self.root),
+            &crate::version::format_file_version(new_version),
+        )
+    }
+
+    fn sync_lockfiles(&self) -> Result<Vec<PathBuf>> {
+        sync_lockfile(&self.root)?;
+        let lock = self.root.join("Cargo.lock");
+        Ok(if lock.exists() { vec![lock] } else { vec![] })
+    }
+
+    fn version_files(&self) -> Vec<PathBuf> {
+        let mut files = vec![cargo_toml_path(&self.root)];
+        let lock = self.root.join("Cargo.lock");
+        if lock.exists() {
+            files.push(lock);
+        }
+        files
+    }
+
+    fn validate(&self, skip_members: &[String]) -> Result<()> {
+        super::validate_project(&self.root, super::ProjectType::Rust, skip_members)
+    }
 }
 
 #[cfg(test)]

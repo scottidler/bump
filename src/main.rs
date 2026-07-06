@@ -20,8 +20,8 @@ use lang::cargo;
 #[cfg(test)]
 use lang::skip_message;
 use lang::{
-    ProjectType, detect_project_type, is_version_files_only, read_file_version, sync_lockfile, validate_project,
-    version_file_name, write_file_version,
+    ManifestVersion, ProjectType, detect_project_type, is_version_files_only, read_file_version, validate_project,
+    version_file_name,
 };
 use version::BumpType;
 
@@ -476,16 +476,43 @@ fn process_directory(dir: &Path, cli: &Cli, bump_type: BumpType) -> Result<()> {
         }
     }
 
-    // 2. Detect project type
+    // 2. Detect the project type (POLICY marker) and ALL root-level version-bearing
+    //    manifests. detect() is root-only, never recursive.
     let project_type = detect_project_type(dir);
-    info!("Detected project type: {}", project_type);
+    let manifests = lang::detect(dir)?;
+    info!(
+        "Detected project type: {} ({} manifest(s))",
+        project_type,
+        manifests.len()
+    );
 
-    // 3. Project-specific validation
-    validate_project(dir, project_type, &cli.skip_member)?;
+    // 3. Project-specific validation. Each detected manifest validates itself (the
+    //    Cargo workspace independent-version guard lives in the cargo adapter); a
+    //    generic repo (no manifest) still fails closed on a stale --skip-member.
+    if manifests.is_empty() {
+        validate_project(dir, project_type, &cli.skip_member)?;
+    } else {
+        for m in &manifests {
+            m.validate(&cli.skip_member)?;
+        }
+    }
 
-    // 4. Read file version and determine version action
-    let file_version = read_file_version(dir, project_type)?.and_then(|v| version::parse_version(&v).ok());
-    let action = determine_version_action(dir, file_version, project_type, bump_type)?;
+    // 4. Read the version AGREED across all manifests (one repo = one version = one
+    //    tag): a disagreement is a loud refusal, a dynamic-version manifest refuses
+    //    rather than corrupt metadata, and no manifest at all is generic (None).
+    let file_version: Option<Version> = if manifests.is_empty() {
+        None
+    } else {
+        match lang::agreed_version(&manifests)? {
+            ManifestVersion::Static(v) => Some(v),
+            ManifestVersion::Missing => None,
+            ManifestVersion::Dynamic(reason) => bail!(
+                "Cannot bump: {reason}. The version is owned elsewhere; remove the \
+                 dynamic declaration to let bump manage it."
+            ),
+        }
+    };
+    let action = determine_version_action(dir, file_version.clone(), project_type, bump_type)?;
     let new_tag = version::format_tag(&action.target_version);
     let new_file_version = version::format_file_version(&action.target_version);
 
@@ -497,10 +524,10 @@ fn process_directory(dir: &Path, cli: &Cli, bump_type: BumpType) -> Result<()> {
             println!("version: {}", new_file_version);
         }
     } else {
-        // For bumps, show the transition
-        let current_version = read_file_version(dir, project_type)?
-            .and_then(|v| version::parse_version(&v).ok())
-            .map(|v| version::format_file_version(&v))
+        // For bumps, show the transition (reuse the agreed version already read).
+        let current_version = file_version
+            .as_ref()
+            .map(version::format_file_version)
             .unwrap_or_else(|| "unknown".to_string());
         println!("bump: {} -> {}", current_version, new_file_version);
     }
@@ -541,15 +568,11 @@ fn process_directory(dir: &Path, cli: &Cli, bump_type: BumpType) -> Result<()> {
     if has_changes {
         // ===== STANDARD WORKFLOW: Uncommitted changes exist =====
 
-        // Update version file if needed
+        // Update version file(s) if needed: write EVERY detected manifest in lockstep
+        // (one repo = one version = one tag) and sync their lockfiles.
         if action.needs_file_update {
-            write_file_version(dir, project_type, &new_file_version)?;
-            info!(
-                "Updated {} to version {}",
-                version_file_name(project_type),
-                new_file_version
-            );
-            sync_lockfile(dir, project_type)?;
+            let touched = lang::write_all(&manifests, &action.target_version)?;
+            info!("Updated manifest(s) to version {}: {:?}", new_file_version, touched);
         }
 
         // Stage all changes
@@ -591,15 +614,11 @@ fn process_directory(dir: &Path, cli: &Cli, bump_type: BumpType) -> Result<()> {
         // Check if HEAD has been pushed
         let is_pushed = git::is_head_pushed(dir)?;
 
-        // Update version file
+        // Update version file(s): write EVERY detected manifest in lockstep and sync
+        // their lockfiles.
         if action.needs_file_update {
-            write_file_version(dir, project_type, &new_file_version)?;
-            info!(
-                "Updated {} to version {}",
-                version_file_name(project_type),
-                new_file_version
-            );
-            sync_lockfile(dir, project_type)?;
+            let touched = lang::write_all(&manifests, &action.target_version)?;
+            info!("Updated manifest(s) to version {}: {:?}", new_file_version, touched);
         }
 
         // Stage changes
