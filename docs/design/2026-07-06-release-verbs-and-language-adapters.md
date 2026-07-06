@@ -2,7 +2,7 @@
 
 **Author:** Scott Idler
 **Date:** 2026-07-06
-**Status:** In Review
+**Status:** Implemented (Phases 0-8 in bump; Phase 9 cross-repo retirement pending, gated behind bump shipping per the rollout order)
 **Review Passes Completed:** 5/5
 
 ## Summary
