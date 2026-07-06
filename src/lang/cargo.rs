@@ -757,6 +757,50 @@ version.workspace = true
         assert_eq!(result[0].version, "0.5.0");
     }
 
+    /// PRE-EXISTING BEHAVIOR, NOT FIXED HERE (design doc risk table: "Workspace glob
+    /// members (`crates/*`) silently skipped by independent-version scan,
+    /// cargo.rs:234-236"). A `members` entry is treated as a literal path
+    /// (`dir.join(member_path).join("Cargo.toml")`); a glob pattern like `crates/*`
+    /// never resolves to a real file, so the `!member_cargo_toml.exists()` guard
+    /// silently `continue`s past it -- an independent version living behind a glob
+    /// member is invisible to this scan, even though a real Cargo workspace resolves
+    /// the glob to real member crates. This test documents that gap; it is NOT a
+    /// regression test for a fix (no fix lands in this phase).
+    #[test]
+    fn test_check_independent_versions_glob_member_silently_skipped() {
+        let dir = TempDir::new().unwrap();
+        create_cargo_toml(
+            dir.path(),
+            r#"
+[workspace]
+members = ["crates/*"]
+
+[workspace.package]
+version = "1.0.0"
+"#,
+        );
+
+        // A real member crate that Cargo's own glob expansion would pick up, with an
+        // independent (non-workspace) version -- exactly the case the guard exists to
+        // catch when the member is named explicitly.
+        create_member_cargo_toml(
+            dir.path(),
+            "crates/pinned",
+            r#"
+[package]
+name = "pinned-crate"
+version = "9.9.9"
+"#,
+        );
+
+        let result = check_workspace_independent_versions(dir.path()).unwrap();
+        assert!(
+            result.is_empty(),
+            "documents the known gap: a glob members entry is never expanded, so \
+             pinned-crate's independent version is invisible to the scan (got: {result:?})"
+        );
+    }
+
     // Tests for dotted key syntax: version.workspace = true
 
     #[test]
