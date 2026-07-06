@@ -15,6 +15,22 @@ mod github;
 mod lang;
 mod version;
 
+// The `bump release` state machine is built and tested this phase but not yet wired to a
+// CLI subcommand (that is Phase 8). bump is a BIN crate, so any item unreachable from
+// `main` is `dead_code`, which `cargo clippy -- -D warnings` rejects. Gating the module
+// `#[cfg(test)]` keeps it fully compiled + tested (clippy `--all-targets` builds the test
+// target) without shipping unreachable code; Phase 8 removes this gate when it wires the
+// subcommand and calls `release::release(...)`.
+#[cfg(test)]
+mod release;
+
+/// Serialize env-var-mutating tests (`BUMP_GATES_PROBE`) across ALL test modules in
+/// this binary. Env is process-global, so `main.rs` and `release` tests must share ONE
+/// lock or they race on the probe override. Hoisted to the crate root (from `mod tests`)
+/// so every test module can reach it via `crate::ENV_LOCK`.
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 use cli::Cli;
 #[cfg(test)]
 use lang::cargo;
@@ -128,20 +144,20 @@ fn prompt_commit_message_with_editor(staged_files: &[String]) -> Result<String> 
 
 /// Result of determining what version action to take
 #[derive(Debug)]
-struct VersionAction {
+pub(crate) struct VersionAction {
     /// The version to tag
-    target_version: Version,
+    pub(crate) target_version: Version,
     /// Whether we need to update the version file
-    needs_file_update: bool,
+    pub(crate) needs_file_update: bool,
     /// Whether this is an initial tag (no bump) vs a version bump
-    is_initial_tag: bool,
+    pub(crate) is_initial_tag: bool,
 }
 
 /// The default "untouched" version in Cargo.toml
 const DEFAULT_UNTOUCHED_VERSION: Version = Version::new(0, 1, 0);
 
 /// Determine what version action to take
-fn determine_version_action(
+pub(crate) fn determine_version_action(
     dir: &Path,
     file_version: Option<Version>,
     project_type: ProjectType,
@@ -423,7 +439,7 @@ fn tag_only(dir: &Path) -> Result<()> {
 }
 
 /// Process a single directory
-fn process_directory(dir: &Path, cli: &Cli, bump_type: BumpType) -> Result<()> {
+pub(crate) fn process_directory(dir: &Path, cli: &Cli, bump_type: BumpType) -> Result<()> {
     let dir_name = dir
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
@@ -1450,10 +1466,6 @@ name = "test-pkg"
     // These exercise process_directory with the BUMP_GATES_PROBE env seam, so no
     // network is touched. Env mutation is serialized behind ENV_LOCK.
     // =========================================================================
-
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// Set BUMP_GATES_PROBE, returning the prior value for restoration.
     fn set_probe(val: &str) -> Option<String> {

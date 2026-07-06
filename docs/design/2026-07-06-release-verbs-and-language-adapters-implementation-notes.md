@@ -312,3 +312,103 @@ per phase.
 - None. (Deleting the stale `bump.yml` sample and replacing it with
   `bump.yml.example` was executed directly -- it is a repo-local file rename/rewrite,
   not a cross-repo/system-mutating step.)
+
+## Phase 5: `bump release` -- ungated flow
+
+### Design decisions
+- `src/release.rs` is a callable module with `release(dir, opts, pusher, installer) ->
+  Result<ReleaseReport>` (`release::release`), split into `classify()` (typed state
+  detection, read-only except the preconditional `git fetch origin <default>`) and
+  `execute()` (turns each typed `ReleaseState` into the correct mutation sequence or a
+  refusal). Every decision is on typed internals -- `github::detect`/`Gate`,
+  `git::compare_head_to_remote`/`HeadRemote`, `lang::detect`/`agreed_version`/
+  `ManifestVersion`, `determine_version_action`/`VersionAction` -- ZERO stdout parsing.
+- The internal version commit reuses the existing `--no-tag` code path verbatim:
+  `version_commit()` (`src/release.rs`) constructs a `Cli { no_tag: true, .. }` and calls
+  `crate::process_directory`. No commit/version/tag logic is reimplemented.
+- Strengthened ordering enforced in code (`execute_release`, `src/release.rs`): version
+  commit -> `pusher.push_branch` -> `confirm_on_origin` (re-fetch + require `HEAD ==
+  origin/<default>`) -> `git::create_tag` -> `pusher.push_tag`. The tag is created ONLY
+  after the branch is confirmed on origin, so a rejected branch push can never strand a
+  local tag on an unpushed commit -- a deliberate strengthening over plain-bump's
+  tag-local-HEAD-then-push ordering.
+- RESUME (`classify_equal`, `src/release.rs`): when `HEAD == origin/<default>` and the
+  manifest version's remote tag is ABSENT (`git::remote_tag_sha(..).is_none()`), it is a
+  partial release. `local_tag_present` (`git::tag_exists` + `git::tag_sha == HEAD`) splits
+  the two sub-states: absent -> create the annotated tag then push; present -> push only.
+  Never re-bumps (never calls `version_commit`), never prints "already released".
+- Refusals are typed `ReleaseState` variants; `execute()` `bail!`s each with the EXACT
+  next command: NotOnDefault -> "git checkout <default>", Behind|Diverged -> "git pull
+  --ff-only origin <default>", Nothing -> "nothing ahead ... already tagged", DirtyTree,
+  DetachedHead, Unknown (carries the probe reason), Gated (deferred to Phase 6).
+- Gate::Unknown FAILS CLOSED (`classify` -> `ReleaseState::Unknown` -> refuse) because
+  `release` pushes -- the opposite of plain `bump`'s warn-and-proceed (which never pushes).
+- New `git.rs` helpers `push_branch` / `push_tag` push a single ref to origin BY EXPLICIT
+  NAME (never `--tags`/`--follow-tags`/`--force`). Production `GitPusher` delegates to them.
+- Install step (`resolve_install`, `src/release.rs`): precedence override
+  (`InstallChoice::Command`) > config `install` > default `cargo install --path .` iff a
+  `Cargo.toml` is present > skip (`None`). Resolution is pure and separate from execution
+  (`run_install` runs it via the injected `Installer`); the resolved command is returned in
+  `ReleaseReport.install_command`. Test mechanism: a `RecordingInstaller` double captures
+  the resolved command WITHOUT executing it (no real `cargo install` in any test); one
+  test exercises the production `ShellInstaller` with `InstallChoice::Command("touch
+  install-marker")` and asserts the marker file appears (proves real execution) -- a
+  harmless local command, never an outward/slow install.
+- `-n` dry-run (`execute_release`/`execute_resume`): echoes every command it would run
+  (`[dry-run] ...`) and executes NOTHING -- no `version_commit`, no push (ports untouched),
+  no tag, no install. Returns a `ReleaseReport { dry_run: true }` carrying the would-be tag
+  and resolved install command.
+- DI via a small `Ports<P: Pusher, I: Installer>` bundle (generics, not `dyn` --
+  rules/rust.md), keeping the execution functions under the clippy argument-count limit.
+
+### Deviations
+- The `release` module is gated `#[cfg(test)]` this phase (same for the two new
+  `git::push_branch`/`push_tag` helpers). bump is a bin crate and CI runs `cargo clippy
+  --all-targets -- -D warnings`, under which any item unreachable from `main` is
+  `dead_code` (Phase 3's notes document this exact constraint). With CLI wiring explicitly
+  deferred to Phase 8, the only reachable callers this phase are the tests. Gating keeps
+  the module fully compiled AND fully tested (clippy `--all-targets` builds the test
+  target) without shipping unreachable code. Same effect (a built, tested, callable state
+  machine), correct seam for a not-yet-wired scaffold; Phase 8 removes the gate when it
+  adds the subcommand and calls `release()` from production. Flagged as an open question
+  for the parent.
+- API Design table says the exact-next-command messages; implemented as typed
+  `ReleaseState` refusal variants each `bail!`ing its exact command (same effect, typed
+  seam) rather than free-form strings, so each refusal is both individually classifiable
+  and asserted in a dedicated test.
+- Test assertions use `git::remote_tag_sha(..).is_some()` (tag present on origin), NOT
+  `== Some(head_sha)`: `git ls-remote origin <exact-refspec>` does not emit the peeled
+  `^{}` line, so `remote_tag_sha` returns the annotated tag-OBJECT SHA for an exact
+  refspec. Production `classify` only ever uses `.is_some()` for the released/not-released
+  decision, so this is correct there; only the positive test assertions were adjusted.
+- `main.rs`: `determine_version_action`, `process_directory`, and `VersionAction` (+
+  fields) widened from private to `pub(crate)` so the sibling `release` module can reuse
+  them. No behavior change; both are still reached from production `main`, so no new
+  dead_code. The `#[cfg(test)] static ENV_LOCK` was hoisted from inside `mod tests` to the
+  crate root (`pub(crate)`) so `main.rs` gate tests and `release` tests share ONE lock for
+  the process-global `BUMP_GATES_PROBE` env var (a different lock per module would race).
+  Existing test bodies are unchanged (they reach it via `use super::*`).
+
+### Tradeoffs
+- Reused `process_directory` in `--no-tag` mode for the version commit (vs. inlining a
+  focused write+stage+commit) -- faithful to the doc's "the internal version commit is
+  the existing `--no-tag` code path" and avoids duplicating the amend-vs-new-commit logic.
+  Cost: it prints its own "Run: git push ..." hint (worded for the primitive flow); cosmetic
+  and invisible until Phase 8 wires the verb, noted for cleanup then.
+- Order assertion via a `RecordingPusher` that records call order AND performs the REAL
+  push (so `confirm_on_origin` genuinely passes), plus a `fail_branch` variant that records
+  then errors WITHOUT pushing for the rejected-push test. This gives a direct `["branch:main",
+  "tag:v0.1.6"]` order assertion and a rejected-push assertion (zero tags, tag push never
+  attempted) without a fake git layer.
+- Generic (no-manifest) ungated repos: fresh release works (tag-only semantics via
+  `determine_version_action`); a generic repo with `HEAD == origin` classifies as
+  `Nothing` (no manifest version to resume-tag). A `Missing`/`Dynamic` agreed version at
+  `HEAD == origin` maps to `Nothing`/refuse respectively -- edge handling noted, not a
+  documented row.
+
+### Open questions
+- Confirm Phase 8 removes the `#[cfg(test)]` gate on `mod release` and on
+  `git::push_branch`/`push_tag`, wires the `bump release` subcommand + `--install`/
+  `--no-install` flags (constructing `ReleaseOpts`), and calls `release(dir, &opts,
+  &GitPusher, &ShellInstaller)` -- these are the only steps that turn this phase's
+  test-built scaffold into shipped, main-reachable code.

@@ -385,10 +385,167 @@ pub fn remote_tag_sha(path: &Path, tag: &str) -> Result<Option<String>> {
     Ok(plain_sha)
 }
 
+/// Push a single branch to origin BY NAME. Never `--tags`, never `--follow-tags`,
+/// never `--force`. `bump release`'s strengthened ordering pushes the branch first and
+/// only tags after confirming it landed, so a rejected branch push can never strand a tag.
+///
+/// Gated `#[cfg(test)]` this phase: the only consumers are the (also `#[cfg(test)]`)
+/// `release` module's `GitPusher` and these tests. bump is a bin crate, so an
+/// unreachable-from-`main` `pub fn` is `dead_code` under `clippy -D warnings`; Phase 6/7/8
+/// remove this gate when `release` is wired to a CLI subcommand and calls it in production.
+#[cfg(test)]
+pub fn push_branch(path: &Path, branch: &str) -> Result<()> {
+    debug!("push_branch: path={} branch={}", path.display(), branch);
+    let output = Command::new("git")
+        .args(["push", "origin", branch])
+        .current_dir(path)
+        .output()
+        .context("Failed to run git push")?;
+
+    if !output.status.success() {
+        bail!(
+            "git push origin {} failed: {}",
+            branch,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    Ok(())
+}
+
+/// Push a single tag to origin BY EXPLICIT NAME. Never `git push --tags` / `--follow-tags`
+/// (those can land a tag even when the branch push was rejected -- the okta-auth-rs
+/// orphan). Never `--force`, never tag deletion. Gated `#[cfg(test)]` this phase for the
+/// same reason as `push_branch` above.
+#[cfg(test)]
+pub fn push_tag(path: &Path, tag: &str) -> Result<()> {
+    debug!("push_tag: path={} tag={}", path.display(), tag);
+    let output = Command::new("git")
+        .args(["push", "origin", tag])
+        .current_dir(path)
+        .output()
+        .context("Failed to run git push")?;
+
+    if !output.status.success() {
+        bail!(
+            "git push origin {} failed: {}",
+            tag,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::env;
+    use tempfile::TempDir;
+
+    /// A bare `origin` plus a working clone on `main` with one commit, HEAD == origin/main.
+    fn bare_remote_and_clone() -> (TempDir, TempDir) {
+        let origin = TempDir::new().unwrap();
+        Command::new("git")
+            .args(["init", "--bare", "-b", "main"])
+            .current_dir(origin.path())
+            .output()
+            .unwrap();
+
+        let work = TempDir::new().unwrap();
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.email", "test@test.com"],
+            vec!["config", "user.name", "Test"],
+        ] {
+            Command::new("git")
+                .args(&args)
+                .current_dir(work.path())
+                .output()
+                .unwrap();
+        }
+        std::fs::write(work.path().join("README.md"), "# test").unwrap();
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(work.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(work.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["remote", "add", "origin", origin.path().to_str().unwrap()])
+            .current_dir(work.path())
+            .output()
+            .unwrap();
+        (origin, work)
+    }
+
+    #[test]
+    fn push_branch_and_tag_reach_bare_remote() {
+        let (origin, work) = bare_remote_and_clone();
+        // Branch push lands the commit on origin.
+        push_branch(work.path(), "main").unwrap();
+        let ls = Command::new("git")
+            .args(["ls-remote", "origin", "refs/heads/main"])
+            .current_dir(work.path())
+            .output()
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&ls.stdout).trim().is_empty(),
+            "branch must be on origin after push_branch"
+        );
+        // Tag push lands the annotated tag on origin BY NAME.
+        create_tag(work.path(), "v0.1.0", "v0.1.0").unwrap();
+        push_tag(work.path(), "v0.1.0").unwrap();
+        // `remote_tag_sha` on an exact refspec returns the annotated tag-object SHA (no
+        // peeled `^{}` line), so assert PRESENCE, not commit equality.
+        assert!(
+            remote_tag_sha(work.path(), "v0.1.0").unwrap().is_some(),
+            "tag must be on origin after push_tag"
+        );
+        drop(origin);
+    }
+
+    #[test]
+    fn push_branch_errors_on_missing_remote() {
+        // A repo with no `origin` remote fails loudly rather than silently.
+        let work = TempDir::new().unwrap();
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.email", "test@test.com"],
+            vec!["config", "user.name", "Test"],
+        ] {
+            Command::new("git")
+                .args(&args)
+                .current_dir(work.path())
+                .output()
+                .unwrap();
+        }
+        std::fs::write(work.path().join("README.md"), "# test").unwrap();
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(work.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(work.path())
+            .output()
+            .unwrap();
+
+        assert!(
+            push_branch(work.path(), "main").is_err(),
+            "push_branch must error when origin is missing"
+        );
+        create_tag(work.path(), "v0.1.0", "v0.1.0").unwrap();
+        assert!(
+            push_tag(work.path(), "v0.1.0").is_err(),
+            "push_tag must error when origin is missing"
+        );
+    }
 
     #[test]
     fn test_is_git_repo_current_dir() {
