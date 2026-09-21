@@ -218,13 +218,16 @@ pub fn read_file_version(dir: &Path, project_type: ProjectType) -> Result<Option
     }
 }
 
-/// Get the version file name for display purposes
+/// Get the version file name for display purposes. `Generic` has no manifest at all (its
+/// version lives only in git tags), so this returns a parenthetical rather than "" --
+/// an empty string produced grammatically broken messages like "needs a version in ;
+/// none found." wherever it was interpolated.
 pub fn version_file_name(project_type: ProjectType) -> &'static str {
     match project_type {
         ProjectType::Rust => "Cargo.toml",
         ProjectType::Python => "pyproject.toml",
         ProjectType::Node => "package.json",
-        ProjectType::Generic => "",
+        ProjectType::Generic => "(no manifest)",
     }
 }
 

@@ -746,15 +746,29 @@ pub(crate) fn process_directory(dir: &Path, cli: &Cli, bump_type: BumpType) -> R
                 println!("Committed version bump to {} (no tag)", new_file_version);
             }
         } else {
-            // HEAD is not pushed - amend the previous commit
+            // HEAD is not pushed - amend the previous commit. An explicit --message or
+            // --automatic must still be honored here: only fall back to keeping the
+            // prior commit's message untouched (--no-edit) when neither was requested.
+            let explicit_message = cli
+                .message
+                .clone()
+                .or_else(|| cli.automatic.then(|| format!("Bump version to {}", new_tag)));
+
             if !staged_files.is_empty() {
-                git::amend_commit_no_edit(dir)?;
-                info!("Amended previous commit with version file changes");
+                match &explicit_message {
+                    Some(msg) => {
+                        git::amend_commit_with_message(dir, msg)?;
+                        info!("Amended previous commit with message: {}", msg);
+                    }
+                    None => {
+                        git::amend_commit_no_edit(dir)?;
+                        info!("Amended previous commit with version file changes");
+                    }
+                }
             }
 
             if create_tag {
-                // Use automatic message for the tag since we're amending
-                let tag_message = format!("Bump version to {}", new_tag);
+                let tag_message = explicit_message.unwrap_or_else(|| format!("Bump version to {}", new_tag));
                 git::create_tag(dir, &new_tag, &tag_message)?;
                 info!("Created tag: {}", new_tag);
                 println!("Amended commit and tagged {}", new_tag);
@@ -1722,6 +1736,33 @@ name = "test-pkg"
         assert_eq!(version, "0.1.6", "version file must still be bumped");
     }
 
+    /// Regression test: on the "clean tree, HEAD not pushed" (amend) path, an explicit
+    /// `--message` used to be silently ignored -- `amend_commit_no_edit` (`--no-edit`)
+    /// kept the OLD commit's message no matter what was asked for. Now it must apply.
+    #[test]
+    fn amend_path_honors_explicit_message() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        setup_git_repo(dir); // no remote/upstream configured -> is_head_pushed() == false
+        create_cargo_toml(dir, Some("0.1.5"));
+        create_initial_commit(dir); // message: "init"
+        create_git_tag(dir, "v0.1.5"); // file version matches tag -> bumps to 0.1.6
+
+        let cli = Cli::try_parse_from(["bump", "--force", "--message", "explicit release note"]).unwrap();
+        process_directory(dir, &cli, BumpType::Patch).unwrap();
+
+        let log = Command::new("git")
+            .args(["log", "-1", "--format=%s"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        let subject = String::from_utf8_lossy(&log.stdout).trim().to_string();
+        assert_eq!(
+            subject, "explicit release note",
+            "explicit --message must replace the amended commit's message, not keep the prior one"
+        );
+    }
+
     /// --no-tag on an initial-tag scenario commits the version but creates no tag.
     #[test]
     fn no_tag_initial_creates_no_tag() {
@@ -1892,6 +1933,22 @@ name = "test-pkg"
         assert!(result.is_ok(), "local tag at HEAD must be idempotent: {result:?}");
     }
 
+    /// Step 5: an annotated tag already on the REMOTE at HEAD is idempotent success too.
+    /// Regression test: `remote_tag_sha` used to return the annotated tag OBJECT's sha
+    /// (from an exact, unpeeled `ls-remote` refspec) instead of the commit it points to,
+    /// so this always misclassified as `RemoteAtOther` and refused with a false
+    /// "not HEAD" error on every re-run of an already-released --tag-only.
+    #[test]
+    fn tag_only_idempotent_remote_tag_at_head() {
+        let (_origin, work) = setup_remote_repo();
+        let dir = work.path();
+        git_in(dir, &["tag", "-a", "v0.1.0", "-m", "v0.1.0"]);
+        git_in(dir, &["push", "origin", "v0.1.0"]);
+
+        let result = tag_only(dir);
+        assert!(result.is_ok(), "remote tag at HEAD must be idempotent: {result:?}");
+    }
+
     /// Step 5: a remote tag at a different commit is a refusal, no local tag.
     #[test]
     fn tag_only_refuses_remote_tag_conflict() {
@@ -1936,6 +1993,9 @@ name = "test-pkg"
 
         let err = tag_only(work.path()).unwrap_err().to_string();
         assert!(err.contains("needs a version"), "got: {err}");
+        // Regression: `version_file_name(Generic)` used to be "", producing the
+        // grammatically broken "needs a version in ; none found."
+        assert!(!err.contains(" in ;"), "got malformed generic-manifest message: {err}");
     }
 
     // =========================================================================

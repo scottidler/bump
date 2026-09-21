@@ -158,6 +158,23 @@ pub fn amend_commit_no_edit(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Amend the previous commit, REPLACING its message. For an explicit `--message` or
+/// `--automatic` on the amend path, where the plain `--no-edit` amend above would
+/// otherwise silently keep the prior commit's message and ignore what was asked for.
+pub fn amend_commit_with_message(path: &Path, message: &str) -> Result<()> {
+    let output = Command::new("git")
+        .args(["commit", "--amend", "-m", message])
+        .current_dir(path)
+        .output()
+        .context("Failed to run git commit --amend")?;
+
+    if !output.status.success() {
+        bail!("git commit --amend failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    Ok(())
+}
+
 /// Check if there are any uncommitted changes (staged or unstaged)
 pub fn has_uncommitted_changes(path: &Path) -> Result<bool> {
     let output = Command::new("git")
@@ -368,49 +385,22 @@ pub fn tag_sha(path: &Path, tag: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// The commit SHA a tag points to ON THE REMOTE, or `None` if the remote has no
-/// such tag. Annotated tags are dereferenced via the `^{}` peeled line.
+/// The commit SHA a tag points to ON THE REMOTE, or `None` if the remote has no such tag
+/// (annotated tags dereferenced). Same query as `remote_tag_commit`; kept as a separate
+/// name because callers ask two different questions ("does this tag exist" vs. "what
+/// commit is this tag really at"), but they must never diverge in behavior, so this just
+/// delegates.
 pub fn remote_tag_sha(path: &Path, tag: &str) -> Result<Option<String>> {
-    let refspec = format!("refs/tags/{tag}");
-    let output = Command::new("git")
-        .args(["ls-remote", "origin", &refspec])
-        .current_dir(path)
-        .output()
-        .context("Failed to run git ls-remote")?;
-
-    if !output.status.success() {
-        bail!(
-            "git ls-remote origin {} failed: {}",
-            refspec,
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let peeled = format!("{refspec}^{{}}");
-    let mut plain_sha = None;
-    for line in stdout.lines() {
-        let Some((sha, name)) = line.split_once('\t') else {
-            continue;
-        };
-        if name == peeled {
-            // Peeled commit of an annotated tag: this is what the tag points to.
-            return Ok(Some(sha.trim().to_string()));
-        }
-        if name == refspec {
-            plain_sha = Some(sha.trim().to_string());
-        }
-    }
-    Ok(plain_sha)
+    remote_tag_commit(path, tag)
 }
 
 /// The COMMIT a tag points to ON THE REMOTE (annotated tags dereferenced), or `None` if the
-/// remote has no such tag. Unlike `remote_tag_sha` -- which, queried with an EXACT refspec,
-/// returns the annotated TAG-OBJECT sha (git omits the peeled `^{}` line for an exact
-/// match) -- this asks for the peeled ref too, so an annotated tag resolves to its
-/// underlying commit. `bump finish` needs the real commit to tell an at-HEAD remote tag
-/// (already released) from an at-other one (missed bump). Wired to `release::finish`'s
-/// remote-tag arm in production.
+/// remote has no such tag. `git ls-remote` only emits the peeled `^{}` line when the peeled
+/// refspec is ALSO requested (an exact, single refspec query never gets it, so a naive
+/// exact-refspec query would return the annotated TAG-OBJECT sha instead of the commit) --
+/// this passes both refspecs in one call to get the real commit. `bump finish` needs it to
+/// tell an at-HEAD remote tag (already released) from an at-other one (missed bump). Wired
+/// to `release::finish`'s remote-tag arm in production.
 pub fn remote_tag_commit(path: &Path, tag: &str) -> Result<Option<String>> {
     debug!("remote_tag_commit: path={} tag={}", path.display(), tag);
     let refspec = format!("refs/tags/{tag}");
@@ -627,11 +617,13 @@ mod tests {
         // Tag push lands the annotated tag on origin BY NAME.
         create_tag(work.path(), "v0.1.0", "v0.1.0").unwrap();
         push_tag(work.path(), "v0.1.0").unwrap();
-        // `remote_tag_sha` on an exact refspec returns the annotated tag-object SHA (no
-        // peeled `^{}` line), so assert PRESENCE, not commit equality.
-        assert!(
-            remote_tag_sha(work.path(), "v0.1.0").unwrap().is_some(),
-            "tag must be on origin after push_tag"
+        // `remote_tag_sha` peels the annotated tag: it must return the underlying COMMIT,
+        // not the tag object's own SHA, and that commit must equal HEAD.
+        let head = head_sha(work.path()).unwrap();
+        assert_eq!(
+            remote_tag_sha(work.path(), "v0.1.0").unwrap(),
+            Some(head),
+            "remote_tag_sha must resolve the annotated tag to its target commit"
         );
         drop(origin);
     }
