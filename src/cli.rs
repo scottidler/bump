@@ -184,7 +184,8 @@ fn get_finish_help() -> String {
          \x20 tag vX exists LOCALLY only (prior run died before/during the tag push): \
          resume -- push tag by name, install; never reported as already released\n\
          \x20 generic repo (no manifest), gated: refuse -- finish cannot derive a version\n\
-         \x20 dirty tree: refuse before checkout (would clobber or carry strays)\n\n\
+         \x20 tracked changes in the tree: refuse before checkout (would clobber them; \
+         untracked files are fine, nothing is ever staged)\n\n\
          REQUIRED TOOLS:\n  {} {:<10} {}\n  {} {:<10} {}\n\n\
          gh is used only indirectly (via `bump release`'s PR); finish itself only needs git.\n\n\
          Logs are written to: {}",

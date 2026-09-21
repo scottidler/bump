@@ -804,12 +804,15 @@ pub fn finish<P: Pusher, I: Installer>(
         bail!("not a git repository: {}", dir.display());
     }
 
-    // Dirty tree: checking out the default branch would clobber tracked changes or carry
-    // strays onto the release. Refuse before ANY mutation, with the one exact fix.
-    if git::has_uncommitted_changes(dir)? {
+    // Dirty tree: checking out the default branch would clobber TRACKED changes. Untracked
+    // files aren't a reason to refuse: finish never stages or commits anything (it only
+    // tags), so a stray file can't ride onto the release; if it collides with a path the
+    // checkout would create, `git checkout` itself will say so. Refuse before ANY mutation,
+    // with the one exact fix.
+    if git::has_tracked_changes(dir)? {
         bail!(
-            "the working tree is dirty; bump finish checks out the default branch, which would \
-             clobber or carry strays.\n\
+            "the working tree has uncommitted tracked changes; bump finish checks out the \
+             default branch, which would clobber them.\n\
              Commit or stash your changes first, then bump finish"
         );
     }

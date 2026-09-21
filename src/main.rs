@@ -383,31 +383,29 @@ pub(crate) struct TagCheck {
 }
 
 /// The `--tag-only` verification ladder, factored so `bump --tag-only` and `bump finish`
-/// SHARE it (never duplicate it). Rungs, in order: clean working tree, on the remote
-/// default branch, HEAD == origin/<default> EXACTLY (fetch first), manifest version -> tag
-/// name, then the remote-then-local tag-existence classification. Any failed rung bails
-/// with the exact refusal it warrants; success returns the tag/head/default and the
-/// `TagState`. Read-only except for the `git fetch origin <default>` the exactness check
-/// requires -- it NEVER creates or pushes a tag (the consumer does that).
+/// SHARE it (never duplicate it). Rungs, in order: no TRACKED changes, HEAD ==
+/// origin/<default> EXACTLY (fetch first), manifest version -> tag name, then the
+/// remote-then-local tag-existence classification. Any failed rung bails with the exact
+/// refusal it warrants; success returns the tag/head/default and the `TagState`.
+/// Read-only except for the `git fetch origin <default>` the exactness check requires --
+/// it NEVER creates or pushes a tag (the consumer does that).
+///
+/// Deliberately does NOT require the current worktree's checked-out branch to be named
+/// `<default>`: this ladder never commits, so it never runs `git add -A`, and the SHA
+/// check below is a strictly stronger safety guarantee than a branch-name match. Requiring
+/// a literal `<default>` checkout broke every worktree except the one holding that branch
+/// (`git checkout <default>` fails there with "already checked out elsewhere").
 pub(crate) fn tag_ladder(dir: &Path) -> Result<TagCheck> {
     debug!("tag_ladder: dir={}", dir.display());
 
-    // 1. Working tree must be clean.
-    if git::has_uncommitted_changes(dir)? {
-        bail!("--tag-only requires a clean working tree; commit or stash changes first.");
+    // 1. No TRACKED changes. Untracked files can't ride into a tag: this ladder never
+    // stages or commits anything, so an unrelated scratch file is not a reason to refuse.
+    if git::has_tracked_changes(dir)? {
+        bail!("--tag-only requires no uncommitted tracked changes; commit or stash them first.");
     }
 
-    // 2. Must be on the remote default branch.
+    // 2. HEAD must equal origin/<default> EXACTLY (not merely an ancestor).
     let default = git::remote_default_branch(dir)?;
-    let current = git::current_branch(dir)?;
-    if current != default {
-        bail!(
-            "--tag-only must run on the default branch '{default}', but HEAD is on '{current}'.\n\
-             Run: git checkout {default} && git pull --ff-only origin {default}"
-        );
-    }
-
-    // 3. HEAD must equal origin/<default> EXACTLY (not merely an ancestor).
     git::fetch_branch(dir, &default)?;
     match git::compare_head_to_remote(dir, &default)? {
         git::HeadRemote::Equal => {}
@@ -425,7 +423,7 @@ pub(crate) fn tag_ladder(dir: &Path) -> Result<TagCheck> {
         ),
     }
 
-    // 4. Manifest version -> tag name.
+    // 3. Manifest version -> tag name.
     let project_type = detect_project_type(dir);
     let file_version = read_file_version(dir, project_type)?
         .and_then(|v| version::parse_version(&v).ok())
@@ -439,7 +437,7 @@ pub(crate) fn tag_ladder(dir: &Path) -> Result<TagCheck> {
     let new_tag = version::format_tag(&file_version);
     let head = git::head_sha(dir)?;
 
-    // 5. Tag-existence classification, remote then local.
+    // 4. Tag-existence classification, remote then local.
     let state = if let Some(remote_sha) = git::remote_tag_sha(dir, &new_tag)? {
         if remote_sha == head {
             TagState::RemoteAtHead
@@ -1815,28 +1813,45 @@ name = "test-pkg"
         assert_eq!(git::tag_sha(dir, "v0.1.0").unwrap(), git::head_sha(dir).unwrap());
     }
 
-    /// Step 1: dirty working tree refuses, no tag.
+    /// Step 1: an UNTRACKED file does not refuse -- --tag-only never stages or commits
+    /// anything, so a stray scratch file can't ride into the tag.
     #[test]
-    fn tag_only_refuses_dirty_tree() {
+    fn tag_only_allows_untracked_file() {
         let (_origin, work) = setup_remote_repo();
         let dir = work.path();
-        fs::write(dir.join("dirty.txt"), "x").unwrap();
+        fs::write(dir.join("stray.txt"), "x").unwrap();
+
+        tag_only(dir).unwrap();
+
+        assert!(git::tag_exists(dir, "v0.1.0").unwrap());
+    }
+
+    /// Step 1: a TRACKED, uncommitted modification still refuses, no tag.
+    #[test]
+    fn tag_only_refuses_tracked_change() {
+        let (_origin, work) = setup_remote_repo();
+        let dir = work.path();
+        fs::write(dir.join("Cargo.toml"), "tracked edit").unwrap();
 
         let err = tag_only(dir).unwrap_err().to_string();
-        assert!(err.contains("clean working tree"), "got: {err}");
+        assert!(err.contains("uncommitted tracked changes"), "got: {err}");
         assert!(!git::tag_exists(dir, "v0.1.0").unwrap());
     }
 
-    /// Step 2: not on the default branch refuses, no tag.
+    /// Step 2 (removed): a worktree checked out on a differently-named branch, but at the
+    /// exact merged commit, still succeeds. The old rung required the branch to be
+    /// literally named `<default>`, which made --tag-only fail in every worktree except
+    /// the single one holding that branch. HEAD == origin/<default> (checked below) is
+    /// the guarantee that actually matters, not the local branch name.
     #[test]
-    fn tag_only_refuses_wrong_branch() {
+    fn tag_only_succeeds_on_differently_named_branch_at_merged_head() {
         let (_origin, work) = setup_remote_repo();
         let dir = work.path();
         git_in(dir, &["checkout", "-b", "feature"]);
 
-        let err = tag_only(dir).unwrap_err().to_string();
-        assert!(err.contains("default branch"), "got: {err}");
-        assert!(!git::tag_exists(dir, "v0.1.0").unwrap());
+        tag_only(dir).unwrap();
+
+        assert!(git::tag_exists(dir, "v0.1.0").unwrap());
     }
 
     /// Step 3: HEAD ahead of origin/main refuses with a distinct message.

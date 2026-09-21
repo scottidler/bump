@@ -1099,19 +1099,40 @@ fn finish_gated_generic_repo_refuses() {
     drop(origin);
 }
 
-/// Row 6: a dirty tree refuses BEFORE any checkout (which would clobber or carry strays).
+/// Row 6: an UNTRACKED file does not refuse -- finish never stages or commits anything
+/// (it only checks out, fast-forwards, and tags), so a stray file can't ride onto the
+/// release. finish proceeds and completes normally.
 #[test]
-fn finish_dirty_tree_refuses() {
+fn finish_allows_untracked_file() {
     let (origin, work) = setup_finish_untagged_merged("0.1.5", "0.1.6");
     let dir = work.path();
-    fs::write(dir.join("dirty.txt"), "x").unwrap();
+    fs::write(dir.join("stray.txt"), "x").unwrap();
+
+    let pusher = RecordingPusher::new(false);
+    let installer = RecordingInstaller::new();
+    let report = finish(dir, &finish_opts(false), &pusher, &installer).unwrap();
+
+    assert_eq!(report.tag, "v0.1.6");
+    assert_eq!(pusher.calls(), vec!["tag:v0.1.6".to_string()]);
+    drop(origin);
+}
+
+/// Row 6: a TRACKED, uncommitted modification refuses BEFORE any checkout (which would
+/// clobber it).
+#[test]
+fn finish_refuses_tracked_change() {
+    let (origin, work) = setup_finish_untagged_merged("0.1.5", "0.1.6");
+    let dir = work.path();
+    let cargo_toml = dir.join("Cargo.toml");
+    let contents = fs::read_to_string(&cargo_toml).unwrap();
+    fs::write(&cargo_toml, format!("{contents}\n# tracked edit\n")).unwrap();
 
     let pusher = RecordingPusher::new(false);
     let installer = RecordingInstaller::new();
     let err = finish(dir, &finish_opts(false), &pusher, &installer)
-        .expect_err("dirty tree must refuse")
+        .expect_err("tracked change must refuse")
         .to_string();
-    assert!(err.contains("dirty"), "got: {err}");
+    assert!(err.contains("uncommitted tracked changes"), "got: {err}");
     assert!(pusher.calls().is_empty());
     // No checkout happened -- HEAD is still on the feature branch.
     assert_eq!(

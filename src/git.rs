@@ -174,6 +174,25 @@ pub fn has_uncommitted_changes(path: &Path) -> Result<bool> {
     Ok(!status.trim().is_empty())
 }
 
+/// Check if there are any TRACKED uncommitted changes (staged or modified), ignoring
+/// untracked files. For paths that never `git add`: an untracked file can't ride into
+/// a commit that's never made, so it isn't a reason to refuse. Contrast with
+/// `has_uncommitted_changes`, which callers that DO `git add -A` must keep using.
+pub fn has_tracked_changes(path: &Path) -> Result<bool> {
+    let output = Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=no"])
+        .current_dir(path)
+        .output()
+        .context("Failed to run git status")?;
+
+    if !output.status.success() {
+        bail!("git status failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    let status = String::from_utf8_lossy(&output.stdout);
+    Ok(!status.trim().is_empty())
+}
+
 /// List the paths git considers dirty (staged, modified, or untracked) via
 /// `git status --porcelain`. Captured BEFORE bump mutates anything so the lockfile
 /// guard can tell a bump-synced lockfile from one the user had already changed.
