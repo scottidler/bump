@@ -12,8 +12,8 @@
 //! post-merge tag step). Phase 8 wires the `bump release` / `bump finish` clap
 //! subcommands (`main.rs::dispatch_release`/`dispatch_finish`) and the
 //! `--install`/`--no-install` flags to the callable `release(dir, opts, pusher,
-//! installer, pr)` / `finish(dir, opts, pusher, installer)` functions; tests still drive
-//! them via injected `Pusher`/`Installer`/`Pr` doubles.
+//! installer, pr, ci)` / `finish(dir, opts, pusher, installer, ci)` functions; tests
+//! still drive them via injected `Pusher`/`Installer`/`Pr`/`Ci` doubles.
 //!
 //! GATED invariant (Phase 6): NO tag is ever created or pushed in the gated `release`
 //! flow -- the version commit rides the feature branch (internal `--no-tag`), the branch
@@ -21,16 +21,22 @@
 //! none is open, and the verb PAUSES (exit 0) for the human to merge. Tagging the merged
 //! commit is `bump finish`'s job (Phase 7), never `release`'s.
 //!
-//! Strengthened ordering invariant (git.md, enforced in code below, NOT prose): a tag is
-//! created ONLY after the commit it points to is confirmed on `origin/<default>`. Plain
-//! `bump` tags local HEAD before pushing; `bump release` inverts that -- version commit
-//! -> push branch -> confirm on origin -> THEN tag -> push tag by name -- so a rejected
-//! branch push can never strand a local tag on an unpushed commit.
+//! Tag invariant (2026-09-26 one-release-command doc, enforced in `gate_tag_and_push`):
+//! a tag is created ONLY on a sha that (1) passed the CI gate (`wait_for_green`), (2) a
+//! fresh fetch shows EQUALS `origin/<default>`, and (3) whose committed manifest carries
+//! the tag's version; the push re-checks (2) after a second fresh fetch. A tip that moved
+//! during the wait with the same version restarts the gate on the new tip.
+//!
+//! Pending version (`pending_version`): the manifest version at HEAD is the release when
+//! it has no remote tag, is not below the latest tag, and is not the Rust untouched
+//! default while tags exist. It is classified before the ahead/equal split (ungated) and
+//! before the fresh/inherited split (gated); `compute_target_tag` never runs while one
+//! exists.
 
 use crate::cli::Cli;
-use crate::config::{self, Config};
+use crate::config::{self, CiDeclaration, Config};
 use crate::git::{self, HeadRemote};
-use crate::github::{self, Gate};
+use crate::github::{self, CheckRuns, Gate, StatusState};
 use crate::lang::{self, Manifest, ManifestVersion, ProjectType};
 use crate::version::{self, BumpType};
 use crate::{DEFAULT_UNTOUCHED_VERSION, TagState, determine_version_action, process_directory, tag_ladder};
@@ -39,6 +45,8 @@ use log::debug;
 use semver::Version;
 use std::path::Path;
 use std::process::Command;
+use std::thread;
+use std::time::{Duration, Instant};
 
 /// The default install command when none is configured and a Cargo manifest is present.
 const DEFAULT_INSTALL_COMMAND: &str = "cargo install --path .";
@@ -47,6 +55,16 @@ const DEFAULT_INSTALL_COMMAND: &str = "cargo install --path .";
 /// everything mechanical up to (and including) opening the PR, and now hands control back
 /// to the human/agent to merge and then run `bump finish`.
 const GATED_PAUSE_MESSAGE: &str = "merge the PR, then run: bump finish";
+
+/// How often the CI gate re-reads check runs and legacy statuses.
+pub const CI_POLL_INTERVAL: Duration = Duration::from_secs(15);
+
+/// How long the CI gate waits for ANY check run or status to register on a sha before
+/// deciding from the sha's `.github/workflows` tree.
+pub const CI_APPEAR_WINDOW: Duration = Duration::from_secs(120);
+
+/// The default `--ci-timeout`: how long the gate waits on incomplete runs before refusing.
+pub const DEFAULT_CI_TIMEOUT: Duration = Duration::from_secs(1800);
 
 /// How the install step is resolved. Precedence (general.md): CLI override > config
 /// `install` > default (`cargo install --path .` iff a `Cargo.toml` is present) > skip.
@@ -64,12 +82,17 @@ pub enum InstallChoice {
 /// CLI) drive the verb without a clap dependency here.
 #[derive(Debug, Clone)]
 pub struct ReleaseOpts {
-    /// The bump level (patch/minor/major) for a fresh release.
-    pub bump_type: BumpType,
+    /// The explicit `-m`/`-M` level. `None` (no level flag) takes a pending version when
+    /// one exists and means patch on a fresh release.
+    pub bump_type: Option<BumpType>,
     /// `-n`: echo every command that would run and execute NOTHING.
     pub dry_run: bool,
     /// How to resolve the post-release install step.
     pub install: InstallChoice,
+    /// `false` skips the CI gate with a printed warning (`--no-ci-gate`).
+    pub ci_gate: bool,
+    /// How long the CI gate waits on incomplete runs before refusing (`--ci-timeout`).
+    pub ci_timeout: Duration,
 }
 
 /// Inputs to a `bump finish` invocation. No bump level -- finish tags the version already
@@ -81,6 +104,10 @@ pub struct FinishOpts {
     pub dry_run: bool,
     /// How to resolve the post-release install step.
     pub install: InstallChoice,
+    /// `false` skips the CI gate with a printed warning (`--no-ci-gate`).
+    pub ci_gate: bool,
+    /// How long the CI gate waits on incomplete runs before refusing (`--ci-timeout`).
+    pub ci_timeout: Duration,
 }
 
 /// The outcome of a successful `release()` (refusals are `Err`). Lets callers/tests
@@ -101,6 +128,25 @@ pub struct ReleaseReport {
     pub install_command: Option<String>,
     /// True when this was a `-n` dry run (nothing was mutated).
     pub dry_run: bool,
+    /// The URL of the PR this run CREATED (`None` when one was already open, or on any
+    /// ungated / finish run).
+    pub pr_url: Option<String>,
+    /// A warning printed alongside the pause (the inherited-pending-version notice).
+    pub notice: Option<String>,
+}
+
+impl ReleaseReport {
+    fn new(tag: &str) -> Self {
+        Self {
+            tag: tag.to_string(),
+            resumed: false,
+            paused: false,
+            install_command: None,
+            dry_run: false,
+            pr_url: None,
+            notice: None,
+        }
+    }
 }
 
 /// The typed state the repo is in, as classified from git + gate facts. Each refusal
@@ -108,16 +154,21 @@ pub struct ReleaseReport {
 /// either the correct mutation sequence or a loud, actionable refusal.
 #[derive(Debug)]
 enum ReleaseState {
-    /// Ungated, on default, ahead of origin, clean: fresh release.
+    /// Ungated, on default, ahead of origin, clean, no pending version: fresh release.
     Release { target_tag: String, default: String },
-    /// Ungated RESUME: origin carries the version, the remote tag is missing (a prior
-    /// run died between branch push and tag push). `local_tag_present` distinguishes the
-    /// two sub-states (`git::tag_exists`): present -> push only; absent -> create + push.
-    Resume {
+    /// Ungated, on default, clean, the manifest carries a PENDING version (see
+    /// `pending_version`). `ahead` pushes the commits first; `!ahead` is the RESUME row
+    /// (a prior run died, or CI was red and nothing new was committed). Never re-bumps.
+    UngatedPending {
         tag: String,
+        version: Version,
         default: String,
-        local_tag_present: bool,
+        ahead: bool,
     },
+    /// Ungated pending version, but the requested level implies a DIFFERENT version.
+    UngatedLevelMismatch { pending: String, implied: String },
+    /// Any gate: the manifest version is below the latest tag.
+    BelowLatest { manifest: String, latest: String },
     /// Ungated, not on the default branch.
     NotOnDefault { default: String, current: String },
     /// Ungated, behind (or diverged from) origin.
@@ -128,15 +179,38 @@ enum ReleaseState {
     DirtyTree,
     /// Detached HEAD.
     DetachedHead,
-    /// Gated, on a feature branch, version == last tag: fresh gated release. Bump rides
-    /// the branch (`--no-tag`), push branch, ensure PR, PAUSE.
-    GatedFresh { branch: String, target_tag: String },
-    /// Gated, on a feature branch, version ALREADY bumped (idempotent re-run). Skip the
-    /// re-bump, ensure the branch is pushed + a PR is open, PAUSE.
-    GatedAlreadyBumped { branch: String, tag: String },
+    /// Gated, on a feature branch, no pending version, no version line in the diff:
+    /// fresh gated release. Version commit by level, push branch, ensure PR, PAUSE.
+    GatedFresh {
+        branch: String,
+        default: String,
+        target_tag: String,
+        bump_type: BumpType,
+    },
+    /// Gated, on a feature branch whose diff vs origin/<default> changes a version line
+    /// (the branch's own bump, e.g. an idempotent re-run). Skip the re-bump, ensure the
+    /// branch is pushed + a PR is open, PAUSE.
+    GatedAlreadyBumped {
+        branch: String,
+        default: String,
+        tag: String,
+    },
+    /// Gated, on a feature branch carrying work, the manifest carries a pending version
+    /// with NO version line in the branch diff: inherited from origin/<default>. Bumps
+    /// again from the manifest version (Scott, 2026-09-26: "bump again").
+    GatedInheritedPending {
+        branch: String,
+        default: String,
+        inherited: String,
+        target: Version,
+    },
     /// Gated re-run whose requested level (`-m`/`-M`) implies a DIFFERENT version than the
     /// one already riding the branch. REFUSE naming BOTH (never silently keep either).
     GatedLevelMismatch { riding: String, implied: String },
+    /// Gated feature branch whose name is not its own slug: the PR title is built from the
+    /// branch, so it could not slugify back to it (`branch-pr-title-guard.sh`). REFUSE
+    /// before any mutation.
+    GatedBadBranchName { branch: String, slug: String },
     /// Gated, on the local default branch, with commits NOT on origin (stranded). REFUSE
     /// with the LITERAL rescue commands; the verb never invents a branch or resets.
     GatedStranded { default: String, suggested_branch: String },
@@ -147,6 +221,20 @@ enum ReleaseState {
     GatedGeneric,
     /// Gate probe inconclusive: `release` pushes, so it FAILS CLOSED.
     Unknown { reason: String },
+}
+
+/// The pending-version classification (design doc, Data Model): the one definition every
+/// release row uses.
+#[derive(Debug)]
+enum PendingCheck {
+    /// The manifest version is the release: untagged on the remote, not below the latest
+    /// tag, not the Rust untouched default while tags exist.
+    Pending(Version),
+    /// The manifest version is BELOW the latest tag: no release row matches, refuse.
+    BelowLatest { manifest: Version, latest: Version },
+    /// No pending version: the manifest equals a released tag, is the untouched default,
+    /// or there is no manifest version at all.
+    NotPending,
 }
 
 /// Pushes a branch / tag to origin. A port so tests can record ordering and inject a
@@ -171,14 +259,31 @@ pub trait Installer {
 /// fake `gh` without a real GitHub round-trip.
 ///
 /// `open_pr_exists` is the Phase-0 open-PR probe (`gh pr list --head <branch> --state
-/// open --json number`, NOT `gh pr view`); `create_pr` is `gh pr create --fill`, only
-/// ever called when `open_pr_exists` returns false.
+/// open --json number`, NOT `gh pr view`); `create_pr` is `gh pr create` with an explicit
+/// head, base, title and body, only ever called when `open_pr_exists` returns false, and
+/// returns the new PR's URL.
 pub trait Pr {
     fn open_pr_exists(&self, dir: &Path, branch: &str) -> Result<bool>;
-    fn create_pr(&self, dir: &Path, branch: &str) -> Result<()>;
+    fn create_pr(&self, dir: &Path, branch: &str, base: &str, title: &str, body: &str) -> Result<String>;
 }
 
-/// Production `Pr`: the real `gh` PR operations (list-probe + `--fill` create).
+/// The CI seam for the gate. `Ok(None)` = the repo has no GitHub remote (nothing to wait
+/// on); `Err` = an API/auth failure or a truncated read, which the gate fails closed on.
+///
+/// The poll interval and appear window live on the port because they describe the remote
+/// CI system (how often it is sane to poll GitHub, how long GitHub takes to register a
+/// run); test doubles return zero for both so no test ever sleeps.
+pub trait Ci {
+    fn check_runs(&self, dir: &Path, sha: &str) -> Result<Option<CheckRuns>>;
+    fn poll_interval(&self) -> Duration {
+        CI_POLL_INTERVAL
+    }
+    fn appear_window(&self) -> Duration {
+        CI_APPEAR_WINDOW
+    }
+}
+
+/// Production `Pr`: the real `gh` PR operations (list-probe + explicit create).
 pub struct GhPr;
 
 impl Pr for GhPr {
@@ -186,8 +291,17 @@ impl Pr for GhPr {
         github::open_pr_exists(dir, branch)
     }
 
-    fn create_pr(&self, dir: &Path, branch: &str) -> Result<()> {
-        github::create_pr(dir, branch)
+    fn create_pr(&self, dir: &Path, branch: &str, base: &str, title: &str, body: &str) -> Result<String> {
+        github::create_pr(dir, branch, base, title, body)
+    }
+}
+
+/// Production `Ci`: `gh api` check-runs + legacy status for the sha.
+pub struct GhCi;
+
+impl Ci for GhCi {
+    fn check_runs(&self, dir: &Path, sha: &str) -> Result<Option<CheckRuns>> {
+        github::check_runs(dir, sha)
     }
 }
 
@@ -211,10 +325,11 @@ impl Pusher for GitPusher {
 
 /// The external-effect ports bundled together, so the execution functions stay under the
 /// argument-count limit and the seams travel as one unit (rules/rust.md `Deps`).
-struct Ports<'a, P: Pusher, I: Installer, R: Pr> {
+struct Ports<'a, P: Pusher, I: Installer, R: Pr, C: Ci> {
     pusher: &'a P,
     installer: &'a I,
     pr: &'a R,
+    ci: &'a C,
 }
 
 /// Production `Installer`: run the repo-committed install command through the shell (same
@@ -237,26 +352,51 @@ impl Installer for ShellInstaller {
     }
 }
 
-/// `bump release`: classify the repo's state, then execute the one correct ungated
-/// sequence or refuse with the exact next command (non-zero exit at the caller).
-pub fn release<P: Pusher, I: Installer, R: Pr>(
+/// The CI gate's settings for one run, taken from the verb's opts.
+#[derive(Debug, Clone, Copy)]
+struct CiGate {
+    enabled: bool,
+    timeout: Duration,
+}
+
+/// What `gate_tag_and_push` tags and where: the tag, the version the manifest at the
+/// tagged sha must carry, the default branch it must equal, and the verb a refusal tells
+/// the operator to re-run.
+struct TagTarget<'a> {
+    tag: &'a str,
+    version: &'a Version,
+    default: &'a str,
+    rerun: &'a str,
+}
+
+/// `bump release`: classify the repo's state, then execute the one correct sequence or
+/// refuse with the exact next command (non-zero exit at the caller).
+pub fn release<P: Pusher, I: Installer, R: Pr, C: Ci>(
     dir: &Path,
     opts: &ReleaseOpts,
     pusher: &P,
     installer: &I,
     pr: &R,
+    ci: &C,
 ) -> Result<ReleaseReport> {
     debug!(
-        "release: dir={} dry_run={} bump_type={:?} install={:?}",
+        "release: dir={} dry_run={} bump_type={:?} install={:?} ci_gate={} ci_timeout={:?}",
         dir.display(),
         opts.dry_run,
         opts.bump_type,
-        opts.install
+        opts.install,
+        opts.ci_gate,
+        opts.ci_timeout
     );
     let config = config::load(dir)?;
     let state = classify(dir, opts)?;
     debug!("release: classified state={:?}", state);
-    let ports = Ports { pusher, installer, pr };
+    let ports = Ports {
+        pusher,
+        installer,
+        pr,
+        ci,
+    };
     execute(dir, opts, &config, state, &ports)
 }
 
@@ -292,45 +432,59 @@ fn classify(dir: &Path, opts: &ReleaseOpts) -> Result<ReleaseState> {
         return Ok(ReleaseState::NotOnDefault { default, current });
     }
 
-    match git::compare_head_to_remote(dir, &default)? {
-        HeadRemote::Behind | HeadRemote::Diverged => Ok(ReleaseState::Behind { default }),
-        HeadRemote::Ahead => {
-            let target_tag = compute_target_tag(dir, opts.bump_type)?;
+    let ahead = match git::compare_head_to_remote(dir, &default)? {
+        HeadRemote::Behind | HeadRemote::Diverged => return Ok(ReleaseState::Behind { default }),
+        HeadRemote::Ahead => true,
+        HeadRemote::Equal => false,
+    };
+
+    // The pending version is classified BEFORE the ahead/equal split: a pending version
+    // IS the release, whether or not commits sit on top of it.
+    match pending_version(dir)? {
+        PendingCheck::BelowLatest { manifest, latest } => Ok(ReleaseState::BelowLatest {
+            manifest: version::format_file_version(&manifest),
+            latest: version::format_tag(&latest),
+        }),
+        PendingCheck::Pending(version) => classify_ungated_pending(dir, opts, version, default, ahead),
+        PendingCheck::NotPending if ahead => {
+            let target_tag = compute_target_tag(dir, opts.bump_type.unwrap_or_default())?;
             Ok(ReleaseState::Release { target_tag, default })
         }
-        HeadRemote::Equal => classify_equal(dir, default),
+        PendingCheck::NotPending => Ok(ReleaseState::Nothing { default }),
     }
 }
 
-/// HEAD == origin/<default> and the tree is clean: either a partial-release RESUME (the
-/// version is committed+pushed but the remote tag is missing) or truly nothing to do.
-fn classify_equal(dir: &Path, default: String) -> Result<ReleaseState> {
-    debug!("classify_equal: dir={} default={}", dir.display(), default);
-    let manifests = lang::detect(dir)?;
-    if manifests.is_empty() {
-        // Generic repo (version lives in tags): with nothing ahead, there is nothing to
-        // release and no manifest version to resume-tag.
-        return Ok(ReleaseState::Nothing { default });
-    }
-    let version = match lang::agreed_version(&manifests)? {
-        ManifestVersion::Static(v) => v,
-        ManifestVersion::Missing => return Ok(ReleaseState::Nothing { default }),
-        ManifestVersion::Dynamic(reason) => bail!(
-            "cannot release: {reason}. The version is owned elsewhere; remove the \
-             dynamic declaration to let bump manage it."
-        ),
-    };
+/// Ungated, on default, the manifest carries a pending version: refuse a level flag that
+/// implies a different version, refuse a local tag for it at another commit (manual
+/// surgery), otherwise ship the pending version.
+fn classify_ungated_pending(
+    dir: &Path,
+    opts: &ReleaseOpts,
+    version: Version,
+    default: String,
+    ahead: bool,
+) -> Result<ReleaseState> {
+    debug!(
+        "classify_ungated_pending: dir={} version={} ahead={}",
+        dir.display(),
+        version,
+        ahead
+    );
     let tag = version::format_tag(&version);
-
-    // The remote tag is the source of truth for "released": present on origin => done.
-    if git::remote_tag_sha(dir, &tag)?.is_some() {
-        return Ok(ReleaseState::Nothing { default });
+    if let Some(level) = opts.bump_type {
+        let implied = implied_version(latest_tag_version(dir)?.as_ref(), &version, level);
+        if implied != version {
+            return Ok(ReleaseState::UngatedLevelMismatch {
+                pending: tag,
+                implied: version::format_tag(&implied),
+            });
+        }
     }
 
-    // Origin carries the version but the remote tag is absent -> RESUME. A local tag may
-    // or may not exist; a local tag at a DIFFERENT commit is manual surgery, not resume.
-    let head = git::head_sha(dir)?;
-    let local_tag_present = if git::tag_exists(dir, &tag)? {
+    // A local tag at HEAD is the local-tag resume row (`gate_tag_and_push` pushes it
+    // without re-creating); a local tag at a DIFFERENT commit is manual surgery.
+    if git::tag_exists(dir, &tag)? {
+        let head = git::head_sha(dir)?;
         let sha = git::tag_sha(dir, &tag)?;
         if sha != head {
             bail!(
@@ -338,21 +492,20 @@ fn classify_equal(dir: &Path, default: String) -> Result<ReleaseState> {
                  resolving that is manual tag surgery, not bump's job."
             );
         }
-        true
-    } else {
-        false
-    };
-    Ok(ReleaseState::Resume {
+    }
+
+    Ok(ReleaseState::UngatedPending {
         tag,
+        version,
         default,
-        local_tag_present,
+        ahead,
     })
 }
 
 /// Classify a GATED repo. Resolves the remote default and fetches it (like the ungated
 /// path), then splits on branch: on the default branch it is either a stranded-commits
-/// refusal, a behind refusal, or the "bump rides a PR" refusal; on a feature branch it is
-/// a fresh release, an idempotent re-run, a level-mismatch refusal, or generic-unsupported.
+/// refusal, a behind refusal, or the "bump rides a PR" refusal; on a feature branch see
+/// `classify_gated_feature`.
 fn classify_gated(dir: &Path, opts: &ReleaseOpts, current: &str) -> Result<ReleaseState> {
     debug!("classify_gated: dir={} current={}", dir.display(), current);
     let default = git::remote_default_branch(dir)?;
@@ -376,12 +529,13 @@ fn classify_gated(dir: &Path, opts: &ReleaseOpts, current: &str) -> Result<Relea
         };
     }
 
-    classify_gated_feature(dir, opts, current.to_string())
+    classify_gated_feature(dir, opts, current.to_string(), default)
 }
 
-/// Classify a gated repo when HEAD is on a FEATURE branch: fresh vs already-bumped vs
-/// level-mismatch vs generic-unsupported.
-fn classify_gated_feature(dir: &Path, opts: &ReleaseOpts, branch: String) -> Result<ReleaseState> {
+/// Classify a gated repo when HEAD is on a FEATURE branch. Order: generic, branch-name
+/// precondition, below-latest, then the branch's own bump (a version line in the diff vs
+/// origin/<default>, Gate D's test) vs an inherited pending version vs a fresh release.
+fn classify_gated_feature(dir: &Path, opts: &ReleaseOpts, branch: String, default: String) -> Result<ReleaseState> {
     debug!("classify_gated_feature: dir={} branch={}", dir.display(), branch);
     let manifests = lang::detect(dir)?;
     if manifests.is_empty() {
@@ -390,42 +544,185 @@ fn classify_gated_feature(dir: &Path, opts: &ReleaseOpts, branch: String) -> Res
         return Ok(ReleaseState::GatedGeneric);
     }
 
-    let current_version = match lang::agreed_version(&manifests)? {
-        ManifestVersion::Static(v) => Some(v),
-        ManifestVersion::Missing => None,
-        ManifestVersion::Dynamic(reason) => bail!(
-            "cannot release: {reason}. The version is owned elsewhere; remove the \
-             dynamic declaration to let bump manage it."
-        ),
-    };
-    let latest_tag = git::get_latest_tag(dir)?.and_then(|t| version::parse_version(&t).ok());
-    let project_type = lang::detect_project_type(dir);
+    let slug = branch_slug(&branch);
+    if slug != branch {
+        return Ok(ReleaseState::GatedBadBranchName { branch, slug });
+    }
 
-    // Already-bumped detection: the manifest version is AHEAD of the last released tag (a
-    // prior gated run's `--no-tag` bump already rode this branch), and it is not the Rust
-    // untouched-default 0.1.0 (which defers to the tag -> still a fresh release).
-    if let (Some(v), Some(t)) = (&current_version, &latest_tag) {
-        let is_untouched_default = project_type == ProjectType::Rust && *v == DEFAULT_UNTOUCHED_VERSION;
-        if v != t && !is_untouched_default {
-            let implied = version::bump_version(t, opts.bump_type);
-            if implied != *v {
-                // The requested level implies a DIFFERENT version than the one riding.
+    let pending = pending_version(dir)?;
+    if let PendingCheck::BelowLatest { manifest, latest } = &pending {
+        return Ok(ReleaseState::BelowLatest {
+            manifest: version::format_file_version(manifest),
+            latest: version::format_tag(latest),
+        });
+    }
+
+    let base_ref = format!("origin/{default}");
+    if git::version_line_changed(dir, &base_ref)? {
+        let riding = agreed_file_version(&manifests)?.ok_or_else(|| {
+            eyre::eyre!("this branch changes a version line but the manifest carries no version; fix the manifest")
+        })?;
+        if let Some(level) = opts.bump_type {
+            let implied = implied_version(branch_base_version(dir, &base_ref)?.as_ref(), &riding, level);
+            if implied != riding {
                 return Ok(ReleaseState::GatedLevelMismatch {
-                    riding: version::format_tag(v),
+                    riding: version::format_tag(&riding),
                     implied: version::format_tag(&implied),
                 });
             }
-            return Ok(ReleaseState::GatedAlreadyBumped {
-                branch,
-                tag: version::format_tag(v),
-            });
         }
+        return Ok(ReleaseState::GatedAlreadyBumped {
+            branch,
+            default,
+            tag: version::format_tag(&riding),
+        });
+    }
+
+    let bump_type = opts.bump_type.unwrap_or_default();
+    if let PendingCheck::Pending(inherited) = pending {
+        let target = version::bump_version(&inherited, bump_type);
+        return Ok(ReleaseState::GatedInheritedPending {
+            branch,
+            default,
+            inherited: version::format_tag(&inherited),
+            target,
+        });
     }
 
     // Fresh: version == last tag (or an initial release). Compute the target the requested
     // level yields via bump's own version rules (no re-derivation, no stdout parsing).
-    let target_tag = compute_target_tag(dir, opts.bump_type)?;
-    Ok(ReleaseState::GatedFresh { branch, target_tag })
+    let target_tag = compute_target_tag(dir, bump_type)?;
+    Ok(ReleaseState::GatedFresh {
+        branch,
+        default,
+        target_tag,
+        bump_type,
+    })
+}
+
+/// The pending-version definition (design doc, Data Model): the manifest version at HEAD
+/// (a) has no tag on the REMOTE, (b) is not below the latest local `v*` tag, and (c) is
+/// not the Rust untouched default `0.1.0` while tags exist. A manifest below the latest
+/// tag is its own verdict, refused by name.
+fn pending_version(dir: &Path) -> Result<PendingCheck> {
+    debug!("pending_version: dir={}", dir.display());
+    let manifests = lang::detect(dir)?;
+    let Some(manifest) = agreed_file_version(&manifests)? else {
+        return Ok(PendingCheck::NotPending);
+    };
+    let latest = latest_tag_version(dir)?;
+    let untouched_default =
+        lang::detect_project_type(dir) == ProjectType::Rust && manifest == DEFAULT_UNTOUCHED_VERSION;
+    if untouched_default && latest.is_some() {
+        return Ok(PendingCheck::NotPending);
+    }
+    if let Some(latest) = latest
+        && manifest < latest
+    {
+        return Ok(PendingCheck::BelowLatest { manifest, latest });
+    }
+    if git::remote_tag_sha(dir, &version::format_tag(&manifest))?.is_some() {
+        return Ok(PendingCheck::NotPending);
+    }
+    debug!("pending_version: {manifest} is pending");
+    Ok(PendingCheck::Pending(manifest))
+}
+
+/// The latest local `v*` tag as a `Version` (`None` when there are no tags).
+fn latest_tag_version(dir: &Path) -> Result<Option<Version>> {
+    Ok(git::get_latest_tag(dir)?.and_then(|t| version::parse_version(&t).ok()))
+}
+
+/// The version an explicit level implies, bumped from `base` (the latest tag, or the
+/// version the branch bumped from). With no base (no tags), the level cannot move an
+/// initial release, so it implies the version already there.
+fn implied_version(base: Option<&Version>, current: &Version, level: BumpType) -> Version {
+    match base {
+        Some(base) => version::bump_version(base, level),
+        None => current.clone(),
+    }
+}
+
+/// The version a gated branch bumped FROM: the higher of the manifest at `base_ref`
+/// (skipped when it is the Rust untouched default while tags exist) and the latest tag.
+fn branch_base_version(dir: &Path, base_ref: &str) -> Result<Option<Version>> {
+    let latest = latest_tag_version(dir)?;
+    let at_base = git::manifest_version_at(dir, base_ref)?.and_then(|v| version::parse_version(&v).ok());
+    let untouched_default = lang::detect_project_type(dir) == ProjectType::Rust
+        && at_base.as_ref() == Some(&DEFAULT_UNTOUCHED_VERSION)
+        && latest.is_some();
+    let at_base = if untouched_default { None } else { at_base };
+    Ok(at_base.into_iter().chain(latest).max())
+}
+
+/// `title_slug` from `branch-pr-title-guard.sh`: lowercase, collapse every run of
+/// non-`[a-z0-9]` to `-`, trim dashes. A branch is a legal release branch only when it is
+/// its own slug.
+fn branch_slug(branch: &str) -> String {
+    let mut slug = String::new();
+    let mut in_run = false;
+    for c in branch.to_lowercase().chars() {
+        if c.is_ascii_lowercase() || c.is_ascii_digit() {
+            slug.push(c);
+            in_run = false;
+        } else if !in_run {
+            slug.push('-');
+            in_run = true;
+        }
+    }
+    slug.trim_matches('-').to_string()
+}
+
+/// The PR title: `<type>(<scope>): <branch words>`, type/scope from the first commit
+/// subject on the branch (`chore` when it has no conventional prefix). By construction it
+/// slugifies back to the branch, which `branch-pr-title-guard.sh` enforces.
+pub fn pr_title(branch: &str, subjects: &[String]) -> String {
+    let words = branch.replace('-', " ");
+    let (kind, scope) = subjects
+        .first()
+        .and_then(|s| parse_conventional_prefix(s))
+        .unwrap_or_else(|| ("chore".to_string(), None));
+    match scope {
+        Some(scope) => format!("{kind}({scope}): {words}"),
+        None => format!("{kind}: {words}"),
+    }
+}
+
+/// `feat(scope)!: subject` -> `("feat", Some("scope"))`. `None` when the subject has no
+/// conventional prefix.
+fn parse_conventional_prefix(subject: &str) -> Option<(String, Option<String>)> {
+    let (head, _) = subject.split_once(':')?;
+    let head = head.trim_end_matches('!');
+    let (kind, scope) = match head.split_once('(') {
+        Some((k, rest)) => (k, Some(rest.strip_suffix(')')?)),
+        None => (head, None),
+    };
+    if kind.is_empty() || !kind.chars().all(|c| c.is_ascii_lowercase()) {
+        return None;
+    }
+    if let Some(s) = scope
+        && (s.is_empty()
+            || !s
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_'))
+    {
+        return None;
+    }
+    Some((kind.to_string(), scope.map(str::to_string)))
+}
+
+/// The PR body: one `- <subject>` per commit on the branch, then the release-intent line
+/// Gate D looks for as the LAST line.
+pub fn pr_body(subjects: &[String], tag: &str) -> String {
+    let mut body = String::new();
+    for s in subjects {
+        body.push_str(&format!("- {s}\n"));
+    }
+    if subjects.is_empty() {
+        body.push_str("- version bump\n");
+    }
+    body.push_str(&format!("\nRelease: rides this PR ({tag})"));
+    body
 }
 
 /// A deterministic suggested branch name for the stranded-commits rescue, derived from the
@@ -438,7 +735,8 @@ fn suggest_rescue_branch(dir: &Path) -> Result<String> {
 }
 
 /// Compute the tag a fresh release would create, via bump's own `determine_version_action`
-/// (no stdout parsing, no re-derivation of the version rules).
+/// (no stdout parsing, no re-derivation of the version rules). Only called when no pending
+/// version exists.
 fn compute_target_tag(dir: &Path, bump_type: BumpType) -> Result<String> {
     debug!("compute_target_tag: dir={} bump_type={:?}", dir.display(), bump_type);
     let project_type = lang::detect_project_type(dir);
@@ -466,12 +764,12 @@ fn agreed_file_version(manifests: &[Box<dyn Manifest>]) -> Result<Option<Version
 
 /// Turn a classified state into either the correct mutation sequence or a refusal whose
 /// message is the exact next command.
-fn execute<P: Pusher, I: Installer, R: Pr>(
+fn execute<P: Pusher, I: Installer, R: Pr, C: Ci>(
     dir: &Path,
     opts: &ReleaseOpts,
     config: &Config,
     state: ReleaseState,
-    ports: &Ports<P, I, R>,
+    ports: &Ports<P, I, R, C>,
 ) -> Result<ReleaseReport> {
     debug!(
         "execute: dir={} state={:?} dry_run={}",
@@ -483,11 +781,19 @@ fn execute<P: Pusher, I: Installer, R: Pr>(
         ReleaseState::Release { target_tag, default } => {
             execute_release(dir, opts, config, &target_tag, &default, ports)
         }
-        ReleaseState::Resume {
+        ReleaseState::UngatedPending {
             tag,
+            version,
             default,
-            local_tag_present,
-        } => execute_resume(dir, opts, config, &tag, &default, local_tag_present, ports),
+            ahead,
+        } => execute_pending(dir, opts, config, &tag, &version, &default, ahead, ports),
+        ReleaseState::UngatedLevelMismatch { pending, implied } => bail!(
+            "{pending} is committed and untagged, so it IS the pending release, but the requested level implies {implied}.\n\
+             bump never bumps past a pending version: drop the -m/-M flag and re-run bump release to ship {pending}."
+        ),
+        ReleaseState::BelowLatest { manifest, latest } => bail!(
+            "manifest {manifest} is below the latest tag {latest}; bump never lowers a version, fix the manifest by hand"
+        ),
         ReleaseState::NotOnDefault { default, current } => bail!(
             "bump release runs on the default branch '{default}', but you are on '{current}'.\n\
              Run: git checkout {default}, then bump release"
@@ -512,14 +818,68 @@ fn execute<P: Pusher, I: Installer, R: Pr>(
             "gate status is UNKNOWN ({reason}); bump release pushes, so it refuses to guess (fail closed).\n\
              Run `gh auth status` (or `bump --gates`) once online, then bump release"
         ),
-        ReleaseState::GatedFresh { branch, target_tag } => {
-            execute_gated(dir, opts, &branch, Some(&target_tag), &target_tag, ports)
+        ReleaseState::GatedFresh {
+            branch,
+            default,
+            target_tag,
+            bump_type,
+        } => execute_gated(
+            dir,
+            opts,
+            GatedPlan {
+                branch,
+                default,
+                commit: VersionCommit::Level(bump_type),
+                tag: target_tag,
+                notice: None,
+            },
+            ports,
+        ),
+        ReleaseState::GatedAlreadyBumped { branch, default, tag } => execute_gated(
+            dir,
+            opts,
+            GatedPlan {
+                branch,
+                default,
+                commit: VersionCommit::AlreadyRiding,
+                tag,
+                notice: None,
+            },
+            ports,
+        ),
+        ReleaseState::GatedInheritedPending {
+            branch,
+            default,
+            inherited,
+            target,
+        } => {
+            let tag = version::format_tag(&target);
+            let notice = format!(
+                "origin/{default} carries untagged {inherited}; this PR releases as {tag}. \
+                 To ship {inherited} on its own first, run bump finish before merging this PR."
+            );
+            execute_gated(
+                dir,
+                opts,
+                GatedPlan {
+                    branch,
+                    default,
+                    commit: VersionCommit::To(target),
+                    tag,
+                    notice: Some(notice),
+                },
+                ports,
+            )
         }
-        ReleaseState::GatedAlreadyBumped { branch, tag } => execute_gated(dir, opts, &branch, None, &tag, ports),
         ReleaseState::GatedLevelMismatch { riding, implied } => bail!(
             "this branch already carries a version bump to {riding}, but the requested level implies {implied}.\n\
              bump refuses to name two versions: either drop the -m/-M flag to keep {riding}, or reset the branch's \
              bump commit and re-run for {implied}."
+        ),
+        ReleaseState::GatedBadBranchName { branch, slug } => bail!(
+            "branch '{branch}' is not its own slug ('{slug}'): the PR title is built from the branch name and must \
+             slugify back to it.\n\
+             Run: git branch -m {slug}, then bump release"
         ),
         ReleaseState::GatedStranded {
             default,
@@ -543,15 +903,15 @@ fn execute<P: Pusher, I: Installer, R: Pr>(
     }
 }
 
-/// Fresh ungated release: version commit -> push branch -> confirm on origin -> tag ->
-/// push tag by name -> install. The confirm step is the strengthened-ordering guard.
-fn execute_release<P: Pusher, I: Installer, R: Pr>(
+/// Fresh ungated release: version commit -> push branch -> confirm on origin -> CI gate
+/// -> re-verify -> tag the verified sha -> re-verify -> push tag by name -> install.
+fn execute_release<P: Pusher, I: Installer, R: Pr, C: Ci>(
     dir: &Path,
     opts: &ReleaseOpts,
     config: &Config,
     target_tag: &str,
     default: &str,
-    ports: &Ports<P, I, R>,
+    ports: &Ports<P, I, R, C>,
 ) -> Result<ReleaseReport> {
     debug!(
         "execute_release: dir={} target_tag={} default={} dry_run={}",
@@ -564,180 +924,223 @@ fn execute_release<P: Pusher, I: Installer, R: Pr>(
     if opts.dry_run {
         let install_command = resolve_install(dir, &opts.install, config);
         println!("[dry-run] bump --no-tag  (commit the version bump for {target_tag})");
-        println!("[dry-run] git push origin {default}");
+        println!("[dry-run] git push --no-follow-tags origin {default}");
         println!("[dry-run] (confirm HEAD is on origin/{default} before tagging)");
-        println!("[dry-run] git tag -a {target_tag} -m \"Release {target_tag}\"");
-        println!("[dry-run] git push origin {target_tag}");
+        echo_tag_steps(target_tag, default, &ci_gate(opts.ci_gate, opts.ci_timeout), false);
         echo_install(&install_command);
         return Ok(ReleaseReport {
-            tag: target_tag.to_string(),
-            resumed: false,
-            paused: false,
             install_command,
             dry_run: true,
+            ..ReleaseReport::new(target_tag)
         });
     }
 
     // 1. The version commit is the existing `--no-tag` code path (version bump + commit,
     //    no tag). Reused verbatim -- release never re-implements commit/version logic.
-    version_commit(dir, opts.bump_type)?;
+    version_commit(dir, opts.bump_type.unwrap_or_default())?;
     // 2. Push the branch FIRST.
     ports.pusher.push_branch(dir, default)?;
     // 3. Confirm it landed on origin BEFORE any tag exists (a rejected push errored above
     //    and we never reach here; a push that reported success but didn't land is caught).
     confirm_on_origin(dir, default)?;
-    // 4. Only now create the annotated tag, on the sha `confirm_on_origin` just
-    //    confirmed IS origin/<default>'s tip -- never implicit HEAD.
-    let message = format!("Release {target_tag}");
-    git::create_tag(dir, target_tag, &message, &git::head_sha(dir)?)?;
-    // 5. Push the tag BY EXPLICIT NAME.
-    ports.pusher.push_tag(dir, target_tag)?;
+    // 4. CI gate, re-verify, tag the verified sha, re-verify, push the tag by name.
+    let version = version::parse_version(target_tag)?;
+    let target = TagTarget {
+        tag: target_tag,
+        version: &version,
+        default,
+        rerun: "bump release",
+    };
+    let gate = ci_gate(opts.ci_gate, opts.ci_timeout);
+    gate_tag_and_push(dir, gate, &target, git::head_sha(dir)?, ports.pusher, ports.ci)?;
     println!("Released {target_tag} on {default}");
     let install_command = run_install(dir, &opts.install, config, ports.installer)?;
     Ok(ReleaseReport {
-        tag: target_tag.to_string(),
-        resumed: false,
-        paused: false,
         install_command,
-        dry_run: false,
+        ..ReleaseReport::new(target_tag)
     })
 }
 
-/// Partial-release RESUME: never re-bump, never claim "already released". Create the
-/// annotated tag only if it is absent locally, then push it by name and install.
-fn execute_resume<P: Pusher, I: Installer, R: Pr>(
+/// A pending version on the ungated default branch: never re-bump. `ahead` pushes the
+/// commits on top of it first (a fix after red CI, or an unpushed version commit); `!ahead`
+/// is RESUME. Both then run the CI gate and tag the verified sha (a local tag already at
+/// that sha is pushed, not re-created).
+#[allow(clippy::too_many_arguments)]
+fn execute_pending<P: Pusher, I: Installer, R: Pr, C: Ci>(
     dir: &Path,
     opts: &ReleaseOpts,
     config: &Config,
     tag: &str,
+    version: &Version,
     default: &str,
-    local_tag_present: bool,
-    ports: &Ports<P, I, R>,
+    ahead: bool,
+    ports: &Ports<P, I, R, C>,
 ) -> Result<ReleaseReport> {
     debug!(
-        "execute_resume: dir={} tag={} default={} local_tag_present={} dry_run={}",
+        "execute_pending: dir={} tag={} default={} ahead={} dry_run={}",
         dir.display(),
         tag,
         default,
-        local_tag_present,
+        ahead,
         opts.dry_run
     );
+    let local_tag_present = git::tag_exists(dir, tag)?;
 
     if opts.dry_run {
         let install_command = resolve_install(dir, &opts.install, config);
-        if local_tag_present {
-            println!("[dry-run] git push origin {tag}  (local tag already present)");
-        } else {
-            println!("[dry-run] git tag -a {tag} -m \"Release {tag}\"");
-            println!("[dry-run] git push origin {tag}");
+        println!("[dry-run] (pending version {tag}: no version commit, no re-bump)");
+        if ahead {
+            println!("[dry-run] git push --no-follow-tags origin {default}");
         }
+        println!("[dry-run] (confirm HEAD is on origin/{default} before tagging)");
+        echo_tag_steps(tag, default, &ci_gate(opts.ci_gate, opts.ci_timeout), local_tag_present);
         echo_install(&install_command);
         return Ok(ReleaseReport {
-            tag: tag.to_string(),
-            resumed: true,
-            paused: false,
+            resumed: !ahead,
             install_command,
             dry_run: true,
+            ..ReleaseReport::new(tag)
         });
     }
 
-    if !local_tag_present {
-        let message = format!("Release {tag}");
-        git::create_tag(dir, tag, &message, &git::head_sha(dir)?)?;
+    if ahead {
+        ports.pusher.push_branch(dir, default)?;
     }
-    // The version is already on origin (that is what makes this a resume), but confirm
-    // before pushing the tag so the invariant holds on this path too.
     confirm_on_origin(dir, default)?;
-    ports.pusher.push_tag(dir, tag)?;
-    println!("Resumed release: pushed {tag} on {default}");
+    let target = TagTarget {
+        tag,
+        version,
+        default,
+        rerun: "bump release",
+    };
+    let gate = ci_gate(opts.ci_gate, opts.ci_timeout);
+    gate_tag_and_push(dir, gate, &target, git::head_sha(dir)?, ports.pusher, ports.ci)?;
+    if ahead {
+        println!("Released pending {tag} on {default}");
+    } else {
+        println!("Resumed release: pushed {tag} on {default}");
+    }
     let install_command = run_install(dir, &opts.install, config, ports.installer)?;
     Ok(ReleaseReport {
-        tag: tag.to_string(),
-        resumed: true,
-        paused: false,
+        resumed: !ahead,
         install_command,
-        dry_run: false,
+        ..ReleaseReport::new(tag)
     })
 }
 
-/// The GATED release flow: on a feature branch, ride the version bump on the branch (fresh
-/// only), push the branch with `--no-follow-tags -u`, ensure an OPEN PR exists (list-probe
-/// then create), and PAUSE (exit 0) for the human to merge. NO tag is created or pushed
-/// here -- tagging the merged commit is `bump finish`'s job (Phase 7).
-///
-/// `fresh_target` is `Some(target_tag)` for a fresh release (do the `--no-tag` bump) and
-/// `None` for an idempotent re-run (the bump already rode the branch -- never re-bump).
-/// `report_tag` is the tag reported (fresh target, or the riding version's tag); it is
-/// informational and NEVER created.
-fn execute_gated<P: Pusher, I: Installer, R: Pr>(
+/// How the gated flow's version commit is made.
+#[derive(Debug)]
+enum VersionCommit {
+    /// Bump by level through the existing `--no-tag` path (fresh release).
+    Level(BumpType),
+    /// Set this exact version (the inherited-pending row bumps from the manifest version,
+    /// which `determine_version_action` would refuse as a tag mismatch).
+    To(Version),
+    /// The branch already carries its own bump: no version commit.
+    AlreadyRiding,
+}
+
+/// Everything `execute_gated` needs for one run.
+struct GatedPlan {
+    branch: String,
+    default: String,
+    commit: VersionCommit,
+    tag: String,
+    notice: Option<String>,
+}
+
+/// The GATED release flow: on a feature branch, make the version commit (unless the
+/// branch already carries its own bump), push the branch with `--no-follow-tags -u`,
+/// ensure an OPEN PR exists (list-probe, then create with the derived title and body), and
+/// PAUSE (exit 0) for the human to merge. NO tag is created or pushed here -- tagging the
+/// merged commit is `bump finish`'s job.
+fn execute_gated<P: Pusher, I: Installer, R: Pr, C: Ci>(
     dir: &Path,
     opts: &ReleaseOpts,
-    branch: &str,
-    fresh_target: Option<&str>,
-    report_tag: &str,
-    ports: &Ports<P, I, R>,
+    plan: GatedPlan,
+    ports: &Ports<P, I, R, C>,
 ) -> Result<ReleaseReport> {
+    let GatedPlan {
+        branch,
+        default,
+        commit,
+        tag,
+        notice,
+    } = plan;
     debug!(
-        "execute_gated: dir={} branch={} fresh_target={:?} report_tag={} dry_run={}",
+        "execute_gated: dir={} branch={} default={} commit={:?} tag={} dry_run={}",
         dir.display(),
         branch,
-        fresh_target,
-        report_tag,
+        default,
+        commit,
+        tag,
         opts.dry_run
     );
+    let base_ref = format!("origin/{default}");
 
     if opts.dry_run {
-        match fresh_target {
-            Some(target) => {
-                println!("[dry-run] bump --no-tag  (commit the version bump for {target} on {branch})");
+        match &commit {
+            VersionCommit::Level(_) | VersionCommit::To(_) => {
+                println!("[dry-run] commit the version bump for {tag} on {branch} (a new commit, never an amend)");
             }
-            None => {
+            VersionCommit::AlreadyRiding => {
                 println!("[dry-run] (version already bumped on {branch}; no re-bump)");
             }
         }
+        let title = pr_title(&branch, &git::commit_subjects(dir, &base_ref)?);
         println!("[dry-run] git push --no-follow-tags -u origin {branch}");
         println!("[dry-run] gh pr list --head {branch} --state open --json number  (open-PR probe)");
-        println!("[dry-run] gh pr create --fill  (only if no open PR)");
+        println!(
+            "[dry-run] gh pr create --head {branch} --base {default} --title \"{title}\" --body \"<subjects>\\n\\nRelease: rides this PR ({tag})\"  (only if no open PR)"
+        );
+        if let Some(notice) = &notice {
+            println!("[dry-run] {notice}");
+        }
         println!("[dry-run] {GATED_PAUSE_MESSAGE}");
         return Ok(ReleaseReport {
-            tag: report_tag.to_string(),
-            resumed: false,
             paused: true,
-            install_command: None,
             dry_run: true,
+            notice,
+            ..ReleaseReport::new(&tag)
         });
     }
 
-    // 1. Fresh: ride the version bump on the branch via the existing `--no-tag` path (no
-    //    tag). Idempotent re-run: skip -- the bump already rode the branch.
-    if let Some(target) = fresh_target {
-        debug!("execute_gated: fresh bump for {target}");
-        version_commit(dir, opts.bump_type)?;
-    } else {
-        debug!("execute_gated: version already bumped on {branch}; skipping re-bump");
+    // 1. The version commit: always a NEW commit, never an amend (`never_amend`).
+    match &commit {
+        VersionCommit::Level(level) => version_commit(dir, *level)?,
+        VersionCommit::To(target) => version_commit_to(dir, target)?,
+        VersionCommit::AlreadyRiding => debug!("execute_gated: version already bumped on {branch}; skipping re-bump"),
     }
 
     // 2. Push the feature branch with `--no-follow-tags -u` (a stray local tag must not
     //    ride; tagging is `bump finish`'s job on the merged commit).
-    ports.pusher.push_feature_branch(dir, branch)?;
+    ports.pusher.push_feature_branch(dir, &branch)?;
 
     // 3. Ensure an OPEN PR exists: the list-probe FIRST (exit-0 in all cases, reused
-    //    branch names read correctly), create ONLY if none is open.
-    if ports.pr.open_pr_exists(dir, branch)? {
+    //    branch names read correctly), create ONLY if none is open, with the title and
+    //    body built from the branch and its commits.
+    let pr_url = if ports.pr.open_pr_exists(dir, &branch)? {
         println!("open PR already exists for {branch}; not creating another");
+        None
     } else {
-        ports.pr.create_pr(dir, branch)?;
-        println!("opened a PR for {branch}");
-    }
+        let subjects = git::commit_subjects(dir, &base_ref)?;
+        let title = pr_title(&branch, &subjects);
+        let body = pr_body(&subjects, &tag);
+        let url = ports.pr.create_pr(dir, &branch, &default, &title, &body)?;
+        println!("opened PR: {url}");
+        Some(url)
+    };
 
     // 4. PAUSE. No tag, no install -- both are `bump finish`'s after the merge.
+    if let Some(notice) = &notice {
+        println!("{notice}");
+    }
     println!("{GATED_PAUSE_MESSAGE}");
     Ok(ReleaseReport {
-        tag: report_tag.to_string(),
-        resumed: false,
         paused: true,
-        install_command: None,
-        dry_run: false,
+        pr_url,
+        notice,
+        ..ReleaseReport::new(&tag)
     })
 }
 
@@ -767,6 +1170,29 @@ fn version_commit(dir: &Path, bump_type: BumpType) -> Result<()> {
     process_directory(dir, &cli, bump_type)
 }
 
+/// The version commit to an EXACT version, for the inherited-pending row: the manifest
+/// is already above the latest tag, which `process_directory`'s `determine_version_action`
+/// refuses as a mismatch. Same manifest validation and lockstep write as `process_directory`,
+/// then a new commit (the tree is clean at classification, so only version files stage).
+fn version_commit_to(dir: &Path, target: &Version) -> Result<()> {
+    debug!("version_commit_to: dir={} target={}", dir.display(), target);
+    let config = config::load(dir)?;
+    let skip_members = config::effective_skip_members(&[], &config);
+    let manifests = lang::detect(dir)?;
+    for m in &manifests {
+        m.validate(&skip_members)?;
+    }
+    let tag = version::format_tag(target);
+    lang::write_all(&manifests, target)?;
+    git::stage_all(dir)?;
+    git::commit(dir, &format!("Bump version to {tag}"))?;
+    println!(
+        "Committed version bump to {} (no tag)",
+        version::format_file_version(target)
+    );
+    Ok(())
+}
+
 /// The strengthened-ordering guard: re-fetch and require HEAD == origin/<default> before
 /// any tag is created. If the branch push did not land, refuse loudly with no tag.
 fn confirm_on_origin(dir: &Path, default: &str) -> Result<()> {
@@ -781,27 +1207,253 @@ fn confirm_on_origin(dir: &Path, default: &str) -> Result<()> {
     }
 }
 
+fn ci_gate(enabled: bool, timeout: Duration) -> CiGate {
+    CiGate { enabled, timeout }
+}
+
+/// The manifest version committed at `sha`, parsed.
+fn version_at(dir: &Path, sha: &str) -> Result<Option<Version>> {
+    Ok(git::manifest_version_at(dir, sha)?.and_then(|v| version::parse_version(&v).ok()))
+}
+
+/// Human form of a manifest version read for a refusal message.
+fn describe_version(version: &Option<Version>) -> String {
+    version
+        .as_ref()
+        .map(version::format_file_version)
+        .unwrap_or_else(|| "no version".to_string())
+}
+
+/// The ONLY place a release tag is created and pushed. Starting from `start_sha`:
+/// 1. `wait_for_green` on the sha;
+/// 2. fetch origin/<default> fresh: the sha must EQUAL its tip. A tip that moved and still
+///    carries the tag's version restarts the gate on the new tip; a different version
+///    refuses with no tag;
+/// 3. the manifest at the sha must carry the tag's version;
+/// 4. create the annotated tag ON THAT SHA (a local tag already there is kept);
+/// 5. fetch fresh again: the sha must still equal the tip, else refuse and leave the local
+///    tag for the local-tag resume row;
+/// 6. push the tag by name.
+///
+/// Returns the sha that was tagged.
+fn gate_tag_and_push<P: Pusher, C: Ci>(
+    dir: &Path,
+    gate: CiGate,
+    target: &TagTarget,
+    start_sha: String,
+    pusher: &P,
+    ci: &C,
+) -> Result<String> {
+    let TagTarget {
+        tag,
+        version,
+        default,
+        rerun,
+    } = *target;
+    debug!(
+        "gate_tag_and_push: dir={} tag={} default={} start_sha={}",
+        dir.display(),
+        tag,
+        default,
+        start_sha
+    );
+
+    let mut sha = start_sha;
+    loop {
+        wait_for_green(dir, &sha, gate, ci, target)?;
+        let tip = git::remote_tip(dir, default)?;
+        if tip == sha {
+            break;
+        }
+        let at_tip = version_at(dir, &tip)?;
+        if at_tip.as_ref() != Some(version) {
+            bail!(
+                "origin/{default} moved from {sha} to {tip} during the CI wait, and the manifest there carries {}, \
+                 not {tag}. NO tag was created.\n\
+                 Run: git pull --ff-only origin {default}, then {rerun}",
+                describe_version(&at_tip)
+            );
+        }
+        println!(
+            "origin/{default} moved to {tip} during the CI wait and still carries {tag}; re-running the CI gate on the new tip"
+        );
+        sha = tip;
+    }
+
+    let at_sha = version_at(dir, &sha)?;
+    if at_sha.as_ref() != Some(version) {
+        bail!(
+            "the manifest at {sha} carries {}, not {tag}; NO tag was created.",
+            describe_version(&at_sha)
+        );
+    }
+
+    if git::tag_exists(dir, tag)? {
+        let at = git::tag_sha(dir, tag)?;
+        if at != sha {
+            bail!(
+                "tag {tag} exists locally at {at}, but the verified tip of origin/{default} is {sha}; NO tag was pushed.\n\
+                 Run: git tag -d {tag}, then {rerun}"
+            );
+        }
+        debug!("gate_tag_and_push: local {tag} already at {sha}; pushing it");
+    } else {
+        git::create_tag(dir, tag, &format!("Release {tag}"), &sha)?;
+    }
+
+    let tip = git::remote_tip(dir, default)?;
+    if tip != sha {
+        bail!(
+            "origin/{default} moved from {sha} to {tip} between creating {tag} and pushing it; {tag} was NOT pushed \
+             and stays local at {sha}.\n\
+             Run: {rerun} (it re-runs the CI gate on the tip; if origin/{default} no longer carries {sha}, \
+             run git tag -d {tag} first)"
+        );
+    }
+    pusher.push_tag(dir, tag)?;
+    if sha != git::head_sha(dir)? {
+        println!(
+            "tagged {sha}, the tip of origin/{default}; local HEAD is behind it: git pull --ff-only origin {default}"
+        );
+    }
+    Ok(sha)
+}
+
+/// The CI gate (design doc, API Design "CI gate"): poll check runs + legacy statuses for
+/// `sha` until every run completed green (proceed) or anything is red, truncated, errored,
+/// or timed out (refuse, no tag). Zero runs and zero statuses after the appear window are
+/// decided by the sha's `.github/workflows` tree. A committed `ci: none` in `bump.yml` at
+/// the sha, a repo with no GitHub remote, or `--no-ci-gate` skip the gate with a notice.
+fn wait_for_green<C: Ci>(dir: &Path, sha: &str, gate: CiGate, ci: &C, target: &TagTarget) -> Result<()> {
+    debug!(
+        "wait_for_green: dir={} sha={} enabled={} timeout={:?}",
+        dir.display(),
+        sha,
+        gate.enabled,
+        gate.timeout
+    );
+    let TagTarget { tag, rerun, .. } = *target;
+    if !gate.enabled {
+        println!("CI gate: SKIPPED (--no-ci-gate); {tag} is tagged without waiting for CI on {sha}");
+        return Ok(());
+    }
+    if config::load_at(dir, sha)?.ci == Some(CiDeclaration::None) {
+        println!("CI gate: skipped, bump.yml at {sha} declares `ci: none` (this repo's workflows never run on push)");
+        return Ok(());
+    }
+
+    let start = Instant::now();
+    let mut announced = false;
+    loop {
+        let runs = ci
+            .check_runs(dir, sha)
+            .wrap_err_with(|| format!("CI gate: could not read CI for {sha}; NO tag was created (fails closed)"))?;
+        let Some(runs) = runs else {
+            println!("CI gate: no GitHub remote, nothing to wait on");
+            return Ok(());
+        };
+        debug!("wait_for_green: sha={sha} runs={runs:?}");
+
+        if !runs.failed.is_empty() || runs.statuses == StatusState::Failure {
+            let mut lines = String::new();
+            for (name, url) in &runs.failed {
+                lines.push_str(&format!("  FAILED  {name}  {url}\n"));
+            }
+            if runs.statuses == StatusState::Failure {
+                lines.push_str("  FAILED  combined commit status (failure/error)\n");
+            }
+            bail!(
+                "CI is RED on {sha}:\n{lines}NO tag was created. Fix it, commit, and re-run {rerun}: \
+                 the re-run reuses {tag}, it never bumps past it."
+            );
+        }
+
+        let no_ci_reported = runs.total == 0 && runs.statuses == StatusState::None;
+        if no_ci_reported {
+            if start.elapsed() >= ci.appear_window() {
+                let window = ci.appear_window().as_secs();
+                if git::has_workflows_at(dir, sha)? {
+                    bail!(
+                        "CI never registered on {sha} after {window}s; re-run when it has. If this repo's workflows \
+                         never run on push, declare `ci: none` in bump.yml (committed, reviewed) and re-run."
+                    );
+                }
+                println!(
+                    "CI gate: no check runs or statuses on {sha} after {window}s, and the repo has no workflows at that sha; proceeding"
+                );
+                return Ok(());
+            }
+        } else if runs.incomplete == 0 && runs.statuses != StatusState::Pending {
+            println!("CI gate: green ({} check run(s)) on {sha}", runs.total);
+            return Ok(());
+        } else if start.elapsed() >= gate.timeout {
+            bail!(
+                "CI gate: timed out after {}s with {} check run(s) incomplete{} on {sha}. NO tag was created.\n\
+                 Re-run {rerun} when they finish (it reuses {tag}).",
+                gate.timeout.as_secs(),
+                runs.incomplete,
+                if runs.statuses == StatusState::Pending {
+                    " and the commit status pending"
+                } else {
+                    ""
+                }
+            );
+        }
+
+        if !announced {
+            println!("CI gate: waiting on CI for {sha} (no tag exists yet)");
+            announced = true;
+        }
+        thread::sleep(ci.poll_interval());
+    }
+}
+
+/// Echo the CI gate + tag steps for `-n` dry-run.
+fn echo_tag_steps(tag: &str, default: &str, gate: &CiGate, local_tag_present: bool) {
+    if gate.enabled {
+        println!(
+            "[dry-run] wait for green CI on the sha (check-runs + commit status every {}s, up to {}s)",
+            CI_POLL_INTERVAL.as_secs(),
+            gate.timeout.as_secs()
+        );
+    } else {
+        println!("[dry-run] CI gate: SKIPPED (--no-ci-gate)");
+    }
+    println!("[dry-run] git fetch origin {default}  (the sha must equal origin/{default} and carry {tag})");
+    if local_tag_present {
+        println!("[dry-run] (local tag {tag} already present at the sha)");
+    } else {
+        println!("[dry-run] git tag -a {tag} <sha> -m \"Release {tag}\"");
+    }
+    println!("[dry-run] git fetch origin {default}  (re-verify before the push)");
+    println!("[dry-run] git push origin {tag}");
+}
+
 /// `bump finish`: the gated post-merge tag step the paused `bump release` points to. After
 /// the PR merges, finish checks out the default branch, fast-forwards to the merged tip,
 /// then -- reusing `crate::tag_ladder` (the SAME `--tag-only` verification ladder, never a
-/// duplicate) -- either tags the merged commit and pushes it BY NAME, resumes a local-only
-/// tag, no-ops an already-released tag, or refuses (missed bump / gated generic / dirty).
+/// duplicate) -- either runs the CI gate and tags the merged commit (pushing it BY NAME),
+/// resumes a local-only tag through the same gate, no-ops an already-released tag, or
+/// refuses (missed bump / gated generic / dirty).
 ///
 /// The DIFFERENCE from `bump --tag-only`: `--tag-only` only PRINTS the push command; finish
 /// EXECUTES the tag push via the `Pusher` port (by explicit name) and then runs install,
 /// and it does the checkout + `pull --ff-only` up front. NO tag is ever created on an
-/// unconfirmed commit -- the shared ladder requires HEAD == origin/<default>.
-pub fn finish<P: Pusher, I: Installer>(
+/// unconfirmed commit -- `gate_tag_and_push` requires green CI and sha == origin/<default>.
+pub fn finish<P: Pusher, I: Installer, C: Ci>(
     dir: &Path,
     opts: &FinishOpts,
     pusher: &P,
     installer: &I,
+    ci: &C,
 ) -> Result<ReleaseReport> {
     debug!(
-        "finish: dir={} dry_run={} install={:?}",
+        "finish: dir={} dry_run={} install={:?} ci_gate={} ci_timeout={:?}",
         dir.display(),
         opts.dry_run,
-        opts.install
+        opts.install,
+        opts.ci_gate,
+        opts.ci_timeout
     );
     let config = config::load(dir)?;
 
@@ -851,35 +1503,31 @@ pub fn finish<P: Pusher, I: Installer>(
     debug!("finish: tag={} state={:?}", tag, check.state);
 
     match check.state {
-        // Local-only tag at the merged commit: a prior run died before/during the tag push.
-        // RESUME -- push by name + install. A local-only tag is NOT released; NEVER report
-        // it as already released.
-        TagState::LocalAtHead => {
-            pusher.push_tag(dir, &tag)?;
-            println!("resumed release: pushed {tag} on {default}");
+        // Local-only tag at the merged commit (a prior run died before/during the tag
+        // push: RESUME, never "already released"), or no tag yet for the merged version.
+        // Both run the CI gate on the merged sha, then tag it (a local tag already there
+        // is kept) and push by name.
+        TagState::LocalAtHead | TagState::Absent => {
+            let resumed = matches!(check.state, TagState::LocalAtHead);
+            let version = version::parse_version(&tag)?;
+            let target = TagTarget {
+                tag: &tag,
+                version: &version,
+                default: &default,
+                rerun: "bump finish",
+            };
+            let gate = ci_gate(opts.ci_gate, opts.ci_timeout);
+            gate_tag_and_push(dir, gate, &target, check.head.clone(), pusher, ci)?;
+            if resumed {
+                println!("resumed release: pushed {tag} on {default}");
+            } else {
+                println!("released {tag} on {default}");
+            }
             let install_command = run_install(dir, &opts.install, &config, installer)?;
             Ok(ReleaseReport {
-                tag,
-                resumed: true,
-                paused: false,
+                resumed,
                 install_command,
-                dry_run: false,
-            })
-        }
-        // origin/<default> carries an untagged version (the merged bump): tag the merged
-        // commit, push by name, install.
-        TagState::Absent => {
-            let message = format!("Release {tag}");
-            git::create_tag(dir, &tag, &message, &git::head_sha(dir)?)?;
-            pusher.push_tag(dir, &tag)?;
-            println!("released {tag} on {default}");
-            let install_command = run_install(dir, &opts.install, &config, installer)?;
-            Ok(ReleaseReport {
-                tag,
-                resumed: false,
-                paused: false,
-                install_command,
-                dry_run: false,
+                ..ReleaseReport::new(&tag)
             })
         }
         // The tag exists on the REMOTE. `remote_tag_sha` (behind the ladder) returns the
@@ -890,13 +1538,7 @@ pub fn finish<P: Pusher, I: Installer>(
         TagState::RemoteAtHead | TagState::RemoteAtOther(_) => match git::remote_tag_commit(dir, &tag)? {
             Some(commit) if commit == check.head => {
                 println!("already released {tag}");
-                Ok(ReleaseReport {
-                    tag,
-                    resumed: false,
-                    paused: false,
-                    install_command: None,
-                    dry_run: false,
-                })
+                Ok(ReleaseReport::new(&tag))
             }
             _ => missed_bump(&default),
         },
@@ -932,15 +1574,13 @@ fn finish_dry_run(
     println!("[dry-run] git checkout {default}");
     println!("[dry-run] git pull --ff-only origin {default}");
     println!("[dry-run] (tag-only ladder: require HEAD == origin/{default} before tagging)");
-    println!("[dry-run] git tag -a {tag} -m \"Release {tag}\"  (only if the merged version is untagged)");
-    println!("[dry-run] git push origin {tag}");
+    println!("[dry-run] (only if the merged version is untagged:)");
+    echo_tag_steps(&tag, default, &ci_gate(opts.ci_gate, opts.ci_timeout), false);
     echo_install(&install_command);
     Ok(ReleaseReport {
-        tag,
-        resumed: false,
-        paused: false,
         install_command,
         dry_run: true,
+        ..ReleaseReport::new(&tag)
     })
 }
 

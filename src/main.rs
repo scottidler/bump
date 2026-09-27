@@ -17,7 +17,7 @@ mod version;
 
 // The `bump release`/`bump finish` state machines, wired to the `bump release` / `bump
 // finish` clap subcommands below. Every port's production impl (`GitPusher`, `ShellInstaller`,
-// `GhPr`) is reached from `dispatch_release`/`dispatch_finish`.
+// `GhPr`, `GhCi`) is reached from `dispatch_release`/`dispatch_finish`.
 mod release;
 
 /// Serialize env-var-mutating tests (`BUMP_GATES_PROBE`) across ALL test modules in
@@ -861,7 +861,7 @@ fn main() -> Result<()> {
 }
 
 /// Dispatch `bump release` / `bump finish` to the `release` module's state machines,
-/// wired to their PRODUCTION ports (`GitPusher`, `ShellInstaller`, `GhPr`). Both verbs
+/// wired to their PRODUCTION ports (`GitPusher`, `ShellInstaller`, `GhPr`, `GhCi`). Both verbs
 /// operate on the current directory (the design doc's API contract takes no directory
 /// argument -- callers `cd` into the repo, matching the bash driver they replace).
 fn dispatch_command(command: &cli::Commands) -> Result<()> {
@@ -888,10 +888,14 @@ fn install_choice(install: &Option<String>, no_install: bool) -> release::Instal
 /// production ports. Every refusal maps to a nonzero exit, exactly like `process_directory`
 /// errors do today; the gated happy-path pause and any no-op-shaped success exit 0.
 fn dispatch_release(dir: &Path, args: &cli::ReleaseArgs) -> Result<()> {
+    // No level flag is `None`: the verb takes a pending version, else patches.
+    let bump_type = (args.major || args.minor).then(|| BumpType::from_cli(args.major, args.minor));
     let opts = release::ReleaseOpts {
-        bump_type: BumpType::from_cli(args.major, args.minor),
+        bump_type,
         dry_run: args.dry_run,
         install: install_choice(&args.install, args.no_install),
+        ci_gate: true,
+        ci_timeout: release::DEFAULT_CI_TIMEOUT,
     };
     debug!("dispatch_release: dir={} opts={:?}", dir.display(), opts);
     if let Err(e) = release::release(
@@ -900,6 +904,7 @@ fn dispatch_release(dir: &Path, args: &cli::ReleaseArgs) -> Result<()> {
         &release::GitPusher,
         &release::ShellInstaller,
         &release::GhPr,
+        &release::GhCi,
     ) {
         eprintln!("Error: {:#}", e);
         std::process::exit(1);
@@ -913,9 +918,17 @@ fn dispatch_finish(dir: &Path, args: &cli::FinishArgs) -> Result<()> {
     let opts = release::FinishOpts {
         dry_run: args.dry_run,
         install: install_choice(&args.install, args.no_install),
+        ci_gate: true,
+        ci_timeout: release::DEFAULT_CI_TIMEOUT,
     };
     debug!("dispatch_finish: dir={} opts={:?}", dir.display(), opts);
-    if let Err(e) = release::finish(dir, &opts, &release::GitPusher, &release::ShellInstaller) {
+    if let Err(e) = release::finish(
+        dir,
+        &opts,
+        &release::GitPusher,
+        &release::ShellInstaller,
+        &release::GhCi,
+    ) {
         eprintln!("Error: {:#}", e);
         std::process::exit(1);
     }

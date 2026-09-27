@@ -138,3 +138,52 @@ fn effective_skip_members_empty_when_both_absent() {
 
     assert!(effective.is_empty());
 }
+
+fn git(dir: &std::path::Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn repo_with_commit() -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    let d = tmp.path();
+    git(d, &["init", "-b", "main"]);
+    git(d, &["config", "user.email", "test@test.com"]);
+    git(d, &["config", "user.name", "Test"]);
+    fs::write(d.join("README.md"), "x").unwrap();
+    git(d, &["add", "-A"]);
+    git(d, &["commit", "-m", "init"]);
+    tmp
+}
+
+/// `load_at` reads the COMMITTED `bump.yml`; an untracked one on disk does not count.
+#[test]
+fn load_at_reads_committed_config_never_untracked() {
+    let tmp = repo_with_commit();
+    let d = tmp.path();
+    fs::write(d.join(CONFIG_FILE_NAME), "ci: none\n").unwrap();
+    assert_eq!(load_at(d, "HEAD").unwrap().ci, None, "untracked bump.yml is ignored");
+
+    git(d, &["add", "-A"]);
+    git(d, &["commit", "-m", "declare ci none"]);
+    assert_eq!(load_at(d, "HEAD").unwrap().ci, Some(CiDeclaration::None));
+}
+
+#[test]
+fn load_at_bad_committed_value_is_a_loud_error() {
+    let tmp = repo_with_commit();
+    let d = tmp.path();
+    fs::write(d.join(CONFIG_FILE_NAME), "ci: sometimes\n").unwrap();
+    git(d, &["add", "-A"]);
+    git(d, &["commit", "-m", "bad ci"]);
+    let err = load_at(d, "HEAD").unwrap_err().to_string();
+    assert!(err.contains("sometimes"), "got: {err}");
+}

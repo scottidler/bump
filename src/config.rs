@@ -10,6 +10,7 @@
 //! Facts only, never flows: the two release flows (gated | ungated) stay hard-coded in
 //! `src/release.rs` (later phases). This file carries `skip-members` and `install`.
 
+use crate::git;
 use eyre::{Context, Result};
 use log::{debug, info};
 use std::fs;
@@ -70,16 +71,33 @@ pub fn load(dir: &Path) -> Result<Config> {
     }
 
     let contents = fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let config = parse(&contents, &path.display().to_string())?;
+    info!("load: loaded config from {}", path.display());
+    Ok(config)
+}
+
+/// Load `bump.yml` as COMMITTED at `sha` (`git show <sha>:bump.yml`), never off the
+/// working tree. The CI gate reads `ci:` this way: the tracked-changes checks ignore
+/// untracked files, so a working-tree read would let an untracked `bump.yml` switch the
+/// gate off. Absent at `sha` = `Config::default()`.
+pub fn load_at(dir: &Path, sha: &str) -> Result<Config> {
+    debug!("load_at: dir={} sha={}", dir.display(), sha);
+    match git::file_at(dir, sha, CONFIG_FILE_NAME)? {
+        Some(contents) => parse(&contents, &format!("{sha}:{CONFIG_FILE_NAME}")),
+        None => Ok(Config::default()),
+    }
+}
+
+/// Parse `bump.yml` content; `source` names where it came from in the error.
+fn parse(contents: &str, source: &str) -> Result<Config> {
     // Embed the serde_yaml error's own Display (which names the offending key for
     // deny_unknown_fields) directly in the top-level message rather than only in the
     // eyre chain, so callers reading `err.to_string()` see it without unwrapping a
     // Debug chain.
-    let config: Config =
-        serde_yaml::from_str(&contents).map_err(|e| eyre::eyre!("failed to parse {}: {e}", path.display()))?;
-    info!("load: loaded config from {}", path.display());
+    let config: Config = serde_yaml::from_str(contents).map_err(|e| eyre::eyre!("failed to parse {source}: {e}"))?;
     debug!(
-        "load: skip_members={:?} install={:?} ci={:?}",
-        config.skip_members, config.install, config.ci
+        "parse: source={} skip_members={:?} install={:?} ci={:?}",
+        source, config.skip_members, config.install, config.ci
     );
     Ok(config)
 }

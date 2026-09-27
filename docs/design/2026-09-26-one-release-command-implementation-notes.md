@@ -133,3 +133,99 @@ doc's Phase 0 bullets, not here.
 
 ### Open questions
 - None.
+
+## Phase 3: CI gate and PR by construction
+
+### Design decisions
+- `Ci` port + `GhCi` (`src/release.rs`); `Ports` gains `ci`; `release(dir, opts, pusher,
+  installer, pr, ci)` and `finish(dir, opts, pusher, installer, ci)` take it;
+  `main.rs::dispatch_release`/`dispatch_finish` pass `GhCi`. `github::check_runs` lost its
+  `#[allow(dead_code)]`, as did `git::remote_tip`, `git::manifest_version_at` and
+  `git::commit_subjects` (all now called). `changed_files`, `checkout_new_tracking` and
+  `worktree_for_branch` keep theirs: their callers are Phases 4-5.
+- Poll interval and appear window are methods on the `Ci` trait with the production
+  constants as defaults (`CI_POLL_INTERVAL` 15s, `CI_APPEAR_WINDOW` 120s). Every test double
+  overrides both to `Duration::ZERO` (the `zero_timing!` macro in `src/release/tests.rs`), so
+  a zero-runs read is decided on the first poll and nothing sleeps; the timeout tests set
+  `ReleaseOpts.ci_timeout` to zero. Elapsed time is still real `Instant` time in production.
+  The port owns them because both describe the remote CI system (sane GitHub poll rate, how
+  long GitHub takes to register a run), not the verb.
+- One function creates and pushes every release tag: `gate_tag_and_push`. It runs
+  `wait_for_green` on the sha, fetches `origin/<default>` fresh (`git::remote_tip`) and
+  requires EQUALITY, restarts the gate on a moved tip whose committed manifest still carries
+  the version (refuses on a different one, before any tag exists), checks the manifest at the
+  sha (`git::manifest_version_at`), creates the tag on that explicit sha (keeping a local tag
+  already there), fetches fresh again, and only then pushes. `execute_release`, the pending
+  rows, and both finish tag arms (`Absent`, `LocalAtHead`, now one match arm) all call it.
+- `wait_for_green`: `--no-ci-gate` skip -> committed `ci: none` skip (read with
+  `config::load_at(dir, sha)`, i.e. `git show <sha>:bump.yml`) -> poll loop. Red = any failed
+  run or `StatusState::Failure`; truncation and API errors come out of the port as `Err` and
+  are wrapped "NO tag was created (fails closed)"; zero runs + `StatusState::None` after the
+  appear window is decided by `git::has_workflows_at` (`git ls-tree <sha> .github/workflows`);
+  incomplete runs or `StatusState::Pending` wait up to `ci_timeout`. The refusal never names
+  `--no-ci-gate`.
+- Pending version (`pending_version` -> `PendingCheck`): exactly the Data Model definition,
+  classified after the behind/diverged refusal and before the ahead/equal split (ungated),
+  and before the own-bump / inherited / fresh split (gated). `compute_target_tag` only runs
+  on `NotPending`. `BelowLatest` refuses by name on either gate.
+- `ReleaseState::Resume` became `UngatedPending { tag, version, default, ahead }` (the local
+  tag at HEAD is detected inside `gate_tag_and_push` rather than carried as a flag). `ahead`
+  pushes first; `resumed == !ahead`. An explicit level implying a different version is
+  `UngatedLevelMismatch`. The named state landed here because the pending-version tests need
+  it; Phase 4's bullet for it is now satisfied.
+- Gated own bump = `git::version_line_changed(dir, "origin/<default>")`, a port of Gate D's
+  diff test (`is_version_diff_line` ports its regex). An inherited pending version is
+  `GatedInheritedPending` and commits `bump_version(manifest, level)` through the new
+  `version_commit_to` (validate manifests, `lang::write_all`, stage, commit "Bump version to
+  vX.Y.Z"), because `process_directory`'s `determine_version_action` refuses the
+  manifest-above-tag state by design.
+- `pr_title` / `pr_body` / `branch_slug` (the title guard's `title_slug`) are pure functions
+  in `release.rs`; `execute_gated` builds title and body from `git::commit_subjects` after the
+  version commit and calls `create_pr(dir, branch, default, title, body) -> url`
+  (`github::create_pr` now passes `--head --base --title --body`, never `--fill`). The body's
+  last line is `Release: rides this PR (vX.Y.Z)`. `GatedBadBranchName` is the Phase 3 slug
+  precondition, classified before any mutation.
+- Existing test fixture `setup_released` now pushes its tag. Under the pending-version
+  definition a local-only tag means "a prior run died before pushing it" (the local-tag
+  resume row), which is not what the fixture meant by "released".
+- Break-the-code proofs, run by hand: replacing the `wait_for_green` call in
+  `gate_tag_and_push` with a no-op makes `red_ci_leaves_no_tag_and_green_rerun_resumes_same_version`
+  panic at the `expect_err("red CI must refuse")`; setting `never_amend: false` in
+  `version_commit` makes `gated_pr_title_and_body_are_built_from_branch_and_commits` fail at
+  `HEAD~1` (`left: "init"`, `right: "feat(core): add thing"`). Both restored, suite green.
+- The force-move case of `tag_binds_to_verified_sha` uses a one-shot `reference-transaction`
+  hook in the test clone (`core.hooksPath` set locally) that rewinds the bare origin's `main`
+  the moment the local tag ref commits, so the production code path runs with no test seam.
+
+### Deviations
+- `ReleaseOpts` / `FinishOpts` gained `ci_gate` and `ci_timeout` now (the Data Model fields)
+  because `wait_for_green` needs them; production dispatch passes `true` and
+  `DEFAULT_CI_TIMEOUT` (1800s) until Phase 6 adds the `--no-ci-gate` / `--ci-timeout` flags.
+- `ReleaseReport` gained `notice: Option<String>` beyond the doc's field list, so the
+  success criterion "the pause output names the untagged v0.1.6" is asserted on data, not
+  scraped stdout. Same printed text.
+- The `Ci` trait carries `poll_interval` / `appear_window` default methods beyond the doc's
+  one-method signature (see Design decisions). Same effect, the injectable seam the tests need.
+- `finish` wiring of the gate (both tag arms) lands here per this phase's bullet; the Phase 5
+  test named `finish_red_ci_leaves_no_tag` is left to Phase 5. This phase's coverage is
+  `finish_gates_both_tag_arms_on_ci`.
+- `wait_for_green_honors_committed_ci_none_only` exercises the `ci: none` read directly; the
+  Phase 4 criterion test `zero_check_runs_refuses_with_workflows_and_proceeds_with_ci_none`
+  is not written here.
+
+### Tradeoffs
+- Timing on the port vs. a separate clock/sleeper port: one fewer generic parameter
+  threading through every execute function; real `Instant` time in production.
+- Poll-count-free loop keyed on `Instant::elapsed` vs. counting polls: honors the doc's
+  seconds semantics even when a `gh api` call is slow.
+- A gate restart on a moved tip tags a sha that is not local HEAD; the verb prints the
+  `git pull --ff-only` hint, and the install step still runs in the (now stale) working tree.
+  Pulling automatically would mutate the operator's checkout mid-release; not done.
+- `version_commit_to` duplicates the small write/stage/commit tail of `process_directory`
+  instead of teaching `process_directory` an explicit-target mode: the inherited row is the
+  only caller and `process_directory`'s version rules are shared with plain `bump`.
+
+### Open questions
+- `src/release.rs` is now 1638 lines and `src/release/tests.rs` 2068. Split (e.g. `ci.rs`
+  for the gate, `pr.rs` for title/body/slug) before Phase 4 adds the standalone rows, or
+  leave it?

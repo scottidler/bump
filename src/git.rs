@@ -371,8 +371,6 @@ pub fn fetch_branch(path: &Path, branch: &str) -> Result<()> {
 /// placement and the two re-verifies") calls this immediately before creating the tag
 /// and again immediately before pushing it, so both checks see origin as it is right
 /// now, never a stale local view.
-// Wired into the CI-gate re-verify starting in Phase 3.
-#[allow(dead_code)]
 pub fn remote_tip(path: &Path, branch: &str) -> Result<String> {
     debug!("remote_tip: path={} branch={}", path.display(), branch);
     fetch_branch(path, branch)?;
@@ -388,8 +386,6 @@ pub fn remote_tip(path: &Path, branch: &str) -> Result<String> {
 /// read) or when the manifest did not exist yet at `sha`; together with `remote_tip`
 /// this answers the release verb's re-verify question: does the sha that just became
 /// origin's tip still carry the pending version?
-// Wired into the CI-gate re-verify starting in Phase 3.
-#[allow(dead_code)]
 pub fn manifest_version_at(dir: &Path, sha: &str) -> Result<Option<String>> {
     debug!("manifest_version_at: dir={} sha={}", dir.display(), sha);
     let project_type = crate::lang::detect_project_type(dir);
@@ -397,25 +393,12 @@ pub fn manifest_version_at(dir: &Path, sha: &str) -> Result<Option<String>> {
         return Ok(None);
     }
     let manifest = crate::lang::version_file_name(project_type);
-    let spec = format!("{sha}:{manifest}");
-    let output = Command::new("git")
-        .args(["show", &spec])
-        .current_dir(dir)
-        .output()
-        .context("Failed to run git show")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        // The manifest simply didn't exist yet at this sha (e.g. a very early commit
-        // predating the manifest's own addition) -- not a version, not an error.
-        if stderr.contains("does not exist") || stderr.contains("exists on disk, but not in") {
-            debug!("manifest_version_at: {manifest} absent at {sha}");
-            return Ok(None);
-        }
-        bail!("git show {} failed: {}", spec, stderr.trim());
-    }
-
-    let content = String::from_utf8_lossy(&output.stdout).into_owned();
+    // The manifest simply didn't exist yet at this sha (e.g. a very early commit
+    // predating the manifest's own addition) -- not a version, not an error.
+    let Some(content) = file_at(dir, sha, manifest)? else {
+        debug!("manifest_version_at: {manifest} absent at {sha}");
+        return Ok(None);
+    };
     crate::lang::read_version_from_content(project_type, &content)
 }
 
@@ -633,8 +616,6 @@ pub fn pull_ff_only(path: &Path, branch: &str) -> Result<()> {
 /// Commit subjects on `base..HEAD`, oldest first (`git log --reverse --format=%s`). Used
 /// to derive a gated PR's title (the first subject) and body (one `- <subject>` line
 /// each).
-// Phase 1 lands this helper on its own; `pr_title`/`pr_body` call it starting in Phase 3.
-#[allow(dead_code)]
 pub fn commit_subjects(path: &Path, base: &str) -> Result<Vec<String>> {
     debug!("commit_subjects: path={} base={}", path.display(), base);
     let range = format!("{base}..HEAD");
@@ -652,6 +633,88 @@ pub fn commit_subjects(path: &Path, base: &str) -> Result<Vec<String>> {
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .collect())
+}
+
+/// The root manifests whose version line decides whether a branch carries its own bump
+/// (Gate D's pathspec, `git-release-guard.sh:565`).
+const VERSION_LINE_MANIFESTS: [&str; 3] = ["Cargo.toml", "pyproject.toml", "package.json"];
+
+/// Is this unified-diff line an added or removed `version =` / `"version":` line? The
+/// port of Gate D's `^[-+][[:space:]]*"?version"?[[:space:]]*[:=]`.
+pub fn is_version_diff_line(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix('+').or_else(|| line.strip_prefix('-')) else {
+        return false;
+    };
+    let rest = rest.trim_start();
+    let rest = rest.strip_prefix('"').unwrap_or(rest);
+    let Some(rest) = rest.strip_prefix("version") else {
+        return false;
+    };
+    let rest = rest.strip_prefix('"').unwrap_or(rest);
+    matches!(rest.trim_start().chars().next(), Some(':') | Some('='))
+}
+
+/// Does the branch change a version line in a root manifest relative to `base` (`git diff
+/// base...HEAD -- Cargo.toml pyproject.toml package.json`)? True means the branch bumped
+/// the version itself; a pending version with no such line was inherited from `base`.
+pub fn version_line_changed(path: &Path, base: &str) -> Result<bool> {
+    debug!("version_line_changed: path={} base={}", path.display(), base);
+    let range = format!("{base}...HEAD");
+    let output = Command::new("git")
+        .args(["diff", &range, "--"])
+        .args(VERSION_LINE_MANIFESTS)
+        .current_dir(path)
+        .output()
+        .context("Failed to run git diff")?;
+    if !output.status.success() {
+        bail!("git diff {} failed: {}", range, String::from_utf8_lossy(&output.stderr));
+    }
+    let changed = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(is_version_diff_line);
+    debug!("version_line_changed: changed={changed}");
+    Ok(changed)
+}
+
+/// The content of `file` at commit `sha` (`git show <sha>:<file>`), `None` when the file
+/// is not in that commit's tree. Reads the committed tree, never the working tree, so an
+/// untracked file can never stand in for a committed one.
+pub fn file_at(path: &Path, sha: &str, file: &str) -> Result<Option<String>> {
+    debug!("file_at: path={} sha={} file={}", path.display(), sha, file);
+    let spec = format!("{sha}:{file}");
+    let output = Command::new("git")
+        .args(["show", &spec])
+        .current_dir(path)
+        .output()
+        .context("Failed to run git show")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("does not exist") || stderr.contains("exists on disk, but not in") {
+            return Ok(None);
+        }
+        bail!("git show {} failed: {}", spec, stderr.trim());
+    }
+    Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()))
+}
+
+/// Does commit `sha` carry a `.github/workflows` tree (`git ls-tree <sha>
+/// .github/workflows` non-empty)? The CI gate's mechanical answer to "does this repo have
+/// CI at this sha" when no check run or status ever registers.
+pub fn has_workflows_at(path: &Path, sha: &str) -> Result<bool> {
+    debug!("has_workflows_at: path={} sha={}", path.display(), sha);
+    let output = Command::new("git")
+        .args(["ls-tree", sha, ".github/workflows"])
+        .current_dir(path)
+        .output()
+        .context("Failed to run git ls-tree")?;
+    if !output.status.success() {
+        bail!(
+            "git ls-tree {} .github/workflows failed: {}",
+            sha,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(!String::from_utf8_lossy(&output.stdout).trim().is_empty())
 }
 
 /// Paths changed on HEAD relative to `base` (`git diff --name-only base...HEAD`, the
@@ -1042,6 +1105,60 @@ mod tests {
         let (_origin, work) = bare_remote_and_clone();
         let head = head_sha(work.path()).unwrap();
         assert_eq!(manifest_version_at(work.path(), &head).unwrap(), None);
+    }
+
+    #[test]
+    fn is_version_diff_line_matches_gate_d() {
+        assert!(is_version_diff_line("+version = \"0.1.6\""));
+        assert!(is_version_diff_line("-version = \"0.1.5\""));
+        assert!(is_version_diff_line("+  \"version\": \"1.2.3\","));
+        assert!(is_version_diff_line("+version=\"1\""));
+        assert!(!is_version_diff_line(" version = \"0.1.5\""), "context line");
+        assert!(!is_version_diff_line("+serde = { version = \"1\" }"), "dependency line");
+        assert!(!is_version_diff_line("+versions = 2"), "not the version key");
+        assert!(!is_version_diff_line("+++ b/Cargo.toml"), "diff header");
+    }
+
+    #[test]
+    fn version_line_changed_tells_own_bump_from_work_only() {
+        let (_origin, work) = bare_remote_and_clone();
+        let w = work.path();
+        commit_cargo_version(w, "0.1.5");
+        git_in(w, &["push", "origin", "main"]);
+        git_in(w, &["checkout", "-b", "feature"]);
+        std::fs::write(w.join("work.txt"), "x").unwrap();
+        git_in(w, &["add", "-A"]);
+        git_in(w, &["commit", "-m", "work"]);
+        assert!(!version_line_changed(w, "origin/main").unwrap(), "work only");
+
+        commit_cargo_version(w, "0.1.6");
+        assert!(version_line_changed(w, "origin/main").unwrap(), "the branch's own bump");
+    }
+
+    #[test]
+    fn file_at_reads_committed_content_and_none_when_absent() {
+        let (_origin, work) = bare_remote_and_clone();
+        let w = work.path();
+        let head = head_sha(w).unwrap();
+        assert_eq!(file_at(w, &head, "README.md").unwrap().as_deref(), Some("# test"));
+        // An untracked file on disk is NOT in the commit's tree.
+        std::fs::write(w.join("bump.yml"), "ci: none\n").unwrap();
+        assert_eq!(file_at(w, &head, "bump.yml").unwrap(), None);
+        assert!(file_at(w, "no-such-rev", "README.md").is_err(), "a bad rev is an error");
+    }
+
+    #[test]
+    fn has_workflows_at_reads_the_tree_at_the_sha() {
+        let (_origin, work) = bare_remote_and_clone();
+        let w = work.path();
+        let before = head_sha(w).unwrap();
+        std::fs::create_dir_all(w.join(".github/workflows")).unwrap();
+        std::fs::write(w.join(".github/workflows/ci.yml"), "on: push\n").unwrap();
+        git_in(w, &["add", "-A"]);
+        git_in(w, &["commit", "-m", "ci"]);
+        let after = head_sha(w).unwrap();
+        assert!(!has_workflows_at(w, &before).unwrap());
+        assert!(has_workflows_at(w, &after).unwrap());
     }
 
     #[test]
