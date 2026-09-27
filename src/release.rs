@@ -33,20 +33,31 @@
 //! before the fresh/inherited split (gated); `compute_target_tag` never runs while one
 //! exists.
 
+mod ci;
+mod finish;
+mod pr;
+mod tag;
+
+pub use ci::{Ci, DEFAULT_CI_TIMEOUT, GhCi};
+pub use finish::finish;
+pub use pr::{GhPr, Pr};
+
 use crate::cli::Cli;
-use crate::config::{self, CiDeclaration, Config};
+use crate::config::{self, Config};
 use crate::git::{self, HeadRemote};
-use crate::github::{self, CheckRuns, Gate, StatusState};
+use crate::github::{self, Gate};
 use crate::lang::{self, Manifest, ManifestVersion, ProjectType};
 use crate::version::{self, BumpType};
-use crate::{DEFAULT_UNTOUCHED_VERSION, TagState, determine_version_action, process_directory, tag_ladder};
+use crate::{DEFAULT_UNTOUCHED_VERSION, determine_version_action, process_directory};
+use ci::ci_gate;
 use eyre::{Context, Result, bail};
 use log::debug;
+use pr::{branch_slug, pr_body, pr_title};
 use semver::Version;
 use std::path::Path;
 use std::process::Command;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tag::{TagTarget, echo_tag_steps, gate_tag_and_push};
 
 /// The default install command when none is configured and a Cargo manifest is present.
 const DEFAULT_INSTALL_COMMAND: &str = "cargo install --path .";
@@ -55,16 +66,6 @@ const DEFAULT_INSTALL_COMMAND: &str = "cargo install --path .";
 /// everything mechanical up to (and including) opening the PR, and now hands control back
 /// to the human/agent to merge and then run `bump finish`.
 const GATED_PAUSE_MESSAGE: &str = "merge the PR, then run: bump finish";
-
-/// How often the CI gate re-reads check runs and legacy statuses.
-pub const CI_POLL_INTERVAL: Duration = Duration::from_secs(15);
-
-/// How long the CI gate waits for ANY check run or status to register on a sha before
-/// deciding from the sha's `.github/workflows` tree.
-pub const CI_APPEAR_WINDOW: Duration = Duration::from_secs(120);
-
-/// The default `--ci-timeout`: how long the gate waits on incomplete runs before refusing.
-pub const DEFAULT_CI_TIMEOUT: Duration = Duration::from_secs(1800);
 
 /// How the install step is resolved. Precedence (general.md): CLI override > config
 /// `install` > default (`cargo install --path .` iff a `Cargo.toml` is present) > skip.
@@ -254,57 +255,6 @@ pub trait Installer {
     fn install(&self, dir: &Path, command: &str) -> Result<()>;
 }
 
-/// The PR seam for the gated flow. A port (preferred over the doc's optional
-/// `BUMP_PR_PROBE` env seam for consistency with `Pusher`/`Installer`) so tests inject a
-/// fake `gh` without a real GitHub round-trip.
-///
-/// `open_pr_exists` is the Phase-0 open-PR probe (`gh pr list --head <branch> --state
-/// open --json number`, NOT `gh pr view`); `create_pr` is `gh pr create` with an explicit
-/// head, base, title and body, only ever called when `open_pr_exists` returns false, and
-/// returns the new PR's URL.
-pub trait Pr {
-    fn open_pr_exists(&self, dir: &Path, branch: &str) -> Result<bool>;
-    fn create_pr(&self, dir: &Path, branch: &str, base: &str, title: &str, body: &str) -> Result<String>;
-}
-
-/// The CI seam for the gate. `Ok(None)` = the repo has no GitHub remote (nothing to wait
-/// on); `Err` = an API/auth failure or a truncated read, which the gate fails closed on.
-///
-/// The poll interval and appear window live on the port because they describe the remote
-/// CI system (how often it is sane to poll GitHub, how long GitHub takes to register a
-/// run); test doubles return zero for both so no test ever sleeps.
-pub trait Ci {
-    fn check_runs(&self, dir: &Path, sha: &str) -> Result<Option<CheckRuns>>;
-    fn poll_interval(&self) -> Duration {
-        CI_POLL_INTERVAL
-    }
-    fn appear_window(&self) -> Duration {
-        CI_APPEAR_WINDOW
-    }
-}
-
-/// Production `Pr`: the real `gh` PR operations (list-probe + explicit create).
-pub struct GhPr;
-
-impl Pr for GhPr {
-    fn open_pr_exists(&self, dir: &Path, branch: &str) -> Result<bool> {
-        github::open_pr_exists(dir, branch)
-    }
-
-    fn create_pr(&self, dir: &Path, branch: &str, base: &str, title: &str, body: &str) -> Result<String> {
-        github::create_pr(dir, branch, base, title, body)
-    }
-}
-
-/// Production `Ci`: `gh api` check-runs + legacy status for the sha.
-pub struct GhCi;
-
-impl Ci for GhCi {
-    fn check_runs(&self, dir: &Path, sha: &str) -> Result<Option<CheckRuns>> {
-        github::check_runs(dir, sha)
-    }
-}
-
 /// Production `Pusher`: real `git push origin <name>` by explicit name (never `--tags`,
 /// never `--follow-tags`, never `--force`).
 pub struct GitPusher;
@@ -350,23 +300,6 @@ impl Installer for ShellInstaller {
         }
         Ok(())
     }
-}
-
-/// The CI gate's settings for one run, taken from the verb's opts.
-#[derive(Debug, Clone, Copy)]
-struct CiGate {
-    enabled: bool,
-    timeout: Duration,
-}
-
-/// What `gate_tag_and_push` tags and where: the tag, the version the manifest at the
-/// tagged sha must carry, the default branch it must equal, and the verb a refusal tells
-/// the operator to re-run.
-struct TagTarget<'a> {
-    tag: &'a str,
-    version: &'a Version,
-    default: &'a str,
-    rerun: &'a str,
 }
 
 /// `bump release`: classify the repo's state, then execute the one correct sequence or
@@ -653,76 +586,6 @@ fn branch_base_version(dir: &Path, base_ref: &str) -> Result<Option<Version>> {
         && latest.is_some();
     let at_base = if untouched_default { None } else { at_base };
     Ok(at_base.into_iter().chain(latest).max())
-}
-
-/// `title_slug` from `branch-pr-title-guard.sh`: lowercase, collapse every run of
-/// non-`[a-z0-9]` to `-`, trim dashes. A branch is a legal release branch only when it is
-/// its own slug.
-fn branch_slug(branch: &str) -> String {
-    let mut slug = String::new();
-    let mut in_run = false;
-    for c in branch.to_lowercase().chars() {
-        if c.is_ascii_lowercase() || c.is_ascii_digit() {
-            slug.push(c);
-            in_run = false;
-        } else if !in_run {
-            slug.push('-');
-            in_run = true;
-        }
-    }
-    slug.trim_matches('-').to_string()
-}
-
-/// The PR title: `<type>(<scope>): <branch words>`, type/scope from the first commit
-/// subject on the branch (`chore` when it has no conventional prefix). By construction it
-/// slugifies back to the branch, which `branch-pr-title-guard.sh` enforces.
-pub fn pr_title(branch: &str, subjects: &[String]) -> String {
-    let words = branch.replace('-', " ");
-    let (kind, scope) = subjects
-        .first()
-        .and_then(|s| parse_conventional_prefix(s))
-        .unwrap_or_else(|| ("chore".to_string(), None));
-    match scope {
-        Some(scope) => format!("{kind}({scope}): {words}"),
-        None => format!("{kind}: {words}"),
-    }
-}
-
-/// `feat(scope)!: subject` -> `("feat", Some("scope"))`. `None` when the subject has no
-/// conventional prefix.
-fn parse_conventional_prefix(subject: &str) -> Option<(String, Option<String>)> {
-    let (head, _) = subject.split_once(':')?;
-    let head = head.trim_end_matches('!');
-    let (kind, scope) = match head.split_once('(') {
-        Some((k, rest)) => (k, Some(rest.strip_suffix(')')?)),
-        None => (head, None),
-    };
-    if kind.is_empty() || !kind.chars().all(|c| c.is_ascii_lowercase()) {
-        return None;
-    }
-    if let Some(s) = scope
-        && (s.is_empty()
-            || !s
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_'))
-    {
-        return None;
-    }
-    Some((kind.to_string(), scope.map(str::to_string)))
-}
-
-/// The PR body: one `- <subject>` per commit on the branch, then the release-intent line
-/// Gate D looks for as the LAST line.
-pub fn pr_body(subjects: &[String], tag: &str) -> String {
-    let mut body = String::new();
-    for s in subjects {
-        body.push_str(&format!("- {s}\n"));
-    }
-    if subjects.is_empty() {
-        body.push_str("- version bump\n");
-    }
-    body.push_str(&format!("\nRelease: rides this PR ({tag})"));
-    body
 }
 
 /// A deterministic suggested branch name for the stranded-commits rescue, derived from the
@@ -1205,383 +1068,6 @@ fn confirm_on_origin(dir: &Path, default: &str) -> Result<()> {
              the branch push did not land, so NO tag was created."
         ),
     }
-}
-
-fn ci_gate(enabled: bool, timeout: Duration) -> CiGate {
-    CiGate { enabled, timeout }
-}
-
-/// The manifest version committed at `sha`, parsed.
-fn version_at(dir: &Path, sha: &str) -> Result<Option<Version>> {
-    Ok(git::manifest_version_at(dir, sha)?.and_then(|v| version::parse_version(&v).ok()))
-}
-
-/// Human form of a manifest version read for a refusal message.
-fn describe_version(version: &Option<Version>) -> String {
-    version
-        .as_ref()
-        .map(version::format_file_version)
-        .unwrap_or_else(|| "no version".to_string())
-}
-
-/// The ONLY place a release tag is created and pushed. Starting from `start_sha`:
-/// 1. `wait_for_green` on the sha;
-/// 2. fetch origin/<default> fresh: the sha must EQUAL its tip. A tip that moved and still
-///    carries the tag's version restarts the gate on the new tip; a different version
-///    refuses with no tag;
-/// 3. the manifest at the sha must carry the tag's version;
-/// 4. create the annotated tag ON THAT SHA (a local tag already there is kept);
-/// 5. fetch fresh again: the sha must still equal the tip, else refuse and leave the local
-///    tag for the local-tag resume row;
-/// 6. push the tag by name.
-///
-/// Returns the sha that was tagged.
-fn gate_tag_and_push<P: Pusher, C: Ci>(
-    dir: &Path,
-    gate: CiGate,
-    target: &TagTarget,
-    start_sha: String,
-    pusher: &P,
-    ci: &C,
-) -> Result<String> {
-    let TagTarget {
-        tag,
-        version,
-        default,
-        rerun,
-    } = *target;
-    debug!(
-        "gate_tag_and_push: dir={} tag={} default={} start_sha={}",
-        dir.display(),
-        tag,
-        default,
-        start_sha
-    );
-
-    let mut sha = start_sha;
-    loop {
-        wait_for_green(dir, &sha, gate, ci, target)?;
-        let tip = git::remote_tip(dir, default)?;
-        if tip == sha {
-            break;
-        }
-        let at_tip = version_at(dir, &tip)?;
-        if at_tip.as_ref() != Some(version) {
-            bail!(
-                "origin/{default} moved from {sha} to {tip} during the CI wait, and the manifest there carries {}, \
-                 not {tag}. NO tag was created.\n\
-                 Run: git pull --ff-only origin {default}, then {rerun}",
-                describe_version(&at_tip)
-            );
-        }
-        println!(
-            "origin/{default} moved to {tip} during the CI wait and still carries {tag}; re-running the CI gate on the new tip"
-        );
-        sha = tip;
-    }
-
-    let at_sha = version_at(dir, &sha)?;
-    if at_sha.as_ref() != Some(version) {
-        bail!(
-            "the manifest at {sha} carries {}, not {tag}; NO tag was created.",
-            describe_version(&at_sha)
-        );
-    }
-
-    if git::tag_exists(dir, tag)? {
-        let at = git::tag_sha(dir, tag)?;
-        if at != sha {
-            bail!(
-                "tag {tag} exists locally at {at}, but the verified tip of origin/{default} is {sha}; NO tag was pushed.\n\
-                 Run: git tag -d {tag}, then {rerun}"
-            );
-        }
-        debug!("gate_tag_and_push: local {tag} already at {sha}; pushing it");
-    } else {
-        git::create_tag(dir, tag, &format!("Release {tag}"), &sha)?;
-    }
-
-    let tip = git::remote_tip(dir, default)?;
-    if tip != sha {
-        bail!(
-            "origin/{default} moved from {sha} to {tip} between creating {tag} and pushing it; {tag} was NOT pushed \
-             and stays local at {sha}.\n\
-             Run: {rerun} (it re-runs the CI gate on the tip; if origin/{default} no longer carries {sha}, \
-             run git tag -d {tag} first)"
-        );
-    }
-    pusher.push_tag(dir, tag)?;
-    if sha != git::head_sha(dir)? {
-        println!(
-            "tagged {sha}, the tip of origin/{default}; local HEAD is behind it: git pull --ff-only origin {default}"
-        );
-    }
-    Ok(sha)
-}
-
-/// The CI gate (design doc, API Design "CI gate"): poll check runs + legacy statuses for
-/// `sha` until every run completed green (proceed) or anything is red, truncated, errored,
-/// or timed out (refuse, no tag). Zero runs and zero statuses after the appear window are
-/// decided by the sha's `.github/workflows` tree. A committed `ci: none` in `bump.yml` at
-/// the sha, a repo with no GitHub remote, or `--no-ci-gate` skip the gate with a notice.
-fn wait_for_green<C: Ci>(dir: &Path, sha: &str, gate: CiGate, ci: &C, target: &TagTarget) -> Result<()> {
-    debug!(
-        "wait_for_green: dir={} sha={} enabled={} timeout={:?}",
-        dir.display(),
-        sha,
-        gate.enabled,
-        gate.timeout
-    );
-    let TagTarget { tag, rerun, .. } = *target;
-    if !gate.enabled {
-        println!("CI gate: SKIPPED (--no-ci-gate); {tag} is tagged without waiting for CI on {sha}");
-        return Ok(());
-    }
-    if config::load_at(dir, sha)?.ci == Some(CiDeclaration::None) {
-        println!("CI gate: skipped, bump.yml at {sha} declares `ci: none` (this repo's workflows never run on push)");
-        return Ok(());
-    }
-
-    let start = Instant::now();
-    let mut announced = false;
-    loop {
-        let runs = ci
-            .check_runs(dir, sha)
-            .wrap_err_with(|| format!("CI gate: could not read CI for {sha}; NO tag was created (fails closed)"))?;
-        let Some(runs) = runs else {
-            println!("CI gate: no GitHub remote, nothing to wait on");
-            return Ok(());
-        };
-        debug!("wait_for_green: sha={sha} runs={runs:?}");
-
-        if !runs.failed.is_empty() || runs.statuses == StatusState::Failure {
-            let mut lines = String::new();
-            for (name, url) in &runs.failed {
-                lines.push_str(&format!("  FAILED  {name}  {url}\n"));
-            }
-            if runs.statuses == StatusState::Failure {
-                lines.push_str("  FAILED  combined commit status (failure/error)\n");
-            }
-            bail!(
-                "CI is RED on {sha}:\n{lines}NO tag was created. Fix it, commit, and re-run {rerun}: \
-                 the re-run reuses {tag}, it never bumps past it."
-            );
-        }
-
-        let no_ci_reported = runs.total == 0 && runs.statuses == StatusState::None;
-        if no_ci_reported {
-            if start.elapsed() >= ci.appear_window() {
-                let window = ci.appear_window().as_secs();
-                if git::has_workflows_at(dir, sha)? {
-                    bail!(
-                        "CI never registered on {sha} after {window}s; re-run when it has. If this repo's workflows \
-                         never run on push, declare `ci: none` in bump.yml (committed, reviewed) and re-run."
-                    );
-                }
-                println!(
-                    "CI gate: no check runs or statuses on {sha} after {window}s, and the repo has no workflows at that sha; proceeding"
-                );
-                return Ok(());
-            }
-        } else if runs.incomplete == 0 && runs.statuses != StatusState::Pending {
-            println!("CI gate: green ({} check run(s)) on {sha}", runs.total);
-            return Ok(());
-        } else if start.elapsed() >= gate.timeout {
-            bail!(
-                "CI gate: timed out after {}s with {} check run(s) incomplete{} on {sha}. NO tag was created.\n\
-                 Re-run {rerun} when they finish (it reuses {tag}).",
-                gate.timeout.as_secs(),
-                runs.incomplete,
-                if runs.statuses == StatusState::Pending {
-                    " and the commit status pending"
-                } else {
-                    ""
-                }
-            );
-        }
-
-        if !announced {
-            println!("CI gate: waiting on CI for {sha} (no tag exists yet)");
-            announced = true;
-        }
-        thread::sleep(ci.poll_interval());
-    }
-}
-
-/// Echo the CI gate + tag steps for `-n` dry-run.
-fn echo_tag_steps(tag: &str, default: &str, gate: &CiGate, local_tag_present: bool) {
-    if gate.enabled {
-        println!(
-            "[dry-run] wait for green CI on the sha (check-runs + commit status every {}s, up to {}s)",
-            CI_POLL_INTERVAL.as_secs(),
-            gate.timeout.as_secs()
-        );
-    } else {
-        println!("[dry-run] CI gate: SKIPPED (--no-ci-gate)");
-    }
-    println!("[dry-run] git fetch origin {default}  (the sha must equal origin/{default} and carry {tag})");
-    if local_tag_present {
-        println!("[dry-run] (local tag {tag} already present at the sha)");
-    } else {
-        println!("[dry-run] git tag -a {tag} <sha> -m \"Release {tag}\"");
-    }
-    println!("[dry-run] git fetch origin {default}  (re-verify before the push)");
-    println!("[dry-run] git push origin {tag}");
-}
-
-/// `bump finish`: the gated post-merge tag step the paused `bump release` points to. After
-/// the PR merges, finish checks out the default branch, fast-forwards to the merged tip,
-/// then -- reusing `crate::tag_ladder` (the SAME `--tag-only` verification ladder, never a
-/// duplicate) -- either runs the CI gate and tags the merged commit (pushing it BY NAME),
-/// resumes a local-only tag through the same gate, no-ops an already-released tag, or
-/// refuses (missed bump / gated generic / dirty).
-///
-/// The DIFFERENCE from `bump --tag-only`: `--tag-only` only PRINTS the push command; finish
-/// EXECUTES the tag push via the `Pusher` port (by explicit name) and then runs install,
-/// and it does the checkout + `pull --ff-only` up front. NO tag is ever created on an
-/// unconfirmed commit -- `gate_tag_and_push` requires green CI and sha == origin/<default>.
-pub fn finish<P: Pusher, I: Installer, C: Ci>(
-    dir: &Path,
-    opts: &FinishOpts,
-    pusher: &P,
-    installer: &I,
-    ci: &C,
-) -> Result<ReleaseReport> {
-    debug!(
-        "finish: dir={} dry_run={} install={:?} ci_gate={} ci_timeout={:?}",
-        dir.display(),
-        opts.dry_run,
-        opts.install,
-        opts.ci_gate,
-        opts.ci_timeout
-    );
-    let config = config::load(dir)?;
-
-    if !git::is_git_repo(dir) {
-        bail!("not a git repository: {}", dir.display());
-    }
-
-    // Dirty tree: checking out the default branch would clobber TRACKED changes. Untracked
-    // files aren't a reason to refuse: finish never stages or commits anything (it only
-    // tags), so a stray file can't ride onto the release; if it collides with a path the
-    // checkout would create, `git checkout` itself will say so. Refuse before ANY mutation,
-    // with the one exact fix.
-    if git::has_tracked_changes(dir)? {
-        bail!(
-            "the working tree has uncommitted tracked changes; bump finish checks out the \
-             default branch, which would clobber them.\n\
-             Commit or stash your changes first, then bump finish"
-        );
-    }
-
-    // Generic repo (no version-bearing manifest): finish cannot derive a version to tag.
-    // Gated generic is unsupported per the design's Resolved Decisions -- fail closed.
-    let manifests = lang::detect(dir)?;
-    if manifests.is_empty() {
-        bail!(
-            "this repo has no version-bearing manifest (generic).\n\
-             Gated generic repos are unsupported: bump finish cannot derive a version without a manifest."
-        );
-    }
-
-    let default = git::remote_default_branch(dir)?;
-
-    if opts.dry_run {
-        return finish_dry_run(dir, opts, &config, &manifests, &default);
-    }
-
-    // Reach the merged tip: checkout the default branch, then fast-forward to origin.
-    // `pull --ff-only` does its own fetch; the shared ladder re-fetches before comparing.
-    git::checkout(dir, &default)?;
-    git::pull_ff_only(dir, &default)?;
-
-    // Reuse the --tag-only verification ladder (clean-tree, on-default, HEAD==origin,
-    // manifest-version -> tag, remote-then-local existence). The consumer decides the
-    // action; the ladder only classifies.
-    let check = tag_ladder(dir)?;
-    let tag = check.tag.clone();
-    debug!("finish: tag={} state={:?}", tag, check.state);
-
-    match check.state {
-        // Local-only tag at the merged commit (a prior run died before/during the tag
-        // push: RESUME, never "already released"), or no tag yet for the merged version.
-        // Both run the CI gate on the merged sha, then tag it (a local tag already there
-        // is kept) and push by name.
-        TagState::LocalAtHead | TagState::Absent => {
-            let resumed = matches!(check.state, TagState::LocalAtHead);
-            let version = version::parse_version(&tag)?;
-            let target = TagTarget {
-                tag: &tag,
-                version: &version,
-                default: &default,
-                rerun: "bump finish",
-            };
-            let gate = ci_gate(opts.ci_gate, opts.ci_timeout);
-            gate_tag_and_push(dir, gate, &target, check.head.clone(), pusher, ci)?;
-            if resumed {
-                println!("resumed release: pushed {tag} on {default}");
-            } else {
-                println!("released {tag} on {default}");
-            }
-            let install_command = run_install(dir, &opts.install, &config, installer)?;
-            Ok(ReleaseReport {
-                resumed,
-                install_command,
-                ..ReleaseReport::new(&tag)
-            })
-        }
-        // The tag exists on the REMOTE. `remote_tag_sha` (behind the ladder) returns the
-        // annotated TAG-OBJECT sha for an exact refspec, so the ladder can't tell an
-        // at-HEAD remote tag from an at-other one -- resolve the tag's actual COMMIT here.
-        // At the merged tip -> already released (NO-OP). Elsewhere -> the version wasn't
-        // bumped for this merge (missed bump).
-        TagState::RemoteAtHead | TagState::RemoteAtOther(_) => match git::remote_tag_commit(dir, &tag)? {
-            Some(commit) if commit == check.head => {
-                println!("already released {tag}");
-                Ok(ReleaseReport::new(&tag))
-            }
-            _ => missed_bump(&default),
-        },
-        // The tag exists LOCALLY at a commit OTHER than the merged tip: the version equals
-        // the last released tag, so nothing new merged with a bump.
-        TagState::LocalAtOther(_) => missed_bump(&default),
-    }
-}
-
-/// The missed-bump refusal (finish table row 2): a commit merged to the default branch
-/// without a version bump, so origin/<default>'s version still equals the last tag. The
-/// bump rides the NEXT feature PR.
-fn missed_bump(default: &str) -> Result<ReleaseReport> {
-    bail!("no untagged version on {default}; bump rides a feature PR -- run bump release on a branch")
-}
-
-/// `-n` dry run for `bump finish`: echo every command it would run and mutate NOTHING (no
-/// checkout, no pull, no fetch). The reported tag is read from the CURRENT manifest version
-/// (a best-effort preview; the real run tags the merged version after the fast-forward).
-fn finish_dry_run(
-    dir: &Path,
-    opts: &FinishOpts,
-    config: &Config,
-    manifests: &[Box<dyn Manifest>],
-    default: &str,
-) -> Result<ReleaseReport> {
-    debug!("finish_dry_run: dir={} default={}", dir.display(), default);
-    let install_command = resolve_install(dir, &opts.install, config);
-    let tag = match agreed_file_version(manifests)? {
-        Some(v) => version::format_tag(&v),
-        None => "vX.Y.Z".to_string(),
-    };
-    println!("[dry-run] git checkout {default}");
-    println!("[dry-run] git pull --ff-only origin {default}");
-    println!("[dry-run] (tag-only ladder: require HEAD == origin/{default} before tagging)");
-    println!("[dry-run] (only if the merged version is untagged:)");
-    echo_tag_steps(&tag, default, &ci_gate(opts.ci_gate, opts.ci_timeout), false);
-    echo_install(&install_command);
-    Ok(ReleaseReport {
-        install_command,
-        dry_run: true,
-        ..ReleaseReport::new(&tag)
-    })
 }
 
 /// Resolve the install command (precedence: explicit override > config > default-if-Cargo

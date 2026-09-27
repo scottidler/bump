@@ -229,3 +229,19 @@ doc's Phase 0 bullets, not here.
 - `src/release.rs` is now 1638 lines and `src/release/tests.rs` 2068. Split (e.g. `ci.rs`
   for the gate, `pr.rs` for title/body/slug) before Phase 4 adds the standalone rows, or
   leave it?
+
+## Phase 3 addendum: module split
+
+Behavior-preserving decomposition (rules/rust.md 1500-line cap), between Phase 3 and 4.
+`src/release.rs` stays the entry point; code moved verbatim into `src/release/ci.rs` (`Ci`,
+`GhCi`, the CI constants, `CiGate`, `ci_gate`, `wait_for_green`), `pr.rs` (`Pr`, `GhPr`,
+`pr_title`, `pr_body`, `branch_slug`), `tag.rs` (`TagTarget`, `gate_tag_and_push`,
+`echo_tag_steps`, the re-verify helpers) and `finish.rs` (`finish` and its helpers).
+`release.rs` re-exports the public surface (`Ci`, `GhCi`, `DEFAULT_CI_TIMEOUT`, `Pr`,
+`GhPr`, `finish`), so `main.rs` is untouched. The only visibility widening is `pub(super)`
+on `CiGate` (+ fields), `ci_gate`, `wait_for_green`, `TagTarget` (+ fields),
+`gate_tag_and_push`, `echo_tag_steps` and `branch_slug`: the seams between the gate, tag
+placement, and the state machine. Tests: `src/release/tests.rs` keeps the shared doubles,
+harness and fixtures; test functions moved into `tests/{ungated,gated,install,finish,gate,pr}.rs`.
+Test count unchanged (297 + 1). Line counts after: release.rs 1124, ci.rs 148, finish.rs 170,
+pr.rs 103, tag.rs 150, tests.rs 585, tests/gate.rs 499 (largest test file).

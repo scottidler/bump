@@ -1,0 +1,406 @@
+//! Ungated flow: fresh release ordering, rejected push, RESUME, dry run, and each refusal.
+
+use super::*;
+
+// ===================================================================================
+// Ungated e2e: branch push THEN tag push, IN ORDER; install resolved (not executed)
+// ===================================================================================
+
+#[test]
+fn ungated_release_pushes_branch_then_tag_in_order() {
+    let _guard = crate::ENV_LOCK.lock().unwrap();
+    let (origin, work) = setup_with_pending_commit("0.1.5");
+    let dir = work.path();
+
+    let pusher = RecordingPusher::new(false);
+    let installer = RecordingInstaller::new();
+    let prev = set_probe("ungated");
+    let report = release(dir, &auto_opts(None, false), &pusher, &installer, &no_pr(), &NoCi);
+    restore_probe(prev);
+
+    let report = report.expect("ungated release must succeed");
+    assert_eq!(report.tag, "v0.1.6");
+    assert!(!report.resumed);
+    // Branch push STRICTLY before tag push (the strengthened ordering).
+    assert_eq!(
+        pusher.calls(),
+        vec!["branch:main".to_string(), "tag:v0.1.6".to_string()]
+    );
+    // The tag is on origin (created at HEAD locally, then pushed). `remote_tag_sha` on an
+    // exact refspec returns the tag-object SHA, so assert PRESENCE.
+    assert!(
+        git::remote_tag_sha(dir, "v0.1.6").unwrap().is_some(),
+        "tag must be pushed to origin"
+    );
+    // The version file was bumped and the install command resolved (not executed).
+    assert_eq!(read_cargo_version(dir), "0.1.6");
+    assert_eq!(report.install_command.as_deref(), Some("cargo install --path ."));
+    assert_eq!(installer.calls(), vec!["cargo install --path .".to_string()]);
+    drop(origin);
+}
+
+/// The production `GitPusher` + `ShellInstaller` end-to-end: branch and tag both land on
+/// origin, and the resolved install command actually runs (marker file appears).
+#[test]
+fn ungated_release_with_real_pusher_and_installer() {
+    let _guard = crate::ENV_LOCK.lock().unwrap();
+    let (origin, work) = setup_with_pending_commit("0.1.5");
+    let dir = work.path();
+
+    let opts = ReleaseOpts {
+        install: InstallChoice::Command("touch install-marker".to_string()),
+        ..auto_opts(None, false)
+    };
+    let prev = set_probe("ungated");
+    let report = release(dir, &opts, &GitPusher, &ShellInstaller, &GhPr, &GhCi);
+    restore_probe(prev);
+
+    let report = report.expect("real-pusher release must succeed");
+    assert_eq!(report.tag, "v0.1.6");
+    // Branch on origin at HEAD.
+    let head = git::head_sha(dir).unwrap();
+    let remote_main = git_ok(dir, &["rev-parse", "origin/main"]);
+    assert_eq!(remote_main, head, "origin/main must equal HEAD");
+    // Tag on origin (presence; exact refspec returns the tag-object SHA).
+    assert!(
+        git::remote_tag_sha(dir, "v0.1.6").unwrap().is_some(),
+        "tag must be on origin"
+    );
+    // ShellInstaller actually ran the command.
+    assert!(
+        dir.join("install-marker").exists(),
+        "install command must have executed"
+    );
+    drop(origin);
+}
+
+// ===================================================================================
+// Rejected branch push leaves ZERO tags (local or remote) -- strengthened ordering
+// ===================================================================================
+
+#[test]
+fn rejected_branch_push_leaves_no_tag() {
+    let _guard = crate::ENV_LOCK.lock().unwrap();
+    let (origin, work) = setup_with_pending_commit("0.1.5");
+    let dir = work.path();
+
+    let pusher = RecordingPusher::new(true); // branch push is rejected
+    let installer = RecordingInstaller::new();
+    let prev = set_probe("ungated");
+    let result = release(dir, &auto_opts(None, false), &pusher, &installer, &no_pr(), &NoCi);
+    restore_probe(prev);
+
+    assert!(result.is_err(), "a rejected branch push must fail the release");
+    // The whole point: NO tag anywhere, and the tag push was never attempted.
+    assert!(
+        !git::tag_exists(dir, "v0.1.6").unwrap(),
+        "no LOCAL tag on a rejected push"
+    );
+    assert_eq!(
+        git::remote_tag_sha(dir, "v0.1.6").unwrap(),
+        None,
+        "no REMOTE tag on a rejected push"
+    );
+    assert_eq!(
+        pusher.calls(),
+        vec!["branch:main".to_string()],
+        "tag push never attempted"
+    );
+    assert!(installer.calls().is_empty(), "install never runs on a failed release");
+    drop(origin);
+}
+
+// ===================================================================================
+// RESUME: both sub-states (local tag ABSENT -> create+push; PRESENT -> push only)
+// ===================================================================================
+
+#[test]
+fn resume_local_tag_absent_creates_and_pushes() {
+    let _guard = crate::ENV_LOCK.lock().unwrap();
+    let (origin, work) = setup_partial_release("0.1.5", "0.1.6");
+    let dir = work.path();
+    assert!(!git::tag_exists(dir, "v0.1.6").unwrap(), "precondition: no local tag");
+
+    let pusher = RecordingPusher::new(false);
+    let installer = RecordingInstaller::new();
+    let prev = set_probe("ungated");
+    let report = release(dir, &auto_opts(None, false), &pusher, &installer, &no_pr(), &NoCi);
+    restore_probe(prev);
+
+    let report = report.expect("resume must complete");
+    assert!(report.resumed, "must be reported as a resume");
+    assert_eq!(report.tag, "v0.1.6");
+    // Created the missing tag, pushed it -- NO branch push, NO re-bump.
+    assert_eq!(pusher.calls(), vec!["tag:v0.1.6".to_string()]);
+    assert!(git::tag_exists(dir, "v0.1.6").unwrap(), "tag created locally");
+    assert!(
+        git::remote_tag_sha(dir, "v0.1.6").unwrap().is_some(),
+        "tag pushed to origin"
+    );
+    assert_eq!(read_cargo_version(dir), "0.1.6", "version unchanged -- no re-bump");
+    drop(origin);
+}
+
+#[test]
+fn resume_local_tag_present_pushes_only() {
+    let _guard = crate::ENV_LOCK.lock().unwrap();
+    let (origin, work) = setup_partial_release("0.1.5", "0.1.6");
+    let dir = work.path();
+    // Prior run created the local tag but died before pushing it.
+    git_ok(dir, &["tag", "-a", "v0.1.6", "-m", "v0.1.6"]);
+    let tag_sha_before = git::tag_sha(dir, "v0.1.6").unwrap();
+
+    let pusher = RecordingPusher::new(false);
+    let installer = RecordingInstaller::new();
+    let prev = set_probe("ungated");
+    let report = release(dir, &auto_opts(None, false), &pusher, &installer, &no_pr(), &NoCi);
+    restore_probe(prev);
+
+    let report = report.expect("resume must complete");
+    assert!(report.resumed);
+    assert_eq!(
+        pusher.calls(),
+        vec!["tag:v0.1.6".to_string()],
+        "push only, no re-create"
+    );
+    // Local tag object untouched (not recreated), and now on origin.
+    assert_eq!(git::tag_sha(dir, "v0.1.6").unwrap(), tag_sha_before);
+    assert!(
+        git::remote_tag_sha(dir, "v0.1.6").unwrap().is_some(),
+        "tag now on origin"
+    );
+    drop(origin);
+}
+
+/// A completed resume, re-run, is a clean refusal (already tagged) -- never a re-bump and
+/// never a false "already released" claim mid-flight (that claim never appears here).
+#[test]
+fn resume_completes_then_second_run_refuses_without_rebump() {
+    let _guard = crate::ENV_LOCK.lock().unwrap();
+    let (origin, work) = setup_partial_release("0.1.5", "0.1.6");
+    let dir = work.path();
+
+    let pusher = RecordingPusher::new(false);
+    let installer = RecordingInstaller::new();
+    let prev = set_probe("ungated");
+    let first = release(dir, &auto_opts(None, false), &pusher, &installer, &no_pr(), &NoCi);
+    // Second run: the remote now carries the tag, so there is nothing left to do.
+    let second = release(dir, &auto_opts(None, false), &pusher, &installer, &no_pr(), &NoCi);
+    restore_probe(prev);
+
+    assert!(first.expect("first resume completes").resumed);
+    let err = second
+        .expect_err("second run must refuse -- already tagged")
+        .to_string();
+    assert!(err.contains("already tagged"), "got: {err}");
+    assert!(
+        !err.contains("already released"),
+        "must NOT claim 'already released': {err}"
+    );
+    assert_eq!(read_cargo_version(dir), "0.1.6", "no re-bump on the second run");
+    drop(origin);
+}
+
+// ===================================================================================
+// -n dry-run executes NOTHING
+// ===================================================================================
+
+#[test]
+fn dry_run_executes_nothing() {
+    let _guard = crate::ENV_LOCK.lock().unwrap();
+    let (origin, work) = setup_with_pending_commit("0.1.5");
+    let dir = work.path();
+    let head_before = git::head_sha(dir).unwrap();
+
+    let pusher = RecordingPusher::new(false);
+    let installer = RecordingInstaller::new();
+    let prev = set_probe("ungated");
+    let report = release(dir, &auto_opts(None, true), &pusher, &installer, &no_pr(), &NoCi);
+    restore_probe(prev);
+
+    let report = report.expect("dry-run must succeed");
+    assert!(report.dry_run);
+    assert_eq!(report.tag, "v0.1.6", "dry-run still reports the target tag");
+    assert_eq!(report.install_command.as_deref(), Some("cargo install --path ."));
+    // No side effects whatsoever.
+    assert_eq!(git::head_sha(dir).unwrap(), head_before, "no commit/amend");
+    assert_eq!(read_cargo_version(dir), "0.1.5", "no version write");
+    assert!(!git::tag_exists(dir, "v0.1.6").unwrap(), "no tag");
+    assert_eq!(git::remote_tag_sha(dir, "v0.1.6").unwrap(), None, "no remote tag");
+    assert!(pusher.calls().is_empty(), "no push");
+    assert!(installer.calls().is_empty(), "no install");
+    drop(origin);
+}
+
+// ===================================================================================
+// Each UNGATED bash-driver `die` condition reproduced as a distinct refusal
+// ===================================================================================
+
+/// bash: `die "not inside a git repo"`.
+#[test]
+fn refuses_when_not_a_git_repo() {
+    let tmp = TempDir::new().unwrap();
+    let pusher = RecordingPusher::new(false);
+    let installer = RecordingInstaller::new();
+    let err = release(
+        tmp.path(),
+        &auto_opts(None, false),
+        &pusher,
+        &installer,
+        &no_pr(),
+        &NoCi,
+    )
+    .expect_err("must refuse outside a git repo")
+    .to_string();
+    assert!(err.contains("not a git repository"), "got: {err}");
+}
+
+/// bash: `die "tree is dirty..."`.
+#[test]
+fn refuses_dirty_tree() {
+    let _guard = crate::ENV_LOCK.lock().unwrap();
+    let (origin, work) = setup_released("0.1.5");
+    let dir = work.path();
+    fs::write(dir.join("dirty.txt"), "x").unwrap();
+
+    let pusher = RecordingPusher::new(false);
+    let installer = RecordingInstaller::new();
+    let prev = set_probe("ungated");
+    let err = release(dir, &auto_opts(None, false), &pusher, &installer, &no_pr(), &NoCi)
+        .expect_err("dirty tree must refuse")
+        .to_string();
+    restore_probe(prev);
+    assert!(err.contains("dirty"), "got: {err}");
+    assert!(pusher.calls().is_empty());
+    drop(origin);
+}
+
+/// bash: `die "ungated release runs from the default branch..."`.
+#[test]
+fn refuses_when_not_on_default() {
+    let _guard = crate::ENV_LOCK.lock().unwrap();
+    let (origin, work) = setup_released("0.1.5");
+    let dir = work.path();
+    git_ok(dir, &["checkout", "-b", "feature"]);
+
+    let pusher = RecordingPusher::new(false);
+    let installer = RecordingInstaller::new();
+    let prev = set_probe("ungated");
+    let err = release(dir, &auto_opts(None, false), &pusher, &installer, &no_pr(), &NoCi)
+        .expect_err("off-default must refuse")
+        .to_string();
+    restore_probe(prev);
+    assert!(err.contains("git checkout main"), "must print the exact fix: {err}");
+    drop(origin);
+}
+
+/// bash: `die "$DEFAULT is $BEHIND commit(s) behind..."`.
+#[test]
+fn refuses_when_behind_origin() {
+    let _guard = crate::ENV_LOCK.lock().unwrap();
+    let (origin, work) = setup_released("0.1.5");
+    let dir = work.path();
+    let c1 = git::head_sha(dir).unwrap();
+    git_ok(dir, &["commit", "--allow-empty", "-m", "c2"]);
+    git_ok(dir, &["push", "origin", "main"]);
+    git_ok(dir, &["reset", "--hard", &c1]); // local now behind origin/main
+
+    let pusher = RecordingPusher::new(false);
+    let installer = RecordingInstaller::new();
+    let prev = set_probe("ungated");
+    let err = release(dir, &auto_opts(None, false), &pusher, &installer, &no_pr(), &NoCi)
+        .expect_err("behind must refuse")
+        .to_string();
+    restore_probe(prev);
+    assert!(
+        err.contains("git pull --ff-only origin main"),
+        "must print the exact fix: {err}"
+    );
+    assert!(pusher.calls().is_empty());
+    drop(origin);
+}
+
+/// bash: `die "nothing to release: HEAD == origin/$DEFAULT..."` -- here the version is
+/// already tagged on the remote.
+#[test]
+fn refuses_when_nothing_to_release() {
+    let _guard = crate::ENV_LOCK.lock().unwrap();
+    let (origin, work) = setup_released("0.1.5");
+    let dir = work.path();
+    git_ok(dir, &["push", "origin", "v0.1.5"]); // version already tagged on origin
+
+    let pusher = RecordingPusher::new(false);
+    let installer = RecordingInstaller::new();
+    let prev = set_probe("ungated");
+    let err = release(dir, &auto_opts(None, false), &pusher, &installer, &no_pr(), &NoCi)
+        .expect_err("nothing-to-release must refuse")
+        .to_string();
+    restore_probe(prev);
+    assert!(err.contains("nothing ahead"), "got: {err}");
+    assert!(err.contains("already tagged"), "got: {err}");
+    assert!(pusher.calls().is_empty());
+    drop(origin);
+}
+
+/// bash: `die "gate status is UNKNOWN..."` -- but `release` FAILS CLOSED (it pushes).
+#[test]
+fn refuses_when_gate_unknown() {
+    let _guard = crate::ENV_LOCK.lock().unwrap();
+    let (origin, work) = setup_released("0.1.5");
+    let dir = work.path();
+
+    let pusher = RecordingPusher::new(false);
+    let installer = RecordingInstaller::new();
+    let prev = set_probe("unknown:offline");
+    let err = release(dir, &auto_opts(None, false), &pusher, &installer, &no_pr(), &NoCi)
+        .expect_err("unknown gate must fail closed")
+        .to_string();
+    restore_probe(prev);
+    assert!(err.contains("UNKNOWN"), "got: {err}");
+    assert!(err.contains("offline"), "must carry the probe reason: {err}");
+    assert!(pusher.calls().is_empty());
+    drop(origin);
+}
+
+/// Detached HEAD refuses with the one exact fix.
+#[test]
+fn refuses_on_detached_head() {
+    let _guard = crate::ENV_LOCK.lock().unwrap();
+    let (origin, work) = setup_released("0.1.5");
+    let dir = work.path();
+    git_ok(dir, &["checkout", "--detach", "HEAD"]);
+
+    let pusher = RecordingPusher::new(false);
+    let installer = RecordingInstaller::new();
+    let prev = set_probe("ungated");
+    let err = release(dir, &auto_opts(None, false), &pusher, &installer, &no_pr(), &NoCi)
+        .expect_err("detached HEAD must refuse")
+        .to_string();
+    restore_probe(prev);
+    assert!(err.contains("detached"), "got: {err}");
+    drop(origin);
+}
+
+/// Gated, on the default branch, clean, HEAD == origin: refuse -- bump rides a feature PR,
+/// never the default branch. (Phase 6 replaces Phase 5's "not this phase" gated refusal.)
+#[test]
+fn gated_on_default_clean_refuses_bump_rides_a_pr() {
+    let _guard = crate::ENV_LOCK.lock().unwrap();
+    let (origin, work) = setup_released("0.1.5");
+    let dir = work.path();
+
+    let pusher = RecordingPusher::new(false);
+    let installer = RecordingInstaller::new();
+    let pr = RecordingPr::new();
+    let prev = set_probe("gated:pull_request");
+    let err = release(dir, &auto_opts(None, false), &pusher, &installer, &pr, &NoCi)
+        .expect_err("gated on default clean must refuse")
+        .to_string();
+    restore_probe(prev);
+    assert!(err.contains("bump rides a feature PR"), "got: {err}");
+    assert!(pusher.calls().is_empty());
+    assert_eq!(pr.create_calls(), 0, "no PR touched on a refusal");
+    // NO tag created on this gated path either.
+    assert!(!git::tag_exists(dir, "v0.1.6").unwrap());
+    drop(origin);
+}
