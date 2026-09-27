@@ -288,8 +288,9 @@ Ship order: `scottidler/bump` first (Phases 0-7), then `scottidler/claude` (Phas
 
 ## Acceptance Criteria
 
-- [ ] `bump release --help | grep -cE 'standalone|no-ci-gate|ci-timeout'` prints `3`.
+- [ ] `bump release --help | grep -oE -- '--(standalone|no-ci-gate|ci-timeout)' | sort -u | wc -l` prints `3` (presence of each flag, not a line count -- the after-help prose names them literally, so a line-count form miscounts the moment prose mentions a flag more than once).
   Observed on main (installed v0.3.3): `0`.
+  Observed on branch `one-release-command` (Phase 6 follow-up commit, `cargo run -q -- release --help | grep -oE -- '--(standalone|no-ci-gate|ci-timeout)' | sort -u | wc -l`): `3`.
 - [ ] `test ! -e ~/.claude/bin/release && test ! -L ~/.claude/bin/release && test ! -L ~/bin/release` exits 0.
   Observed on main: `~/.claude/bin/release` exists (`rc=0` from `test -e`) and `~/bin/release` is a symlink to it.
 - [ ] `grep -c BUMP_ORDERED_BY_SCOTT ~/.claude/hooks/git-release-guard.sh` prints `0`.
@@ -298,8 +299,9 @@ Ship order: `scottidler/bump` first (Phases 0-7), then `scottidler/claude` (Phas
   Observed on main: `9` (the seven from the first count plus `git-release-guard-test.sh` and `fixtures/inline-token/fixtures.json`).
 - [ ] `~/.claude/hooks/git-release-guard.sh --self-test` exits 0 and its last line reports `fail=0` with `pass` >= 269.
   Observed on main: `pass=269 fail=0`.
-- [ ] `git -C ~/repos/scottidler/bump show HEAD:src/release/tests.rs | grep -c 'fn red_ci_leaves_no_tag\|fn gated_standalone_cuts\|fn finish_from_feature_worktree'` prints `3` and `cargo test` in that repo is green.
+- [ ] `git -C ~/repos/scottidler/bump grep -c -E 'fn (red_ci_leaves_no_tag|gated_standalone_cuts|finish_from_feature_worktree)' HEAD -- src/release/tests/ | awk -F: '{s+=$NF} END {print s}'` prints `3` and `cargo test` in that repo is green. (Amended from a single-file `show HEAD:src/release/tests.rs` grep: the module split at `46aed56` moved these three tests into `src/release/tests/{gate,standalone,finish}.rs` under the 1500-line cap, `rules/rust.md:113`; the original form now greps a path that no longer holds them.)
   Observed on main (`77ad42e`): `0`.
+  Observed on branch `one-release-command` (`ed8640c`): `3` (`gate.rs:9`, `standalone.rs:57`, `finish.rs:310`).
 - [ ] A gated release from a feature branch (Phase 9a) and a gated finish from a sibling worktree (Phase 9b) each complete as ONE bare `bump ...` Bash call by the `release-driver` agent under auto mode, with no `[Auto-Mode Bypass]` or `[Production Deploy]` denial. Cannot run until Phases 7-8 ship; recorded then, with the session id.
 
 ## Resolved Decisions

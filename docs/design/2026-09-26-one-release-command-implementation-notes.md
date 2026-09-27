@@ -502,3 +502,72 @@ pr.rs 103, tag.rs 150, tests.rs 585, tests/gate.rs 499 (largest test file).
 
 ### Open questions
 - None.
+
+## Finalization: acceptance-criteria amendments
+
+Team-lead review of Phase 6 (before acceptance) flagged that the after-help's phrasing
+had been contorted to fit a defective acceptance criterion rather than the other way
+round. This entry supersedes the "Deviations" line above that cited a passing
+`grep -cE 'standalone|no-ci-gate|ci-timeout'` count of `3`/`2` -- that line-count form is
+now understood to have been the wrong criterion, not evidence the code was right; it is
+left in place above (append-only) rather than edited.
+
+### Design decisions
+- `get_release_help`/`get_finish_help` (`src/cli.rs`) rewritten AGAIN to name
+  `--standalone "<words>"`, `--no-ci-gate`, and `--ci-timeout` literally wherever the
+  prior commit had paraphrased them ("the order flag above", "the timeout flag above",
+  "the skip flag above", "SCOTT'S ORDER (the flag above with WORDS)"). An agent (or
+  Scott) reading `--help` needs to see the flag spelled out, not decoded from a
+  cross-reference.
+- `src/cli.rs`'s unit test renamed from `test_release_after_help_does_not_repeat_the_
+  three_flag_names` (asserted zero repetitions) to
+  `test_release_after_help_names_all_three_flags_literally` (asserts each of the three
+  substrings is present at least once). `tests/release_cli.rs`'s
+  `release_help_names_the_three_flags_exactly_three_times` (a line count against the
+  compiled binary) renamed to `release_help_names_all_three_flags_at_least_once`
+  (dedups a found-set and asserts its size is `3` -- the same shape as the doc's amended
+  criterion, so the test and the criterion cannot drift apart the way the line-count
+  form did).
+
+### Deviations
+- The doc's original first Acceptance Criterion (`grep -cE
+  'standalone|no-ci-gate|ci-timeout'` prints `3`) is a LINE-COUNT of every line
+  mentioning any of the three substrings. It is independent of whether the code is
+  right: it is satisfiable only by an after-help that mentions each flag EXACTLY once in
+  the whole document, which is a constraint on prose density, not on flag coverage. The
+  design doc's own Phase 6 bullet requires the after-help to "cover ... `--standalone`
+  ... the CI gate" in prose -- doing that honestly (naming the flags where they are
+  discussed) necessarily produces MORE than 3 matching lines once the Options block's own
+  3 lines are added to the prose's mentions. Amended to `grep -oE --
+  '--(standalone|no-ci-gate|ci-timeout)' | sort -u | wc -l` prints `3`: presence of each
+  of the three flags at least once, order- and count-independent. Observed on this
+  branch: `3` (`--ci-timeout`, `--no-ci-gate`, `--standalone`, alphabetical from `sort
+  -u`).
+- The doc's test-name Acceptance Criterion (`git show HEAD:src/release/tests.rs | grep
+  -c 'fn red_ci_leaves_no_tag\|fn gated_standalone_cuts\|fn finish_from_feature_
+  worktree'`) greps a single file, `src/release/tests.rs`, that no longer contains any of
+  the three tests: the Phase 3 addendum's module split (commit `46aed56`, ahead of the
+  1500-line-per-file cap at `rules/rust.md:113`) moved test FUNCTIONS out of
+  `tests.rs` into `src/release/tests/{gate,standalone,finish}.rs` while `tests.rs` kept
+  only the shared doubles/harness/fixtures. The criterion therefore prints `0` on every
+  commit since `46aed56`, including every one where the three tests demonstrably exist
+  and pass -- it stopped measuring anything the moment the split landed, independent of
+  Phase 6. Amended to `git -C ~/repos/scottidler/bump grep -c -E 'fn
+  (red_ci_leaves_no_tag|gated_standalone_cuts|finish_from_feature_worktree)' HEAD --
+  src/release/tests/ | awk -F: '{s+=$NF} END {print s}'`: sums per-file match counts
+  across the whole post-split test directory, so it survives future splits inside that
+  directory too. Observed on branch `one-release-command` (`ed8640c`): `3` --
+  `src/release/tests/gate.rs:9:fn red_ci_leaves_no_tag_and_green_rerun_resumes_same_
+  version`, `src/release/tests/standalone.rs:57:fn gated_standalone_cuts_tracking_
+  branch_bumps_and_quotes_scott`, `src/release/tests/finish.rs:310:fn finish_from_
+  feature_worktree_finishes_in_the_default_worktree`.
+
+### Tradeoffs
+- Renaming the two after-help tests in place (`src/cli.rs`,
+  `tests/release_cli.rs`) vs. adding new tests alongside the old ones: renamed, because
+  the old assertions (zero repetition; exact line count of 3) actively contradict the
+  corrected requirement (the flags must be named) -- keeping both would leave one test
+  permanently red or one test asserting the wrong thing forever.
+
+### Open questions
+- None.

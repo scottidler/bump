@@ -179,14 +179,9 @@ pub struct FinishArgs {
 }
 
 /// Generate the `bump release --help` after-help text: the state table (condensed), the
-/// two flows and their refusals, RESUME, Scott's order flag, the CI wait, the persona
-/// token rule, required tools and the runtime log path, matching
-/// `get_tool_validation_help`'s sources.
-///
-/// Deliberately does NOT repeat the flag names (`--standalone`, `--no-ci-gate`,
-/// `--ci-timeout`) verbatim below the Options block -- the acceptance criterion
-/// `bump release --help | grep -cE 'standalone|no-ci-gate|ci-timeout'` == 3 counts every
-/// LINE naming them, and clap's own Options block is the one place they should appear.
+/// two flows and their refusals, RESUME, `--standalone`, the CI wait, the persona token
+/// rule, required tools and the runtime log path, matching `get_tool_validation_help`'s
+/// sources.
 fn get_release_help() -> String {
     let git_status = check_tool_version("git", "--version", "2.20.0");
     let gh_status = check_tool_version("gh", "--version", "2.0.0");
@@ -207,8 +202,8 @@ fn get_release_help() -> String {
          \x20 ungated, manifest below the latest tag: refuse by name; bump never lowers a \
          version\n\
          \x20 ungated, not on default / behind / diverged / nothing to release: refuse with \
-         the one exact fix (checkout, `git pull --ff-only`, `git pull --rebase`, or the order \
-         flag below)\n\
+         the one exact fix (checkout, `git pull --ff-only`, `git pull --rebase`, or \
+         `--standalone`)\n\
          \x20 gated, feature branch, fresh: rides the bump, pushes, opens/ensures the PR, \
          pauses\n\
          \x20 gated, feature branch, already bumped (version line already in the diff): skip \
@@ -217,27 +212,27 @@ fn get_release_help() -> String {
          version line of its own): bumps AGAIN from the manifest version, names the untagged \
          one it is burning unless `bump finish` ships it first\n\
          \x20 gated, feature branch whose diff vs the default is empty or version-only: \
-         refuses, names the order flag below\n\
+         refuses, names `--standalone`\n\
          \x20 gated, feature branch where the title-guard slug != the branch name: refuse \
          before any mutation, prints `git branch -m <slug>`\n\
          \x20 gated, on default with commits not on origin (stranded): refuse with the \
          literal rescue commands, never auto-rescued\n\
          \x20 gated, on default, clean, tagged: refuse \"bump rides a feature PR\", names \
-         the order flag below\n\
+         `--standalone`\n\
          \x20 gate unknown, dirty tree, detached HEAD: refuse with the one exact fix\n\n\
-         SCOTT'S ORDER (the flag above with WORDS): his words, verbatim -- the one \
-         legitimate way to ship a release whose diff is empty or version-only (an empty \
-         diff, or a tagged/clean default with nothing new). On a tagged default this cuts \
-         (or reuses) a bump-vX-Y-Z branch and runs the GATED flow with the words quoted in \
-         the PR body; on an ungated tagged default the version commit itself is the release. \
-         Re-asking for this order is a violation: only pass it when Scott already gave the \
-         words in this session; otherwise STOP and report.\n\n\
+         --standalone \"<words>\": Scott's words, verbatim -- the one legitimate way to ship \
+         a release whose diff is empty or version-only (an empty diff, or a tagged/clean \
+         default with nothing new). On a tagged default this cuts (or reuses) a \
+         bump-vX-Y-Z branch and runs the GATED flow with the words quoted in the PR body; \
+         on an ungated tagged default the version commit itself is the release. Re-asking \
+         for this order is a violation: only pass it when Scott already gave the words in \
+         this session; otherwise STOP and report.\n\n\
          CI WAIT: no tag exists until the pushed sha's check runs + legacy commit status are \
-         all green (polled every 15s, up to the timeout flag above, default {ci_timeout}s). \
-         Red, truncated, or errored CI refuses with NO tag created; a re-run reuses the same \
-         version, it never bumps past it. The skip flag above bypasses the wait entirely -- \
-         for a human at a terminal who already knows the repo's CI story, not for an agent \
-         to get unstuck.\n\n\
+         all green (polled every 15s, up to --ci-timeout, default {ci_timeout}s). Red, \
+         truncated, or errored CI refuses with NO tag created; a re-run reuses the same \
+         version, it never bumps past it. --no-ci-gate bypasses the wait entirely -- for a \
+         human at a terminal who already knows the repo's CI story, not for an agent to get \
+         unstuck.\n\n\
          PERSONA TOKENS: gh calls are authed per-org -- a token file, then \
          GITHUB_PAT_<ORG>, then GITHUB_PAT_WORK for tatari-tv / GITHUB_PAT_HOME otherwise, \
          else ambient `gh auth` -- so a work-org PR/CI read never goes out under the wrong \
@@ -272,7 +267,7 @@ fn get_finish_help() -> String {
          install\n\
          \x20 origin/<default> version == last tag (nothing merged / bump never rode): \
          refuse \"no untagged version on <default>; bump rides a feature PR\", names \
-         Scott's order flag on `bump release` as the one door\n\
+         `bump release --standalone` as the one door\n\
          \x20 tag vX exists on the remote at the merged commit: no-op \"already released\" -- \
          install still runs, so a re-run after \"tag pushed, install failed\" installs \
          (--no-install to skip)\n\
@@ -287,8 +282,8 @@ fn get_finish_help() -> String {
          \x20 tracked changes in the current OR the resolved worktree: refuse before \
          anything moves (untracked files are fine, nothing is ever staged)\n\n\
          CI WAIT: same as `bump release --help` -- no tag until the merged sha's CI is green \
-         (default {ci_timeout}s, see the timeout flag above); the skip flag above bypasses \
-         the wait entirely.\n\n\
+         (default {ci_timeout}s, see --ci-timeout above); --no-ci-gate bypasses the wait \
+         entirely.\n\n\
          PERSONA TOKENS: same per-org resolution as `bump release --help` (a token file, then \
          GITHUB_PAT_<ORG>, then GITHUB_PAT_WORK/GITHUB_PAT_HOME, else ambient `gh auth`).\n\n\
          REQUIRED TOOLS:\n  {} {:<10} {}\n  {} {:<10} {}\n\n\
@@ -752,13 +747,14 @@ mod tests {
     /// must not repeat those literal substrings; the flag list is clap's own Options
     /// block, exercised end-to-end by `tests/release_cli.rs`.
     #[test]
-    fn test_release_after_help_does_not_repeat_the_three_flag_names() {
+    fn test_release_after_help_names_all_three_flags_literally() {
+        // Mirrors the design doc's amended acceptance criterion (presence, not line
+        // count): an agent reading --help should see `--standalone "<words>"`,
+        // `--no-ci-gate`, and `--ci-timeout` spelled out, not paraphrased.
         let help = get_release_help();
-        let matching_lines = help
-            .lines()
-            .filter(|l| l.contains("standalone") || l.contains("no-ci-gate") || l.contains("ci-timeout"))
-            .count();
-        assert_eq!(matching_lines, 0, "after-help must not repeat the flag names:\n{help}");
+        for flag in ["--standalone", "--no-ci-gate", "--ci-timeout"] {
+            assert!(help.contains(flag), "after-help must name {flag} literally:\n{help}");
+        }
     }
 
     #[test]
