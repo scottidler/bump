@@ -485,3 +485,84 @@ fn ungated_pending_version_is_pushed_and_tagged_not_rebumped() {
     assert_no_tag_anywhere(dir, "v0.1.7");
     drop(origin);
 }
+
+/// An UNGATED generic (no-manifest) repo: tag `v0.1.5` on origin, plus one unpushed work
+/// commit, so HEAD is ahead of origin/main. The version lives in tags alone.
+fn setup_generic_ungated_ahead() -> (TempDir, TempDir) {
+    let origin = TempDir::new().unwrap();
+    git_ok(origin.path(), &["init", "--bare", "-b", "main"]);
+    let work = TempDir::new().unwrap();
+    let w = work.path();
+    git_ok(w, &["init", "-b", "main"]);
+    git_ok(w, &["config", "user.email", "test@test.com"]);
+    git_ok(w, &["config", "user.name", "Test"]);
+    fs::write(w.join("a.txt"), "a").unwrap();
+    git_ok(w, &["add", "-A"]);
+    git_ok(w, &["commit", "-m", "init"]);
+    git_ok(w, &["tag", "-a", "v0.1.5", "-m", "v0.1.5"]);
+    git_ok(w, &["remote", "add", "origin", origin.path().to_str().unwrap()]);
+    git_ok(w, &["push", "-u", "origin", "main"]);
+    git_ok(w, &["push", "origin", "v0.1.5"]);
+    git_ok(w, &["remote", "set-head", "origin", "main"]);
+    fs::write(w.join("b.txt"), "b").unwrap();
+    git_ok(w, &["add", "-A"]);
+    git_ok(w, &["commit", "-m", "fix: work"]);
+    (origin, work)
+}
+
+/// Audit round 1, must-fix 1: v0.3.3 tagged an ungated generic repo; the CI gate's
+/// manifest-version check must not refuse a repo that has no manifest.
+#[test]
+fn ungated_generic_release_tags_and_pushes() {
+    let _guard = crate::ENV_LOCK.lock().unwrap();
+    let (origin, work) = setup_generic_ungated_ahead();
+    let dir = work.path();
+    let head = git::head_sha(dir).unwrap();
+
+    let pusher = RecordingPusher::new(false);
+    let installer = RecordingInstaller::new();
+    let prev = set_probe("ungated");
+    let report = release(dir, &auto_opts(None, false), &pusher, &installer, &no_pr(), &NoCi);
+    restore_probe(prev);
+
+    let report = report.expect("ungated generic release must tag");
+    assert_eq!(report.tag, "v0.1.6");
+    assert_eq!(
+        pusher.calls(),
+        vec!["branch:main".to_string(), "tag:v0.1.6".to_string()]
+    );
+    assert_eq!(git::remote_tag_commit(dir, "v0.1.6").unwrap(), Some(head));
+    drop(origin);
+}
+
+/// Audit round 1, must-fix 1: a red CI after the branch push leaves origin/main untagged;
+/// the re-run is the RESUME row (tags the same version on the same sha), never "nothing to
+/// release". A third run, now tagged, is "nothing to release".
+#[test]
+fn ungated_generic_red_ci_rerun_resumes() {
+    let _guard = crate::ENV_LOCK.lock().unwrap();
+    let (origin, work) = setup_generic_ungated_ahead();
+    let dir = work.path();
+    let head = git::head_sha(dir).unwrap();
+
+    let pusher = RecordingPusher::new(false);
+    let installer = RecordingInstaller::new();
+    let prev = set_probe("ungated");
+    let red = release(dir, &auto_opts(None, false), &pusher, &installer, &no_pr(), &RedCi);
+    let green = GreenCi::new();
+    let resumed = release(dir, &auto_opts(None, false), &pusher, &installer, &no_pr(), &green);
+    let again = release(dir, &auto_opts(None, false), &pusher, &installer, &no_pr(), &NoCi);
+    restore_probe(prev);
+
+    let err = red.expect_err("red CI must refuse").to_string();
+    assert!(err.contains("RED"), "got: {err}");
+    let report = resumed.expect("the re-run after red CI must resume");
+    assert!(report.resumed, "the re-run is the RESUME row");
+    assert_eq!(report.tag, "v0.1.6");
+    assert_eq!(green.asked(), vec![head.clone()]);
+    assert_eq!(git::remote_tag_commit(dir, "v0.1.6").unwrap(), Some(head));
+    let err = again.expect_err("a tagged tip has nothing to release").to_string();
+    assert!(err.contains("nothing to release"), "got: {err}");
+    assert_no_tag_anywhere(dir, "v0.1.7");
+    drop(origin);
+}

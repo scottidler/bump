@@ -4,6 +4,7 @@
 use super::Pusher;
 use super::ci::{CI_POLL_INTERVAL, Ci, CiGate, wait_for_green};
 use crate::git;
+use crate::lang::{self, ProjectType};
 use crate::version;
 use eyre::{Result, bail};
 use log::debug;
@@ -38,7 +39,9 @@ fn describe_version(version: &Option<Version>) -> String {
 /// 2. fetch origin/<default> fresh: the sha must EQUAL its tip. A tip that moved and still
 ///    carries the tag's version restarts the gate on the new tip; a different version
 ///    refuses with no tag;
-/// 3. the manifest at the sha must carry the tag's version;
+/// 3. the manifest at the sha must carry the tag's version (a generic repo has no manifest:
+///    its version lives in tags alone, so this sub-check is skipped and a moved tip, which
+///    no manifest can prove is the same release, refuses);
 /// 4. create the annotated tag ON THAT SHA (a local tag already there is kept);
 /// 5. fetch fresh again: the sha must still equal the tip, else refuse and leave the local
 ///    tag for the local-tag resume row;
@@ -67,12 +70,20 @@ pub(super) fn gate_tag_and_push<P: Pusher, C: Ci>(
         start_sha
     );
 
+    let generic = lang::detect_project_type(dir) == ProjectType::Generic;
     let mut sha = start_sha;
     loop {
         wait_for_green(dir, &sha, gate, ci, target)?;
         let tip = git::remote_tip(dir, default)?;
         if tip == sha {
             break;
+        }
+        if generic {
+            bail!(
+                "origin/{default} moved from {sha} to {tip} during the CI wait, and a generic repo has no manifest \
+                 to prove the new tip is still {tag}. NO tag was created.\n\
+                 Run: git pull --ff-only origin {default}, then {rerun}"
+            );
         }
         let at_tip = version_at(dir, &tip)?;
         if at_tip.as_ref() != Some(version) {
@@ -89,12 +100,14 @@ pub(super) fn gate_tag_and_push<P: Pusher, C: Ci>(
         sha = tip;
     }
 
-    let at_sha = version_at(dir, &sha)?;
-    if at_sha.as_ref() != Some(version) {
-        bail!(
-            "the manifest at {sha} carries {}, not {tag}; NO tag was created.",
-            describe_version(&at_sha)
-        );
+    if !generic {
+        let at_sha = version_at(dir, &sha)?;
+        if at_sha.as_ref() != Some(version) {
+            bail!(
+                "the manifest at {sha} carries {}, not {tag}; NO tag was created.",
+                describe_version(&at_sha)
+            );
+        }
     }
 
     if git::tag_exists(dir, tag)? {

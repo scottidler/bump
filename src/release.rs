@@ -425,12 +425,52 @@ fn classify(dir: &Path, opts: &ReleaseOpts) -> Result<ReleaseState> {
             let target_tag = compute_target_tag(dir, opts.bump_type.unwrap_or_default())?;
             Ok(ReleaseState::Release { target_tag, default })
         }
+        PendingCheck::NotPending if let Some(state) = classify_generic_resume(dir, opts, &default)? => Ok(state),
         PendingCheck::NotPending if opts.standalone.is_some() => {
             let target_tag = compute_target_tag(dir, opts.bump_type.unwrap_or_default())?;
             Ok(ReleaseState::UngatedStandalone { target_tag, default })
         }
         PendingCheck::NotPending => Ok(ReleaseState::Nothing { default }),
     }
+}
+
+/// Ungated GENERIC (no manifest), HEAD == origin: the version lives in tags alone, so an
+/// origin tip that no remote `v*` tag names is a release that died after its branch push
+/// (red CI, a killed run). That is the RESUME row for the tag the tip should carry: the
+/// latest local tag when it already sits at HEAD unpushed (the local-tag resume row), else
+/// the tag the level computes from the latest tag. `None` for a manifest repo, or a tip
+/// whose tag is already on origin (nothing to release).
+fn classify_generic_resume(dir: &Path, opts: &ReleaseOpts, default: &str) -> Result<Option<ReleaseState>> {
+    debug!("classify_generic_resume: dir={} default={}", dir.display(), default);
+    if lang::detect_project_type(dir) != ProjectType::Generic {
+        return Ok(None);
+    }
+    let head = git::head_sha(dir)?;
+    let local_tag_at_head = match git::get_latest_tag(dir)? {
+        Some(latest) if git::tag_sha(dir, &latest)? == head => Some(latest),
+        _ => None,
+    };
+    let tag = match local_tag_at_head {
+        Some(latest) if git::remote_tag_commit(dir, &latest)?.is_some() => return Ok(None),
+        Some(latest) => latest,
+        None => {
+            let tag = compute_target_tag(dir, opts.bump_type.unwrap_or_default())?;
+            if let Some(at) = git::remote_tag_commit(dir, &tag)? {
+                bail!(
+                    "origin already carries {tag} at {at}, but it is not in your local tags; NO tag was created.\n\
+                     Run: git fetch --tags origin, then bump release"
+                );
+            }
+            tag
+        }
+    };
+    debug!("classify_generic_resume: untagged origin tip {head} resumes {tag}");
+    Ok(Some(ReleaseState::UngatedPending {
+        version: version::parse_version(&tag)?,
+        tag,
+        default: default.to_string(),
+        ahead: false,
+    }))
 }
 
 /// Ungated, on default, the manifest carries a pending version: refuse a level flag that
