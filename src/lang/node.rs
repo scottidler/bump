@@ -46,18 +46,21 @@ pub fn package_json_path(dir: &Path) -> PathBuf {
 pub fn read_version(path: &Path) -> Result<Option<String>> {
     debug!("node::read_version: path={}", path.display());
     let content = fs::read_to_string(path).context(format!("Failed to read {}", path.display()))?;
-    let value: serde_json::Value =
-        serde_json::from_str(&content).context(format!("Failed to parse {} as JSON", path.display()))?;
+    read_version_from_str(&content)
+}
+
+/// Same as `read_version`, but from already-loaded content rather than a path on disk
+/// -- lets `git::manifest_version_at` parse a `git show <sha>:package.json` blob
+/// without writing it to a temp file first.
+pub fn read_version_from_str(content: &str) -> Result<Option<String>> {
+    let value: serde_json::Value = serde_json::from_str(content).context("Failed to parse package.json as JSON")?;
     match value.get("version") {
         None => {
             debug!("node::read_version: no top-level version field");
             Ok(None)
         }
         Some(serde_json::Value::String(s)) => Ok(Some(s.clone())),
-        Some(other) => bail!(
-            "package.json \"version\" is not a string (found {other}) in {}",
-            path.display()
-        ),
+        Some(other) => bail!("package.json \"version\" is not a string (found {other})"),
     }
 }
 

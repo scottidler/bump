@@ -497,7 +497,7 @@ fn tag_only(dir: &Path) -> Result<()> {
         TagState::Absent => {
             // Create the annotated tag on the merged commit.
             let message = format!("Release {new_tag}");
-            git::create_tag(dir, &new_tag, &message)?;
+            git::create_tag(dir, &new_tag, &message, &head)?;
             info!("tag_only: created tag {new_tag} at {head}");
             let short: String = head.chars().take(12).collect();
             println!("Tagged {new_tag} on merged {default} ({short})");
@@ -694,7 +694,7 @@ pub(crate) fn process_directory(dir: &Path, cli: &Cli, bump_type: BumpType) -> R
 
         // Create annotated tag (unless --no-tag)
         if create_tag {
-            git::create_tag(dir, &new_tag, &commit_message)?;
+            git::create_tag(dir, &new_tag, &commit_message, &git::head_sha(dir)?)?;
             info!("Created tag: {}", new_tag);
             println!("Committed and tagged {}", new_tag);
         } else {
@@ -741,7 +741,7 @@ pub(crate) fn process_directory(dir: &Path, cli: &Cli, bump_type: BumpType) -> R
             }
 
             if create_tag {
-                git::create_tag(dir, &new_tag, &commit_message)?;
+                git::create_tag(dir, &new_tag, &commit_message, &git::head_sha(dir)?)?;
                 info!("Created tag: {}", new_tag);
                 println!("Committed and tagged {}", new_tag);
             } else {
@@ -771,7 +771,7 @@ pub(crate) fn process_directory(dir: &Path, cli: &Cli, bump_type: BumpType) -> R
 
             if create_tag {
                 let tag_message = explicit_message.unwrap_or_else(|| format!("Bump version to {}", new_tag));
-                git::create_tag(dir, &new_tag, &tag_message)?;
+                git::create_tag(dir, &new_tag, &tag_message, &git::head_sha(dir)?)?;
                 info!("Created tag: {}", new_tag);
                 println!("Amended commit and tagged {}", new_tag);
             } else {

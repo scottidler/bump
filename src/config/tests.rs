@@ -77,6 +77,7 @@ fn effective_skip_members_cli_flag_overrides_config() {
     let config = Config {
         skip_members: vec!["from-config".to_string()],
         install: None,
+        ci: None,
     };
 
     let effective = effective_skip_members(&["from-cli".to_string()], &config);
@@ -89,11 +90,44 @@ fn effective_skip_members_falls_back_to_config_when_flag_absent() {
     let config = Config {
         skip_members: vec!["from-config".to_string()],
         install: None,
+        ci: None,
     };
 
     let effective = effective_skip_members(&[], &config);
 
     assert_eq!(effective, vec!["from-config".to_string()]);
+}
+
+#[test]
+fn load_parses_ci_none() {
+    let tmp = TempDir::new().unwrap();
+    fs::write(tmp.path().join(CONFIG_FILE_NAME), "ci: none\n").unwrap();
+
+    let config = load(tmp.path()).unwrap();
+
+    assert_eq!(config.ci, Some(CiDeclaration::None));
+}
+
+#[test]
+fn load_ci_absent_is_none() {
+    let tmp = TempDir::new().unwrap();
+    fs::write(tmp.path().join(CONFIG_FILE_NAME), "install: cargo install --path .\n").unwrap();
+
+    let config = load(tmp.path()).unwrap();
+
+    assert_eq!(config.ci, None);
+}
+
+/// `ci` accepts exactly one value; anything else is a loud, serde-driven error --
+/// same trust model as `deny_unknown_fields` on the rest of the file.
+#[test]
+fn load_ci_unknown_value_is_a_loud_error() {
+    let tmp = TempDir::new().unwrap();
+    fs::write(tmp.path().join(CONFIG_FILE_NAME), "ci: sometimes\n").unwrap();
+
+    let err = load(tmp.path()).unwrap_err().to_string();
+
+    assert!(err.contains("sometimes"), "error must name the offending value: {err}");
 }
 
 #[test]

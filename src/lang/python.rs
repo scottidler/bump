@@ -43,7 +43,13 @@ pub fn pyproject_toml_path(dir: &Path) -> std::path::PathBuf {
 pub fn read_version(pyproject_path: &Path) -> Result<Option<String>> {
     debug!("read_version: pyproject_path={}", pyproject_path.display());
     let content = fs::read_to_string(pyproject_path).context(format!("Failed to read {}", pyproject_path.display()))?;
+    read_version_from_str(&content)
+}
 
+/// Same as `read_version`, but from already-loaded content rather than a path on disk
+/// -- lets `git::manifest_version_at` parse a `git show <sha>:pyproject.toml` blob
+/// without writing it to a temp file first.
+pub fn read_version_from_str(content: &str) -> Result<Option<String>> {
     let doc = content
         .parse::<DocumentMut>()
         .context("Failed to parse pyproject.toml")?;

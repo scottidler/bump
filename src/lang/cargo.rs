@@ -10,7 +10,13 @@ use toml_edit::{DocumentMut, Item, Value};
 pub fn read_version(cargo_toml_path: &Path) -> Result<Option<String>> {
     let content =
         fs::read_to_string(cargo_toml_path).context(format!("Failed to read {}", cargo_toml_path.display()))?;
+    read_version_from_str(&content)
+}
 
+/// Same as `read_version`, but from already-loaded content rather than a path on disk
+/// -- lets `git::manifest_version_at` parse a `git show <sha>:Cargo.toml` blob without
+/// writing it to a temp file first.
+pub fn read_version_from_str(content: &str) -> Result<Option<String>> {
     let doc = content.parse::<DocumentMut>().context("Failed to parse Cargo.toml")?;
 
     // Try [package] version first

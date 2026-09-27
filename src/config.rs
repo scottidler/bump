@@ -18,6 +18,18 @@ use std::path::Path;
 /// The repo-root config file name (never XDG -- see module docs).
 pub const CONFIG_FILE_NAME: &str = "bump.yml";
 
+/// A repo's committed declaration about its own CI, read by the release verb's CI
+/// gate (Phase 3). `None` is the only accepted value today: this repo's workflows
+/// never register any check on a push to the default branch, so the gate should skip
+/// waiting rather than spend its 120s "appear window" every release. Any other value
+/// is a loud, serde-driven "unknown variant" error -- same trust model as
+/// `deny_unknown_fields` on `Config` itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CiDeclaration {
+    None,
+}
+
 /// Repo-local facts. Unknown keys are a loud error naming the offending key
 /// (`deny_unknown_fields`) -- a typo in `bump.yml` must never silently no-op.
 #[derive(Debug, Default, Clone, PartialEq, serde::Deserialize)]
@@ -34,6 +46,12 @@ pub struct Config {
     /// and exposes the fact, it does not invent release-verb behavior.
     #[serde(default)]
     pub install: Option<String>,
+
+    /// This repo's CI declaration (see `CiDeclaration`). `None` (the Rust `Option`,
+    /// not the `CiDeclaration` variant) means the repo made no declaration -- the CI
+    /// gate (Phase 3) decides from the `.github/workflows` tree instead.
+    #[serde(default)]
+    pub ci: Option<CiDeclaration>,
 }
 
 /// Load `bump.yml` from the ROOT of `dir` (the directory bump is processing, not XDG).
@@ -60,8 +78,8 @@ pub fn load(dir: &Path) -> Result<Config> {
         serde_yaml::from_str(&contents).map_err(|e| eyre::eyre!("failed to parse {}: {e}", path.display()))?;
     info!("load: loaded config from {}", path.display());
     debug!(
-        "load: skip_members={:?} install={:?}",
-        config.skip_members, config.install
+        "load: skip_members={:?} install={:?} ci={:?}",
+        config.skip_members, config.install, config.ci
     );
     Ok(config)
 }

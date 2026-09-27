@@ -90,10 +90,13 @@ pub fn commit(path: &Path, message: &str) -> Result<()> {
     Ok(())
 }
 
-/// Create an annotated tag with the given message
-pub fn create_tag(path: &Path, tag: &str, message: &str) -> Result<()> {
+/// Create an annotated tag on the EXPLICIT `sha`, never implicit HEAD. The release
+/// verb's re-verify invariant (design doc, "Tag placement and the two re-verifies")
+/// depends on this: the tag must bind to the sha a fresh fetch just confirmed, not to
+/// whatever HEAD happens to be when this call runs.
+pub fn create_tag(path: &Path, tag: &str, message: &str, sha: &str) -> Result<()> {
     let output = Command::new("git")
-        .args(["tag", "-a", tag, "-m", message])
+        .args(["tag", "-a", tag, "-m", message, sha])
         .current_dir(path)
         .output()
         .context("Failed to run git tag")?;
@@ -363,6 +366,59 @@ pub fn fetch_branch(path: &Path, branch: &str) -> Result<()> {
     Ok(())
 }
 
+/// Fetch `branch` and return origin's FRESH tip sha: `fetch_branch` then
+/// `rev-parse origin/<branch>`. The release verb's re-verify step (design doc, "Tag
+/// placement and the two re-verifies") calls this immediately before creating the tag
+/// and again immediately before pushing it, so both checks see origin as it is right
+/// now, never a stale local view.
+// Wired into the CI-gate re-verify starting in Phase 3.
+#[allow(dead_code)]
+pub fn remote_tip(path: &Path, branch: &str) -> Result<String> {
+    debug!("remote_tip: path={} branch={}", path.display(), branch);
+    fetch_branch(path, branch)?;
+    rev_parse(path, &format!("origin/{branch}"))
+}
+
+/// The manifest version at a historical commit (`git show <sha>:<manifest>`), not the
+/// working tree. Detects the ecosystem from the working-tree `dir` (a repo's manifest
+/// kind -- Cargo.toml vs pyproject.toml vs package.json -- does not change commit to
+/// commit within a release) and reads the raw blob content via `git show`, then parses
+/// it with the same per-ecosystem logic `read_file_version` uses on disk
+/// (`lang::read_version_from_content`). `Ok(None)` for a `Generic` repo (no manifest to
+/// read) or when the manifest did not exist yet at `sha`; together with `remote_tip`
+/// this answers the release verb's re-verify question: does the sha that just became
+/// origin's tip still carry the pending version?
+// Wired into the CI-gate re-verify starting in Phase 3.
+#[allow(dead_code)]
+pub fn manifest_version_at(dir: &Path, sha: &str) -> Result<Option<String>> {
+    debug!("manifest_version_at: dir={} sha={}", dir.display(), sha);
+    let project_type = crate::lang::detect_project_type(dir);
+    if project_type == crate::lang::ProjectType::Generic {
+        return Ok(None);
+    }
+    let manifest = crate::lang::version_file_name(project_type);
+    let spec = format!("{sha}:{manifest}");
+    let output = Command::new("git")
+        .args(["show", &spec])
+        .current_dir(dir)
+        .output()
+        .context("Failed to run git show")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // The manifest simply didn't exist yet at this sha (e.g. a very early commit
+        // predating the manifest's own addition) -- not a version, not an error.
+        if stderr.contains("does not exist") || stderr.contains("exists on disk, but not in") {
+            debug!("manifest_version_at: {manifest} absent at {sha}");
+            return Ok(None);
+        }
+        bail!("git show {} failed: {}", spec, stderr.trim());
+    }
+
+    let content = String::from_utf8_lossy(&output.stdout).into_owned();
+    crate::lang::read_version_from_content(project_type, &content)
+}
+
 /// Compare local HEAD to `origin/<branch>` (call `fetch_branch` first).
 pub fn compare_head_to_remote(path: &Path, branch: &str) -> Result<HeadRemote> {
     let head = head_sha(path)?;
@@ -454,15 +510,18 @@ pub fn remote_tag_commit(path: &Path, tag: &str) -> Result<Option<String>> {
     Ok(plain)
 }
 
-/// Push a single branch to origin BY NAME. Never `--tags`, never `--follow-tags`,
-/// never `--force`. `bump release`'s strengthened ordering pushes the branch first and
-/// only tags after confirming it landed, so a rejected branch push can never strand a tag.
+/// Push a single branch to origin BY NAME. Never `--tags`, never `--force`; always
+/// `--no-follow-tags` so a stray local tag (e.g. an old `v*` sitting on the branch
+/// tip) can never ride along -- tagging is the release verb's own, separate step, only
+/// ever by explicit name. `bump release`'s strengthened ordering pushes the branch
+/// first and only tags after confirming it landed, so a rejected branch push can never
+/// strand a tag.
 ///
 /// Wired to `release::GitPusher::push_branch` in production.
 pub fn push_branch(path: &Path, branch: &str) -> Result<()> {
     debug!("push_branch: path={} branch={}", path.display(), branch);
     let output = Command::new("git")
-        .args(["push", "origin", branch])
+        .args(["push", "--no-follow-tags", "origin", branch])
         .current_dir(path)
         .output()
         .context("Failed to run git push")?;
@@ -746,11 +805,11 @@ mod tests {
             "branch must be on origin after push_branch"
         );
         // Tag push lands the annotated tag on origin BY NAME.
-        create_tag(work.path(), "v0.1.0", "v0.1.0").unwrap();
+        let head = head_sha(work.path()).unwrap();
+        create_tag(work.path(), "v0.1.0", "v0.1.0", &head).unwrap();
         push_tag(work.path(), "v0.1.0").unwrap();
         // `remote_tag_sha` peels the annotated tag: it must return the underlying COMMIT,
         // not the tag object's own SHA, and that commit must equal HEAD.
-        let head = head_sha(work.path()).unwrap();
         assert_eq!(
             remote_tag_sha(work.path(), "v0.1.0").unwrap(),
             Some(head),
@@ -790,7 +849,8 @@ mod tests {
             push_branch(work.path(), "main").is_err(),
             "push_branch must error when origin is missing"
         );
-        create_tag(work.path(), "v0.1.0", "v0.1.0").unwrap();
+        let head = head_sha(work.path()).unwrap();
+        create_tag(work.path(), "v0.1.0", "v0.1.0", &head).unwrap();
         assert!(
             push_tag(work.path(), "v0.1.0").is_err(),
             "push_tag must error when origin is missing"
@@ -911,6 +971,77 @@ mod tests {
             checkout_new_tracking(work.path(), "dup", "origin/main").is_err(),
             "checking out an already-existing branch name must error"
         );
+    }
+
+    #[test]
+    fn remote_tip_fetches_and_resolves_origins_fresh_tip() {
+        let (_origin, work) = bare_remote_and_clone();
+        push_branch(work.path(), "main").unwrap();
+        let head = head_sha(work.path()).unwrap();
+
+        assert_eq!(remote_tip(work.path(), "main").unwrap(), head);
+
+        // A second push moves origin's tip; `remote_tip` must report the NEW tip, not a
+        // stale locally-cached one.
+        std::fs::write(work.path().join("more.txt"), "more").unwrap();
+        git_in(work.path(), &["add", "-A"]);
+        git_in(work.path(), &["commit", "-m", "more work"]);
+        push_branch(work.path(), "main").unwrap();
+        let new_head = head_sha(work.path()).unwrap();
+        assert_ne!(new_head, head);
+        assert_eq!(remote_tip(work.path(), "main").unwrap(), new_head);
+    }
+
+    #[test]
+    fn remote_tip_errors_on_unknown_branch() {
+        let (_origin, work) = bare_remote_and_clone();
+        push_branch(work.path(), "main").unwrap();
+        assert!(remote_tip(work.path(), "no-such-branch").is_err());
+    }
+
+    /// Write a minimal `Cargo.toml` carrying `version`, commit it, and return the new HEAD
+    /// sha -- gives `manifest_version_at` a real Rust manifest to read at a specific commit.
+    fn commit_cargo_version(dir: &Path, version: &str) -> String {
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            format!("[package]\nname = \"fixture\"\nversion = \"{version}\"\n"),
+        )
+        .unwrap();
+        git_in(dir, &["add", "-A"]);
+        git_in(dir, &["commit", "-m", format!("set version {version}").as_str()]);
+        head_sha(dir).unwrap()
+    }
+
+    #[test]
+    fn manifest_version_at_reads_the_version_at_a_historical_commit() {
+        let (_origin, work) = bare_remote_and_clone();
+        let first = commit_cargo_version(work.path(), "0.1.0");
+        let second = commit_cargo_version(work.path(), "0.2.0");
+
+        assert_eq!(
+            manifest_version_at(work.path(), &first).unwrap(),
+            Some("0.1.0".to_string())
+        );
+        assert_eq!(
+            manifest_version_at(work.path(), &second).unwrap(),
+            Some("0.2.0".to_string())
+        );
+    }
+
+    #[test]
+    fn manifest_version_at_none_before_manifest_existed() {
+        let (_origin, work) = bare_remote_and_clone();
+        let before_manifest = head_sha(work.path()).unwrap();
+        commit_cargo_version(work.path(), "0.1.0");
+
+        assert_eq!(manifest_version_at(work.path(), &before_manifest).unwrap(), None);
+    }
+
+    #[test]
+    fn manifest_version_at_none_for_generic_repo() {
+        let (_origin, work) = bare_remote_and_clone();
+        let head = head_sha(work.path()).unwrap();
+        assert_eq!(manifest_version_at(work.path(), &head).unwrap(), None);
     }
 
     #[test]

@@ -586,9 +586,10 @@ fn execute_release<P: Pusher, I: Installer, R: Pr>(
     // 3. Confirm it landed on origin BEFORE any tag exists (a rejected push errored above
     //    and we never reach here; a push that reported success but didn't land is caught).
     confirm_on_origin(dir, default)?;
-    // 4. Only now create the annotated tag on the confirmed commit.
+    // 4. Only now create the annotated tag, on the sha `confirm_on_origin` just
+    //    confirmed IS origin/<default>'s tip -- never implicit HEAD.
     let message = format!("Release {target_tag}");
-    git::create_tag(dir, target_tag, &message)?;
+    git::create_tag(dir, target_tag, &message, &git::head_sha(dir)?)?;
     // 5. Push the tag BY EXPLICIT NAME.
     ports.pusher.push_tag(dir, target_tag)?;
     println!("Released {target_tag} on {default}");
@@ -642,7 +643,7 @@ fn execute_resume<P: Pusher, I: Installer, R: Pr>(
 
     if !local_tag_present {
         let message = format!("Release {tag}");
-        git::create_tag(dir, tag, &message)?;
+        git::create_tag(dir, tag, &message, &git::head_sha(dir)?)?;
     }
     // The version is already on origin (that is what makes this a resume), but confirm
     // before pushing the tag so the invariant holds on this path too.
@@ -869,7 +870,7 @@ pub fn finish<P: Pusher, I: Installer>(
         // commit, push by name, install.
         TagState::Absent => {
             let message = format!("Release {tag}");
-            git::create_tag(dir, &tag, &message)?;
+            git::create_tag(dir, &tag, &message, &git::head_sha(dir)?)?;
             pusher.push_tag(dir, &tag)?;
             println!("released {tag} on {default}");
             let install_command = run_install(dir, &opts.install, &config, installer)?;

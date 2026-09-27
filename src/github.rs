@@ -298,16 +298,53 @@ fn token_path(org: &str) -> Option<PathBuf> {
     Some(base.join("github").join("tokens").join(org))
 }
 
-/// Build a `gh` command with per-org auth: set `GH_TOKEN` from the org's token
-/// file when one exists, else fall back to ambient `gh auth` (recorded at debug).
+/// The env var carrying the token for `org`, in the persona vocabulary the dotfiles
+/// `gh()` shell function uses (`GITHUB_PAT_WORK` for the work org, `GITHUB_PAT_HOME`
+/// for everything else). bump runs `gh` as a subprocess, where that shell function does
+/// not exist, so the same selection has to happen here or a work-org call goes out as
+/// the home account and 404s like "no access".
+fn persona_token_var(org: &str) -> &'static str {
+    match org {
+        "tatari-tv" => "GITHUB_PAT_WORK",
+        _ => "GITHUB_PAT_HOME",
+    }
+}
+
+/// Resolve the token for `org`: the org's token file, then `GITHUB_PAT_<ORG>` (`-` as
+/// `_`, uppercased), then the persona env var (`persona_token_var`), else `None`
+/// (ambient `gh auth` applies). Tokens are only ever read into the subprocess env,
+/// never printed or logged -- debug logs name the variable/source, not the value.
+fn token_for_org(org: &str) -> Option<String> {
+    if let Some(token) = token_path(org).and_then(|p| fs::read_to_string(p).ok()) {
+        let token = token.trim();
+        if !token.is_empty() {
+            debug!("token_for_org: {org} -> token file");
+            return Some(token.to_string());
+        }
+    }
+    let org_var = format!("GITHUB_PAT_{}", org.to_uppercase().replace('-', "_"));
+    for var in [org_var.as_str(), persona_token_var(org)] {
+        if let Ok(token) = env::var(var)
+            && !token.trim().is_empty()
+        {
+            debug!("token_for_org: {org} -> ${var}");
+            return Some(token.trim().to_string());
+        }
+    }
+    debug!("token_for_org: {org} -> no token found; using ambient gh auth");
+    None
+}
+
+/// Build a `gh` command with per-org auth: `GH_TOKEN` from `token_for_org`, else
+/// ambient `gh auth` (recorded at debug).
 fn gh_command(org: &str) -> Command {
     let mut cmd = Command::new("gh");
-    match token_path(org).and_then(|p| fs::read_to_string(p).ok()) {
-        Some(token) if !token.trim().is_empty() => {
-            cmd.env("GH_TOKEN", token.trim());
+    match token_for_org(org) {
+        Some(token) => {
+            cmd.env("GH_TOKEN", token);
         }
-        _ => {
-            debug!("gh_command: no token file for {org}; using ambient gh auth");
+        None => {
+            debug!("gh_command: no token for {org}; using ambient gh auth");
         }
     }
     cmd
@@ -442,6 +479,145 @@ pub fn create_pr(path: &Path, branch: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// The legacy commit-status API's combined verdict for a commit (`GET
+/// .../commits/{sha}/status`), read off `total_count` first -- see `status_from_json`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum StatusState {
+    Success,
+    Pending,
+    Failure,
+    /// Zero legacy statuses registered on this commit at all (the common case: most
+    /// repos never used this API). Distinct from `Pending` on purpose -- see
+    /// `status_from_json`.
+    #[default]
+    None,
+}
+
+/// Summary of what GitHub currently reports for one commit, across BOTH the check-runs
+/// API and the legacy commit-status API. `wait_for_green` (Phase 3) is the only
+/// consumer that decides pass/fail from this; this phase only builds it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CheckRuns {
+    /// Check runs GitHub actually returned (never the API's own `total_count` --
+    /// see `check_runs_from_json`'s truncation check).
+    pub total: usize,
+    pub incomplete: usize,
+    /// `(name, html_url)` of every run whose conclusion is not success/skipped/neutral.
+    pub failed: Vec<(String, String)>,
+    /// The legacy commit-status API's combined verdict for the same sha.
+    pub statuses: StatusState,
+}
+
+/// Parse the `check-runs` API payload into a `CheckRuns` summary (the `statuses` field
+/// is left at its default; `check_runs` fills it in from the separate legacy-status
+/// read). A missing `check_runs` array is a loud error, never a silent empty summary.
+/// Truncation -- the API's own `total_count` claiming more runs than were actually
+/// returned (i.e. `per_page=100` wasn't enough) -- is ALSO a loud error: a truncated
+/// read cannot tell red from green, so it must never be read as "all green so far".
+pub fn check_runs_from_json(text: &str) -> Result<CheckRuns> {
+    let value: serde_json::Value = serde_json::from_str(text).context("check-runs payload is not JSON")?;
+    let runs = value
+        .get("check_runs")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| eyre::eyre!("check-runs payload has no check_runs array"))?;
+
+    if let Some(total_count) = value.get("total_count").and_then(|v| v.as_u64()) {
+        let total_count = total_count as usize;
+        if total_count > runs.len() {
+            eyre::bail!(
+                "check-runs payload truncated: total_count={} but only {} returned",
+                total_count,
+                runs.len()
+            );
+        }
+    }
+
+    let mut summary = CheckRuns {
+        total: runs.len(),
+        ..CheckRuns::default()
+    };
+    for run in runs {
+        let status = run.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        if status != "completed" {
+            summary.incomplete += 1;
+            continue;
+        }
+        let conclusion = run.get("conclusion").and_then(|v| v.as_str()).unwrap_or("");
+        if !matches!(conclusion, "success" | "skipped" | "neutral") {
+            let name = run.get("name").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+            let url = run.get("html_url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            summary.failed.push((name, url));
+        }
+    }
+    Ok(summary)
+}
+
+/// Parse the legacy commit-status API payload (`GET .../commits/{sha}/status`) into a
+/// `StatusState`. Read off `total_count`, NEVER off `state` alone: a commit with ZERO
+/// statuses registered reports `state: "pending"` (observed 2026-09-26 on
+/// `scottidler/bump`), so keying on `state` would poll every such repo to the
+/// `--ci-timeout` ceiling waiting for a status that will never arrive. `total_count ==
+/// 0` -> `None` regardless of `state`; otherwise `state` decides, and any value other
+/// than `success`/`pending` (e.g. `failure`, `error`) is `Failure` -- fail closed on an
+/// unrecognized state rather than silently proceeding.
+pub fn status_from_json(text: &str) -> Result<StatusState> {
+    let value: serde_json::Value = serde_json::from_str(text).context("status payload is not JSON")?;
+    let total_count = value
+        .get("total_count")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| eyre::eyre!("status payload has no total_count"))?;
+    if total_count == 0 {
+        return Ok(StatusState::None);
+    }
+    let state = value
+        .get("state")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| eyre::eyre!("status payload has no state"))?;
+    Ok(match state {
+        "success" => StatusState::Success,
+        "pending" => StatusState::Pending,
+        _ => StatusState::Failure,
+    })
+}
+
+/// The check runs AND legacy statuses GitHub currently reports for `sha` in the repo at
+/// `path`, merged into one `CheckRuns`. `Ok(None)` when the repo has no GitHub remote
+/// (nothing to wait on). Any non-success `gh api` result on EITHER read, or truncation
+/// on the check-runs read, is `Err` -- the CI gate (Phase 3) fails closed on both.
+/// Wired to `release::GhCi` in production starting in Phase 3.
+#[allow(dead_code)]
+pub fn check_runs(path: &Path, sha: &str) -> Result<Option<CheckRuns>> {
+    debug!("check_runs: path={} sha={}", path.display(), sha);
+    let Some(slug) = remote_slug(path) else {
+        return Ok(None);
+    };
+    let org = org_of(&slug);
+
+    let runs_endpoint = format!("repos/{slug}/commits/{sha}/check-runs?per_page=100");
+    let runs_output = run_gh(org, &["api", &runs_endpoint]).context("gh api check-runs failed")?;
+    if !runs_output.status.success() {
+        eyre::bail!(
+            "gh api {} failed: {}",
+            runs_endpoint,
+            String::from_utf8_lossy(&runs_output.stderr).trim()
+        );
+    }
+    let mut summary = check_runs_from_json(&String::from_utf8_lossy(&runs_output.stdout))?;
+
+    let status_endpoint = format!("repos/{slug}/commits/{sha}/status");
+    let status_output = run_gh(org, &["api", &status_endpoint]).context("gh api status failed")?;
+    if !status_output.status.success() {
+        eyre::bail!(
+            "gh api {} failed: {}",
+            status_endpoint,
+            String::from_utf8_lossy(&status_output.stderr).trim()
+        );
+    }
+    summary.statuses = status_from_json(&String::from_utf8_lossy(&status_output.stdout))?;
+
+    Ok(Some(summary))
 }
 
 #[cfg(test)]
@@ -607,5 +783,94 @@ mod tests {
         assert!(is_retryable_error("connection reset by peer"));
         assert!(is_retryable_error("HTTP 503 Service Unavailable"));
         assert!(!is_retryable_error("Not Found (HTTP 404)"));
+    }
+
+    #[test]
+    fn check_runs_from_json_counts_incomplete_and_failed() {
+        let payload = r#"{"total_count":4,"check_runs":[
+            {"name":"ci","status":"completed","conclusion":"success","html_url":"u1"},
+            {"name":"lint","status":"in_progress","conclusion":null,"html_url":"u2"},
+            {"name":"test","status":"completed","conclusion":"failure","html_url":"u3"},
+            {"name":"opt","status":"completed","conclusion":"skipped","html_url":"u4"}
+        ]}"#;
+        let summary = check_runs_from_json(payload).unwrap();
+        assert_eq!(summary.total, 4);
+        assert_eq!(summary.incomplete, 1);
+        assert_eq!(summary.failed, vec![("test".to_string(), "u3".to_string())]);
+        assert_eq!(
+            summary.statuses,
+            StatusState::None,
+            "unset until check_runs merges it in"
+        );
+    }
+
+    #[test]
+    fn check_runs_from_json_empty_array_is_zero() {
+        let summary = check_runs_from_json(r#"{"total_count":0,"check_runs":[]}"#).unwrap();
+        assert_eq!(summary, CheckRuns::default());
+    }
+
+    #[test]
+    fn check_runs_from_json_missing_check_runs_key_is_a_loud_error() {
+        assert!(
+            check_runs_from_json("[]").is_err(),
+            "no check_runs key must be loud, never a silent empty summary"
+        );
+        assert!(check_runs_from_json(r#"{"total_count":0}"#).is_err());
+    }
+
+    #[test]
+    fn check_runs_from_json_truncation_is_a_loud_error() {
+        let runs: Vec<String> = (0..100)
+            .map(|i| format!(r#"{{"name":"r{i}","status":"completed","conclusion":"success","html_url":""}}"#))
+            .collect();
+        let payload = format!(r#"{{"total_count":101,"check_runs":[{}]}}"#, runs.join(","));
+        let err = check_runs_from_json(&payload).unwrap_err().to_string();
+        assert!(err.contains("truncated"), "error must name the truncation: {err}");
+    }
+
+    #[test]
+    fn status_from_json_zero_total_is_none_even_when_state_says_pending() {
+        // The observed real-world payload (scottidler/bump): zero statuses, but `state`
+        // itself reads "pending" -- must be read as None, not Pending, or the CI gate
+        // would poll every zero-status repo to the timeout.
+        let state = status_from_json(r#"{"total_count":0,"state":"pending"}"#).unwrap();
+        assert_eq!(state, StatusState::None);
+    }
+
+    #[test]
+    fn status_from_json_maps_success_and_pending() {
+        assert_eq!(
+            status_from_json(r#"{"total_count":1,"state":"success"}"#).unwrap(),
+            StatusState::Success
+        );
+        assert_eq!(
+            status_from_json(r#"{"total_count":1,"state":"pending"}"#).unwrap(),
+            StatusState::Pending
+        );
+    }
+
+    #[test]
+    fn status_from_json_unrecognized_state_fails_closed_as_failure() {
+        assert_eq!(
+            status_from_json(r#"{"total_count":1,"state":"failure"}"#).unwrap(),
+            StatusState::Failure
+        );
+        assert_eq!(
+            status_from_json(r#"{"total_count":1,"state":"error"}"#).unwrap(),
+            StatusState::Failure
+        );
+    }
+
+    #[test]
+    fn status_from_json_missing_total_count_is_a_loud_error() {
+        assert!(status_from_json(r#"{"state":"success"}"#).is_err());
+    }
+
+    #[test]
+    fn persona_token_var_maps_work_org_and_defaults_home() {
+        assert_eq!(persona_token_var("tatari-tv"), "GITHUB_PAT_WORK");
+        assert_eq!(persona_token_var("scottidler"), "GITHUB_PAT_HOME");
+        assert_eq!(persona_token_var("some-other-org"), "GITHUB_PAT_HOME");
     }
 }

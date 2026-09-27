@@ -218,6 +218,20 @@ pub fn read_file_version(dir: &Path, project_type: ProjectType) -> Result<Option
     }
 }
 
+/// Parse a version out of already-loaded manifest CONTENT for `project_type` (never
+/// reads a file itself) -- the content-based counterpart to `read_file_version`, used
+/// by `git::manifest_version_at` to read a manifest at a historical commit
+/// (`git show <sha>:<manifest>`) without writing the blob to disk first. `Generic` has
+/// no manifest at all, so it always reads `None`.
+pub fn read_version_from_content(project_type: ProjectType, content: &str) -> Result<Option<String>> {
+    match project_type {
+        ProjectType::Rust => cargo::read_version_from_str(content),
+        ProjectType::Python => python::read_version_from_str(content),
+        ProjectType::Node => node::read_version_from_str(content),
+        ProjectType::Generic => Ok(None),
+    }
+}
+
 /// Get the version file name for display purposes. `Generic` has no manifest at all (its
 /// version lives only in git tags), so this returns a parenthetical rather than "" --
 /// an empty string produced grammatically broken messages like "needs a version in ;
