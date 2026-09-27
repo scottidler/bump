@@ -649,7 +649,7 @@ pub(crate) fn process_directory(dir: &Path, cli: &Cli, bump_type: BumpType) -> R
         if !create_tag {
             println!("[dry-run] Would commit version bump to {} (no tag)", new_file_version);
         } else if !has_changes && !git::head_has_tag(dir)? {
-            let is_pushed = git::is_head_pushed(dir)?;
+            let is_pushed = cli.never_amend || git::is_head_pushed(dir)?;
             if is_pushed {
                 println!("[dry-run] Would create new commit and tag: {}", new_tag);
             } else {
@@ -709,7 +709,7 @@ pub(crate) fn process_directory(dir: &Path, cli: &Cli, bump_type: BumpType) -> R
         }
 
         // Check if HEAD has been pushed
-        let is_pushed = git::is_head_pushed(dir)?;
+        let is_pushed = cli.never_amend || git::is_head_pushed(dir)?;
 
         // Update version file(s): write EVERY detected manifest in lockstep and sync
         // their lockfiles.
@@ -890,6 +890,9 @@ fn dispatch_release(dir: &Path, args: &cli::ReleaseArgs) -> Result<()> {
         bump_type: BumpType::from_cli(args.major, args.minor),
         dry_run: args.dry_run,
         install: install_choice(&args.install, args.no_install),
+        standalone: args.standalone.clone(),
+        ci_gate: !args.no_ci_gate,
+        ci_timeout: std::time::Duration::from_secs(args.ci_timeout),
     };
     debug!("dispatch_release: dir={} opts={:?}", dir.display(), opts);
     if let Err(e) = release::release(
@@ -898,6 +901,7 @@ fn dispatch_release(dir: &Path, args: &cli::ReleaseArgs) -> Result<()> {
         &release::GitPusher,
         &release::ShellInstaller,
         &release::GhPr,
+        &release::GhCi,
     ) {
         eprintln!("Error: {:#}", e);
         std::process::exit(1);
@@ -911,9 +915,17 @@ fn dispatch_finish(dir: &Path, args: &cli::FinishArgs) -> Result<()> {
     let opts = release::FinishOpts {
         dry_run: args.dry_run,
         install: install_choice(&args.install, args.no_install),
+        ci_gate: !args.no_ci_gate,
+        ci_timeout: std::time::Duration::from_secs(args.ci_timeout),
     };
     debug!("dispatch_finish: dir={} opts={:?}", dir.display(), opts);
-    if let Err(e) = release::finish(dir, &opts, &release::GitPusher, &release::ShellInstaller) {
+    if let Err(e) = release::finish(
+        dir,
+        &opts,
+        &release::GitPusher,
+        &release::ShellInstaller,
+        &release::GhCi,
+    ) {
         eprintln!("Error: {:#}", e);
         std::process::exit(1);
     }

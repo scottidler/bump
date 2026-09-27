@@ -117,10 +117,27 @@ pub fn head_has_tag(path: &Path) -> Result<bool> {
     Ok(output.status.success())
 }
 
-/// Check if HEAD has been pushed to the remote tracking branch
-/// Returns false if there's no upstream or if HEAD is ahead of upstream
+/// Is HEAD already published on the remote? True when ANY `origin/*` ref contains it,
+/// or when it is an ancestor of its upstream. The amend path in `process_directory`
+/// keys off this: a false negative amends a commit that is already on origin.
+///
+/// The first check exists because the upstream check alone is wrong on a branch that
+/// was just cut from `origin/<default>` and has no upstream yet: HEAD IS on origin
+/// (it is origin/main), but `@{u}` is unset, so the old answer was "not pushed" and
+/// `bump --no-tag` amended a commit sitting on origin/main into local-only divergence
+/// (tatari-tv/marquee, 2026-09-26, ~/HALL-OF-SHAME.md).
 pub fn is_head_pushed(path: &Path) -> Result<bool> {
-    // First check if we have an upstream
+    debug!("is_head_pushed: path={}", path.display());
+    let contained = Command::new("git")
+        .args(["branch", "-r", "--contains", "HEAD"])
+        .current_dir(path)
+        .output()
+        .context("Failed to run git branch -r --contains")?;
+    if contained.status.success() && !String::from_utf8_lossy(&contained.stdout).trim().is_empty() {
+        debug!("is_head_pushed: HEAD is contained in a remote-tracking ref");
+        return Ok(true);
+    }
+
     let upstream_check = Command::new("git")
         .args(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
         .current_dir(path)
@@ -128,7 +145,7 @@ pub fn is_head_pushed(path: &Path) -> Result<bool> {
         .context("Failed to check upstream")?;
 
     if !upstream_check.status.success() {
-        // No upstream configured - not pushed
+        // No upstream and no remote ref contains HEAD: unpublished.
         return Ok(false);
     }
 
@@ -720,4 +737,110 @@ mod tests {
         assert!(result.is_ok());
         // The actual value depends on working tree state
     }
+}
+
+/// Subjects of the commits on HEAD that are not on `base`, oldest first. The PR body and
+/// the title's conventional-commit type are derived from these.
+pub fn commit_subjects(path: &Path, base: &str) -> Result<Vec<String>> {
+    debug!("commit_subjects: path={} base={}", path.display(), base);
+    let range = format!("{base}..HEAD");
+    let output = Command::new("git")
+        .args(["log", "--reverse", "--format=%s", &range])
+        .current_dir(path)
+        .output()
+        .context("Failed to run git log")?;
+    if !output.status.success() {
+        bail!("git log {} failed: {}", range, String::from_utf8_lossy(&output.stderr));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// Create `branch` at `upstream` and check it out, with `upstream` as its tracking ref:
+/// `git checkout -b <branch> --track <upstream>`. The standalone release path uses this so
+/// the new branch has an upstream from its first second (see `is_head_pushed`).
+pub fn checkout_new_tracking(path: &Path, branch: &str, upstream: &str) -> Result<()> {
+    debug!(
+        "checkout_new_tracking: path={} branch={} upstream={}",
+        path.display(),
+        branch,
+        upstream
+    );
+    let output = Command::new("git")
+        .args(["checkout", "-b", branch, "--track", upstream])
+        .current_dir(path)
+        .output()
+        .context("Failed to run git checkout -b")?;
+    if !output.status.success() {
+        bail!(
+            "git checkout -b {} --track {} failed: {}",
+            branch,
+            upstream,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
+}
+
+/// The worktree (of the repository containing `path`) that has `branch` checked out, or
+/// `None`. `bump finish` runs from wherever the agent is, which under a worktree layout is
+/// usually a feature-branch worktree while the default branch lives in the main checkout;
+/// `git checkout <default>` fails there ("already checked out"), so finish goes to the
+/// worktree that holds it instead.
+pub fn worktree_for_branch(path: &Path, branch: &str) -> Result<Option<std::path::PathBuf>> {
+    debug!("worktree_for_branch: path={} branch={}", path.display(), branch);
+    let output = Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(path)
+        .output()
+        .context("Failed to run git worktree list")?;
+    if !output.status.success() {
+        bail!(
+            "git worktree list failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let wanted = format!("refs/heads/{branch}");
+    let mut current: Option<std::path::PathBuf> = None;
+    for line in text.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            current = Some(std::path::PathBuf::from(p));
+        } else if let Some(r) = line.strip_prefix("branch ") {
+            if r == wanted {
+                return Ok(current);
+            }
+        } else if line.is_empty() {
+            current = None;
+        }
+    }
+    Ok(None)
+}
+
+/// Paths changed on HEAD relative to `base` (`git diff --name-only base...HEAD`).
+pub fn changed_files(path: &Path, base: &str) -> Result<Vec<String>> {
+    debug!("changed_files: path={} base={}", path.display(), base);
+    let range = format!("{base}...HEAD");
+    let output = Command::new("git")
+        .args(["diff", "--name-only", &range])
+        .current_dir(path)
+        .output()
+        .context("Failed to run git diff --name-only")?;
+    if !output.status.success() {
+        bail!(
+            "git diff --name-only {} failed: {}",
+            range,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect())
 }

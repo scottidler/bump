@@ -298,16 +298,51 @@ fn token_path(org: &str) -> Option<PathBuf> {
     Some(base.join("github").join("tokens").join(org))
 }
 
-/// Build a `gh` command with per-org auth: set `GH_TOKEN` from the org's token
-/// file when one exists, else fall back to ambient `gh auth` (recorded at debug).
+/// The env var carrying the token for `org`, in the persona vocabulary the dotfiles
+/// `gh()` shell function uses (`GITHUB_PAT_WORK` for the work org, `GITHUB_PAT_HOME`
+/// for everything else). bump runs `gh` as a subprocess, where that shell function does
+/// not exist, so the same selection has to happen here or a work-org call goes out as
+/// the home account and 404s like "no access".
+fn persona_token_var(org: &str) -> &'static str {
+    match org {
+        "tatari-tv" => "GITHUB_PAT_WORK",
+        _ => "GITHUB_PAT_HOME",
+    }
+}
+
+/// Resolve the token for `org`: the org's token file, then the org-named env var
+/// (`GITHUB_PAT_<ORG>` with `-` as `_`), then the persona env var, else `None` (ambient
+/// `gh auth`).
+fn token_for_org(org: &str) -> Option<String> {
+    if let Some(token) = token_path(org).and_then(|p| fs::read_to_string(p).ok()) {
+        let token = token.trim();
+        if !token.is_empty() {
+            debug!("token_for_org: {org} -> token file");
+            return Some(token.to_string());
+        }
+    }
+    let org_var = format!("GITHUB_PAT_{}", org.to_uppercase().replace('-', "_"));
+    for var in [org_var.as_str(), persona_token_var(org)] {
+        if let Ok(token) = env::var(var) {
+            if !token.trim().is_empty() {
+                debug!("token_for_org: {org} -> ${var}");
+                return Some(token.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Build a `gh` command with per-org auth: `GH_TOKEN` from `token_for_org`, else the
+/// ambient `gh auth` (recorded at debug).
 fn gh_command(org: &str) -> Command {
     let mut cmd = Command::new("gh");
-    match token_path(org).and_then(|p| fs::read_to_string(p).ok()) {
-        Some(token) if !token.trim().is_empty() => {
-            cmd.env("GH_TOKEN", token.trim());
+    match token_for_org(org) {
+        Some(token) => {
+            cmd.env("GH_TOKEN", token);
         }
-        _ => {
-            debug!("gh_command: no token file for {org}; using ambient gh auth");
+        None => {
+            debug!("gh_command: no token for {org}; using ambient gh auth");
         }
     }
     cmd
@@ -423,25 +458,82 @@ pub fn open_pr_exists(path: &Path, branch: &str) -> Result<bool> {
     Ok(exists)
 }
 
-/// Open a PR for the current branch with `gh pr create --fill`. Only ever called behind
-/// `open_pr_exists` returning false -- `gh pr create --fill` ERRORS on an existing open PR
-/// (known gh behavior, Phase 0 addendum), so this is a race backstop, not the primary
-/// guard. Wired to `release::GhPr::create_pr` in production.
-pub fn create_pr(path: &Path, branch: &str) -> Result<()> {
-    debug!("create_pr: path={} branch={}", path.display(), branch);
+/// Open a PR for `branch` against `base` with an explicit title and body. Only ever called
+/// behind `open_pr_exists` returning false (`gh pr create` errors on an existing open PR,
+/// so that is a race backstop, not the primary guard). Returns the PR url gh prints.
+/// Wired to `release::GhPr::create_pr` in production.
+pub fn create_pr(path: &Path, branch: &str, base: &str, title: &str, body: &str) -> Result<String> {
+    debug!("create_pr: path={} branch={} base={} title={:?}", path.display(), branch, base, title);
     let org = remote_slug(path).map(|s| org_of(&s).to_string()).unwrap_or_default();
     let output = gh_command(&org)
-        .args(["pr", "create", "--fill"])
+        .args([
+            "pr", "create", "--head", branch, "--base", base, "--title", title, "--body", body,
+        ])
         .current_dir(path)
         .output()
         .context("Failed to run gh pr create")?;
     if !output.status.success() {
         eyre::bail!(
-            "gh pr create --fill failed: {}",
+            "gh pr create failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    Ok(())
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Summary of the check runs GitHub reports for one commit.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CheckRuns {
+    pub total: usize,
+    pub incomplete: usize,
+    /// `(name, html_url)` of every run whose conclusion is not success/skipped/neutral.
+    pub failed: Vec<(String, String)>,
+}
+
+/// Parse the `check-runs` API payload into a `CheckRuns` summary.
+pub fn check_runs_from_json(text: &str) -> Result<CheckRuns> {
+    let value: serde_json::Value = serde_json::from_str(text).context("check-runs payload is not JSON")?;
+    let runs = value
+        .get("check_runs")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| eyre::eyre!("check-runs payload has no check_runs array"))?;
+    let mut summary = CheckRuns {
+        total: runs.len(),
+        ..CheckRuns::default()
+    };
+    for run in runs {
+        let status = run.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        if status != "completed" {
+            summary.incomplete += 1;
+            continue;
+        }
+        let conclusion = run.get("conclusion").and_then(|v| v.as_str()).unwrap_or("");
+        if !matches!(conclusion, "success" | "skipped" | "neutral") {
+            let name = run.get("name").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+            let url = run.get("html_url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            summary.failed.push((name, url));
+        }
+    }
+    Ok(summary)
+}
+
+/// The check runs GitHub currently reports for `sha` in the repo at `path`. `Ok(None)`
+/// when the repo has no GitHub remote (nothing to wait on). Wired to `release::GhCi`.
+pub fn check_runs(path: &Path, sha: &str) -> Result<Option<CheckRuns>> {
+    debug!("check_runs: path={} sha={}", path.display(), sha);
+    let Some(slug) = remote_slug(path) else {
+        return Ok(None);
+    };
+    let endpoint = format!("repos/{slug}/commits/{sha}/check-runs?per_page=100");
+    let output = run_gh(org_of(&slug), &["api", &endpoint]).context("gh api check-runs failed")?;
+    if !output.status.success() {
+        eyre::bail!(
+            "gh api {} failed: {}",
+            endpoint,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(Some(check_runs_from_json(&String::from_utf8_lossy(&output.stdout))?))
 }
 
 #[cfg(test)]
@@ -464,6 +556,34 @@ mod tests {
                 "number"
             ]
         );
+    }
+
+    #[test]
+    fn check_runs_from_json_counts_incomplete_and_failed() {
+        let payload = r#"{"check_runs":[
+            {"name":"ci","status":"completed","conclusion":"success","html_url":"u1"},
+            {"name":"lint","status":"in_progress","conclusion":null,"html_url":"u2"},
+            {"name":"test","status":"completed","conclusion":"failure","html_url":"u3"},
+            {"name":"opt","status":"completed","conclusion":"skipped","html_url":"u4"}
+        ]}"#;
+        let summary = check_runs_from_json(payload).unwrap();
+        assert_eq!(summary.total, 4);
+        assert_eq!(summary.incomplete, 1);
+        assert_eq!(summary.failed, vec![("test".to_string(), "u3".to_string())]);
+    }
+
+    #[test]
+    fn check_runs_from_json_empty_is_zero() {
+        let summary = check_runs_from_json(r#"{"check_runs":[]}"#).unwrap();
+        assert_eq!(summary, CheckRuns::default());
+        assert!(check_runs_from_json("[]").is_err(), "no check_runs key must be loud");
+    }
+
+    #[test]
+    fn persona_token_var_maps_work_org_and_defaults_home() {
+        assert_eq!(persona_token_var("tatari-tv"), "GITHUB_PAT_WORK");
+        assert_eq!(persona_token_var("scottidler"), "GITHUB_PAT_HOME");
+        assert_eq!(persona_token_var("anything-else"), "GITHUB_PAT_HOME");
     }
 
     #[test]

@@ -47,6 +47,12 @@ pub struct Cli {
     #[arg(short = 'f', long)]
     pub force: bool,
 
+    /// Never fold the version bump into an unpushed HEAD commit; always make a new commit.
+    /// Not a flag: set internally by `bump release`, whose version commit must be its own
+    /// commit so the PR shows it and the idempotent re-run can see it
+    #[arg(skip)]
+    pub never_amend: bool,
+
     /// Bump version and commit, but do NOT create a tag (for PR-gated repos)
     #[arg(long, conflicts_with = "tag_only")]
     pub no_tag: bool,
@@ -116,9 +122,24 @@ pub struct ReleaseArgs {
     /// Skip the post-release install step entirely
     #[arg(long, conflicts_with = "install")]
     pub no_install: bool,
+
+    /// Scott explicitly ordered a standalone (version-only) release: his words, quoted
+    /// verbatim. Without this a bump-only branch or an already-tagged default branch
+    /// refuses; with it the order is quoted into the PR body (gated) or printed (ungated)
+    #[arg(long, value_name = "WORDS")]
+    pub standalone: Option<String>,
+
+    /// Tag without waiting for CI to go green on the commit (re-arms the double-tap;
+    /// only for repos with no CI)
+    #[arg(long)]
+    pub no_ci_gate: bool,
+
+    /// Seconds to wait for CI before giving up with no tag created
+    #[arg(long, value_name = "SECS", default_value_t = crate::release::DEFAULT_CI_TIMEOUT_SECS)]
+    pub ci_timeout: u64,
 }
 
-/// `bump finish [-n] [--install "<cmd>"|--no-install]`
+/// `bump finish [-n] [--install "<cmd>"|--no-install] [--no-ci-gate] [--ci-timeout SECS]`
 #[derive(clap::Args, Debug)]
 pub struct FinishArgs {
     /// Preview every command that would run; execute nothing
@@ -132,6 +153,15 @@ pub struct FinishArgs {
     /// Skip the post-release install step entirely
     #[arg(long, conflicts_with = "install")]
     pub no_install: bool,
+
+    /// Tag without waiting for CI to go green on the merged commit (re-arms the
+    /// double-tap; only for repos with no CI)
+    #[arg(long)]
+    pub no_ci_gate: bool,
+
+    /// Seconds to wait for CI before giving up with no tag created
+    #[arg(long, value_name = "SECS", default_value_t = crate::release::DEFAULT_CI_TIMEOUT_SECS)]
+    pub ci_timeout: u64,
 }
 
 /// Generate the `bump release --help` after-help text: the state table (condensed) plus
@@ -140,24 +170,30 @@ fn get_release_help() -> String {
     let git_status = check_tool_version("git", "--version", "2.20.0");
     let gh_status = check_tool_version("gh", "--version", "2.0.0");
     format!(
-        "STATE TABLE (see the design doc for the full table):\n\
-         \x20 ungated, on default, ahead of origin: version commit -> push branch -> confirm \
-         on origin -> tag -> push tag -> install\n\
-         \x20 ungated, not on default: refuse \"checkout <default>, then bump release\"\n\
-         \x20 ungated, behind origin: refuse \"git pull --ff-only origin <default>\"\n\
-         \x20 ungated, nothing ahead + already tagged: refuse \"nothing to release\"\n\
-         \x20 ungated RESUME (origin carries the version, remote tag missing): tag if \
-         absent, push tag, install -- never re-bumps, never claims \"already released\"\n\
-         \x20 gated, on a feature branch, fresh: bump rides the branch (--no-tag) -> push \
-         branch -> ensure PR open -> pause: \"merge the PR, then run: bump finish\"\n\
-         \x20 gated, on a feature branch, already bumped: skip re-bump, ensure branch/PR, \
-         same pause; a mismatched -m/-M level refuses naming both versions\n\
-         \x20 gated, on default with commits not on origin (stranded): refuse with the \
-         literal rescue commands (git branch/reset/checkout), never auto-rescued\n\
-         \x20 gated, on default, clean: refuse \"bump rides a feature PR; branch first\"\n\
-         \x20 gate unknown, dirty tree, detached HEAD: refuse with the one exact fix\n\n\
+        "THE TWO FLOWS (bump --gates picks; this verb runs the right one end to end):\n\
+         \x20 UNGATED, on default, ahead of origin: version commit -> push default -> confirm \
+         on origin -> WAIT FOR GREEN CI -> tag -> push tag by name -> install\n\
+         \x20 GATED, on a feature branch carrying work: version commit rides the branch -> push \
+         branch -> open the PR (title from the branch, body with \"Release: rides this PR\") \
+         -> pause: \"merge the PR, then run: bump finish\"\n\n\
+         REFUSALS, each naming the one exact next command:\n\
+         \x20 ungated, not on default / behind origin / nothing to release\n\
+         \x20 gated, on default, clean (bump rides a feature PR; branch first)\n\
+         \x20 gated, on default with commits not on origin (stranded): literal rescue commands\n\
+         \x20 gated, feature branch whose diff vs origin/<default> is empty or version lines \
+         only: a bump-only branch, forbidden without --standalone\n\
+         \x20 gated, branch name with '/' or '.': rename first (the PR title derives from it)\n\
+         \x20 gated re-run with a -m/-M level that implies a different version than the one riding\n\
+         \x20 gate unknown, dirty tree, detached HEAD\n\n\
+         RESUME: origin carries the version, remote tag missing (a prior run died or CI was \
+         red): tags THAT version after CI is green, never bumps past it.\n\n\
+         --standalone \"<Scott's words>\": Scott explicitly ordered a version-only release. \
+         Gated: cuts bump-vX-Y-Z off origin/<default>, bumps on it, opens the PR quoting him, \
+         pauses. Ungated: bumps the default branch and releases it. Using it without his order \
+         is a hall-of-shame offense.\n\n\
          REQUIRED TOOLS:\n  {} {:<10} {}\n  {} {:<10} {}\n\n\
-         gh probes branch-protection gates and opens/lists PRs; `bump release` FAILS \
+         gh probes gates, opens/lists PRs and reads check runs; the work org's token comes \
+         from GITHUB_PAT_WORK, everything else from GITHUB_PAT_HOME. `bump release` FAILS \
          CLOSED on an unknown gate verdict (it pushes, unlike plain bump).\n\n\
          Logs are written to: {}",
         git_status.status_icon,
@@ -175,19 +211,20 @@ fn get_finish_help() -> String {
     let git_status = check_tool_version("git", "--version", "2.20.0");
     let gh_status = check_tool_version("gh", "--version", "2.0.0");
     format!(
-        "STATE TABLE (see the design doc for the full table):\n\
-         \x20 origin/<default> carries an untagged version (the merged bump): checkout -> \
-         pull --ff-only -> tag the merged commit -> push tag -> install\n\
+        "THE POST-MERGE HALF of a gated release. Run it from ANY worktree of the repo: it \
+         finishes in whichever worktree has <default> checked out.\n\
+         \x20 origin/<default> carries an untagged version (the merged bump): pull --ff-only \
+         -> WAIT FOR GREEN CI on the merged commit -> tag it -> push tag by name -> install\n\
          \x20 origin/<default> version == last tag (nothing merged / bump never rode): \
          refuse \"no untagged version on <default>; bump rides a feature PR\"\n\
          \x20 tag vX exists on the remote at the merged commit: no-op \"already released\"\n\
          \x20 tag vX exists LOCALLY only (prior run died before/during the tag push): \
-         resume -- push tag by name, install; never reported as already released\n\
+         resume -- wait for CI, push tag by name, install; never reported as already released\n\
          \x20 generic repo (no manifest), gated: refuse -- finish cannot derive a version\n\
-         \x20 tracked changes in the tree: refuse before checkout (would clobber them; \
-         untracked files are fine, nothing is ever staged)\n\n\
+         \x20 tracked changes in the tree: refuse before anything moves (untracked files are \
+         fine, nothing is ever staged)\n\n\
          REQUIRED TOOLS:\n  {} {:<10} {}\n  {} {:<10} {}\n\n\
-         gh is used only indirectly (via `bump release`'s PR); finish itself only needs git.\n\n\
+         gh reads the merged commit's check runs for the CI gate; --no-ci-gate skips it.\n\n\
          Logs are written to: {}",
         git_status.status_icon,
         "git",
