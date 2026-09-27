@@ -6,6 +6,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 use tempfile::NamedTempFile;
 
 mod cli;
@@ -884,21 +885,39 @@ fn install_choice(install: &Option<String>, no_install: bool) -> release::Instal
     }
 }
 
+/// Build `ReleaseOpts` from the parsed `bump release` args. Pure (no I/O), so the CLI ->
+/// opts mapping is testable without touching git: `--standalone` reaches `standalone` as
+/// `Some(words)`, `--no-ci-gate` flips `ci_gate` to `false`, `--ci-timeout` reaches
+/// `ci_timeout` as the given `Duration`, and no level flag reaches `bump_type` as `None`.
+fn release_opts_from_args(args: &cli::ReleaseArgs) -> release::ReleaseOpts {
+    // No level flag is `None`: the verb takes a pending version, else patches.
+    let bump_type = (args.major || args.minor).then(|| BumpType::from_cli(args.major, args.minor));
+    release::ReleaseOpts {
+        bump_type,
+        dry_run: args.dry_run,
+        install: install_choice(&args.install, args.no_install),
+        standalone: args.standalone.clone(),
+        ci_gate: !args.no_ci_gate,
+        ci_timeout: Duration::from_secs(args.ci_timeout),
+    }
+}
+
+/// Build `FinishOpts` from the parsed `bump finish` args. Pure, same mapping as
+/// `release_opts_from_args` for the two CI flags.
+fn finish_opts_from_args(args: &cli::FinishArgs) -> release::FinishOpts {
+    release::FinishOpts {
+        dry_run: args.dry_run,
+        install: install_choice(&args.install, args.no_install),
+        ci_gate: !args.no_ci_gate,
+        ci_timeout: Duration::from_secs(args.ci_timeout),
+    }
+}
+
 /// `bump release`: build `ReleaseOpts` from the parsed args and run the verb against its
 /// production ports. Every refusal maps to a nonzero exit, exactly like `process_directory`
 /// errors do today; the gated happy-path pause and any no-op-shaped success exit 0.
 fn dispatch_release(dir: &Path, args: &cli::ReleaseArgs) -> Result<()> {
-    // No level flag is `None`: the verb takes a pending version, else patches.
-    let bump_type = (args.major || args.minor).then(|| BumpType::from_cli(args.major, args.minor));
-    let opts = release::ReleaseOpts {
-        bump_type,
-        dry_run: args.dry_run,
-        install: install_choice(&args.install, args.no_install),
-        // `--standalone` is Phase 6's flag; until then the verb only sees no order.
-        standalone: None,
-        ci_gate: true,
-        ci_timeout: release::DEFAULT_CI_TIMEOUT,
-    };
+    let opts = release_opts_from_args(args);
     debug!("dispatch_release: dir={} opts={:?}", dir.display(), opts);
     if let Err(e) = release::release(
         dir,
@@ -917,12 +936,7 @@ fn dispatch_release(dir: &Path, args: &cli::ReleaseArgs) -> Result<()> {
 /// `bump finish`: build `FinishOpts` from the parsed args and run the verb against its
 /// production ports. Same exit-code mapping as `dispatch_release`.
 fn dispatch_finish(dir: &Path, args: &cli::FinishArgs) -> Result<()> {
-    let opts = release::FinishOpts {
-        dry_run: args.dry_run,
-        install: install_choice(&args.install, args.no_install),
-        ci_gate: true,
-        ci_timeout: release::DEFAULT_CI_TIMEOUT,
-    };
+    let opts = finish_opts_from_args(args);
     debug!("dispatch_finish: dir={} opts={:?}", dir.display(), opts);
     if let Err(e) = release::finish(
         dir,
@@ -2383,6 +2397,107 @@ name = "test-pkg"
     #[test]
     fn install_choice_neither_flag_is_auto() {
         assert_eq!(install_choice(&None, false), release::InstallChoice::Auto);
+    }
+
+    // =========================================================================
+    // PHASE 6: CLI surface -- `--standalone`, `--no-ci-gate`, `--ci-timeout` reach
+    // `ReleaseOpts`/`FinishOpts` exactly as parsed, and the absent level flag stays
+    // `bump_type: None` (the pending-version/patch default the verb classifies itself).
+    // =========================================================================
+
+    #[test]
+    fn release_opts_from_args_standalone_reaches_opts_as_some_words() {
+        let cli = Cli::try_parse_from(["bump", "release", "--standalone", "release them to prod"]).unwrap();
+        let cli::Commands::Release(args) = cli.command.unwrap() else {
+            panic!("expected Release");
+        };
+        let opts = release_opts_from_args(&args);
+        assert_eq!(opts.standalone, Some("release them to prod".to_string()));
+    }
+
+    #[test]
+    fn release_opts_from_args_no_standalone_is_none() {
+        let cli = Cli::try_parse_from(["bump", "release"]).unwrap();
+        let cli::Commands::Release(args) = cli.command.unwrap() else {
+            panic!("expected Release");
+        };
+        assert_eq!(release_opts_from_args(&args).standalone, None);
+    }
+
+    #[test]
+    fn release_opts_from_args_no_ci_gate_flips_ci_gate_false() {
+        let cli = Cli::try_parse_from(["bump", "release", "--no-ci-gate"]).unwrap();
+        let cli::Commands::Release(args) = cli.command.unwrap() else {
+            panic!("expected Release");
+        };
+        assert!(!release_opts_from_args(&args).ci_gate);
+    }
+
+    #[test]
+    fn release_opts_from_args_ci_gate_defaults_true() {
+        let cli = Cli::try_parse_from(["bump", "release"]).unwrap();
+        let cli::Commands::Release(args) = cli.command.unwrap() else {
+            panic!("expected Release");
+        };
+        assert!(release_opts_from_args(&args).ci_gate);
+    }
+
+    #[test]
+    fn release_opts_from_args_ci_timeout_reaches_opts_as_the_given_duration() {
+        let cli = Cli::try_parse_from(["bump", "release", "--ci-timeout", "42"]).unwrap();
+        let cli::Commands::Release(args) = cli.command.unwrap() else {
+            panic!("expected Release");
+        };
+        assert_eq!(release_opts_from_args(&args).ci_timeout, Duration::from_secs(42));
+    }
+
+    #[test]
+    fn release_opts_from_args_ci_timeout_defaults_to_release_default() {
+        let cli = Cli::try_parse_from(["bump", "release"]).unwrap();
+        let cli::Commands::Release(args) = cli.command.unwrap() else {
+            panic!("expected Release");
+        };
+        assert_eq!(release_opts_from_args(&args).ci_timeout, release::DEFAULT_CI_TIMEOUT);
+    }
+
+    #[test]
+    fn release_opts_from_args_absent_level_is_bump_type_none() {
+        let cli = Cli::try_parse_from(["bump", "release"]).unwrap();
+        let cli::Commands::Release(args) = cli.command.unwrap() else {
+            panic!("expected Release");
+        };
+        assert_eq!(release_opts_from_args(&args).bump_type, None);
+    }
+
+    #[test]
+    fn release_opts_from_args_explicit_level_is_some() {
+        let cli = Cli::try_parse_from(["bump", "release", "-m"]).unwrap();
+        let cli::Commands::Release(args) = cli.command.unwrap() else {
+            panic!("expected Release");
+        };
+        assert_eq!(release_opts_from_args(&args).bump_type, Some(BumpType::Minor));
+    }
+
+    #[test]
+    fn finish_opts_from_args_no_ci_gate_and_ci_timeout() {
+        let cli = Cli::try_parse_from(["bump", "finish", "--no-ci-gate", "--ci-timeout", "7"]).unwrap();
+        let cli::Commands::Finish(args) = cli.command.unwrap() else {
+            panic!("expected Finish");
+        };
+        let opts = finish_opts_from_args(&args);
+        assert!(!opts.ci_gate);
+        assert_eq!(opts.ci_timeout, Duration::from_secs(7));
+    }
+
+    #[test]
+    fn finish_opts_from_args_defaults() {
+        let cli = Cli::try_parse_from(["bump", "finish"]).unwrap();
+        let cli::Commands::Finish(args) = cli.command.unwrap() else {
+            panic!("expected Finish");
+        };
+        let opts = finish_opts_from_args(&args);
+        assert!(opts.ci_gate);
+        assert_eq!(opts.ci_timeout, release::DEFAULT_CI_TIMEOUT);
     }
 
     /// `--help`'s log path must come from the SAME source `setup_logging` uses -- this

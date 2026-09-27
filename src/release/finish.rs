@@ -292,7 +292,7 @@ fn finish_dry_run(
     println!("[dry-run] (tag-only ladder: require HEAD == origin/{default} before tagging)");
     println!("[dry-run] (only if the merged version is untagged; already released runs only the install:)");
     echo_tag_steps(&tag, default, &ci_gate(opts.ci_gate, opts.ci_timeout), false);
-    echo_install(&install_command);
+    echo_install(dir, &opts.install, &install_command);
     Ok(ReleaseReport {
         install_command,
         dry_run: true,

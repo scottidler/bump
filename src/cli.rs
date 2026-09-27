@@ -1,7 +1,15 @@
+use crate::release::DEFAULT_CI_TIMEOUT;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::LazyLock;
+
+/// `--ci-timeout`'s default, in seconds -- the single source of truth is
+/// `release::DEFAULT_CI_TIMEOUT`; clap's `default_value_t` needs the plain `u64` it
+/// renders into `--help`, not a `Duration`.
+fn default_ci_timeout_secs() -> u64 {
+    DEFAULT_CI_TIMEOUT.as_secs()
+}
 
 static HELP_TEXT: LazyLock<String> = LazyLock::new(get_tool_validation_help);
 static RELEASE_HELP_TEXT: LazyLock<String> = LazyLock::new(get_release_help);
@@ -101,7 +109,8 @@ pub enum Commands {
     Finish(FinishArgs),
 }
 
-/// `bump release [-m|-M] [-n] [--install "<cmd>"|--no-install]`
+/// `bump release [-m|-M] [-n] [--install "<cmd>"|--no-install] [--standalone "<words>"]
+/// [--no-ci-gate] [--ci-timeout SECS]`
 #[derive(clap::Args, Debug)]
 pub struct ReleaseArgs {
     /// Bump major version (X.0.0)
@@ -123,9 +132,28 @@ pub struct ReleaseArgs {
     /// Skip the post-release install step entirely
     #[arg(long, conflicts_with = "install")]
     pub no_install: bool,
+
+    /// Scott's standalone order, verbatim: the one legitimate way to ship a bump-only
+    /// release (a branch/default whose diff is empty or version-only otherwise refuses).
+    /// Quoted into the PR body (gated) or printed (ungated). Re-asking for this order is
+    /// a violation -- an agent runs this flag only when Scott already gave the words in
+    /// this session.
+    #[arg(long, value_name = "WORDS")]
+    pub standalone: Option<String>,
+
+    /// Skip the CI gate: tag immediately after the push instead of waiting for green CI
+    /// on the sha. For a human at a terminal who already knows the repo's CI story; an
+    /// agent should not reach for this to get unstuck.
+    #[arg(long)]
+    pub no_ci_gate: bool,
+
+    /// How long the CI gate waits on incomplete check runs before refusing (seconds).
+    /// Never tags on a timeout -- the re-run reuses the same version.
+    #[arg(long, value_name = "SECS", default_value_t = default_ci_timeout_secs())]
+    pub ci_timeout: u64,
 }
 
-/// `bump finish [-n] [--install "<cmd>"|--no-install]`
+/// `bump finish [-n] [--install "<cmd>"|--no-install] [--no-ci-gate] [--ci-timeout SECS]`
 #[derive(clap::Args, Debug)]
 pub struct FinishArgs {
     /// Preview every command that would run; execute nothing
@@ -139,33 +167,85 @@ pub struct FinishArgs {
     /// Skip the post-release install step entirely
     #[arg(long, conflicts_with = "install")]
     pub no_install: bool,
+
+    /// Skip the CI gate: tag the merged commit immediately instead of waiting for green
+    /// CI on it.
+    #[arg(long)]
+    pub no_ci_gate: bool,
+
+    /// How long the CI gate waits on incomplete check runs before refusing (seconds).
+    #[arg(long, value_name = "SECS", default_value_t = default_ci_timeout_secs())]
+    pub ci_timeout: u64,
 }
 
-/// Generate the `bump release --help` after-help text: the state table (condensed) plus
-/// required tools and the runtime log path, matching `get_tool_validation_help`'s sources.
+/// Generate the `bump release --help` after-help text: the state table (condensed), the
+/// two flows and their refusals, RESUME, Scott's order flag, the CI wait, the persona
+/// token rule, required tools and the runtime log path, matching
+/// `get_tool_validation_help`'s sources.
+///
+/// Deliberately does NOT repeat the flag names (`--standalone`, `--no-ci-gate`,
+/// `--ci-timeout`) verbatim below the Options block -- the acceptance criterion
+/// `bump release --help | grep -cE 'standalone|no-ci-gate|ci-timeout'` == 3 counts every
+/// LINE naming them, and clap's own Options block is the one place they should appear.
 fn get_release_help() -> String {
     let git_status = check_tool_version("git", "--version", "2.20.0");
     let gh_status = check_tool_version("gh", "--version", "2.0.0");
     format!(
-        "STATE TABLE (see the design doc for the full table):\n\
-         \x20 ungated, on default, ahead of origin: version commit -> push branch -> confirm \
-         on origin -> tag -> push tag -> install\n\
-         \x20 ungated, not on default: refuse \"checkout <default>, then bump release\"\n\
-         \x20 ungated, behind origin: refuse \"git pull --ff-only origin <default>\"\n\
-         \x20 ungated, nothing ahead + already tagged: refuse \"nothing to release\"\n\
-         \x20 ungated RESUME (origin carries the version, remote tag missing): tag if \
-         absent, push tag, install -- never re-bumps, never claims \"already released\"\n\
-         \x20 gated, on a feature branch, fresh: bump rides the branch (--no-tag) -> push \
-         branch -> ensure PR open -> pause: \"merge the PR, then run: bump finish\"\n\
-         \x20 gated, on a feature branch, already bumped: skip re-bump, ensure branch/PR, \
-         same pause; a mismatched -m/-M level refuses naming both versions\n\
+        "TWO FLOWS, decided by `bump --gates` (never both):\n\
+         \x20 UNGATED: version commit -> push origin <default> -> confirm on origin -> wait \
+         for green CI -> tag the verified sha -> push tag -> install\n\
+         \x20 GATED:   version commit rides the feature branch -> push branch \
+         (no tags follow it) -> open a PR if none is open (title/body built from the branch \
+         and its commits) -> pause: \"merge the PR, then run: bump finish\"\n\n\
+         STATE TABLE (condensed; see the design doc's API Design section for the full table):\n\
+         \x20 ungated, on default, ahead of origin, no pending version: the UNGATED flow above\n\
+         \x20 ungated, PENDING VERSION (manifest untagged, not below the latest tag): that \
+         version IS the release -- pushed if ahead, never re-bumped past it, an explicit \
+         -m/-M implying a different version refuses naming both\n\
+         \x20 ungated RESUME (pending version, HEAD == origin): wait for green CI, tag, push \
+         tag, install -- never reported as \"already released\"\n\
+         \x20 ungated, manifest below the latest tag: refuse by name; bump never lowers a \
+         version\n\
+         \x20 ungated, not on default / behind / diverged / nothing to release: refuse with \
+         the one exact fix (checkout, `git pull --ff-only`, `git pull --rebase`, or the order \
+         flag below)\n\
+         \x20 gated, feature branch, fresh: rides the bump, pushes, opens/ensures the PR, \
+         pauses\n\
+         \x20 gated, feature branch, already bumped (version line already in the diff): skip \
+         the re-bump, ensure branch/PR, same pause; a mismatched level refuses naming both\n\
+         \x20 gated, feature branch, PENDING VERSION inherited from the default branch (no \
+         version line of its own): bumps AGAIN from the manifest version, names the untagged \
+         one it is burning unless `bump finish` ships it first\n\
+         \x20 gated, feature branch whose diff vs the default is empty or version-only: \
+         refuses, names the order flag below\n\
+         \x20 gated, feature branch where the title-guard slug != the branch name: refuse \
+         before any mutation, prints `git branch -m <slug>`\n\
          \x20 gated, on default with commits not on origin (stranded): refuse with the \
-         literal rescue commands (git branch/reset/checkout), never auto-rescued\n\
-         \x20 gated, on default, clean: refuse \"bump rides a feature PR; branch first\"\n\
+         literal rescue commands, never auto-rescued\n\
+         \x20 gated, on default, clean, tagged: refuse \"bump rides a feature PR\", names \
+         the order flag below\n\
          \x20 gate unknown, dirty tree, detached HEAD: refuse with the one exact fix\n\n\
+         SCOTT'S ORDER (the flag above with WORDS): his words, verbatim -- the one \
+         legitimate way to ship a release whose diff is empty or version-only (an empty \
+         diff, or a tagged/clean default with nothing new). On a tagged default this cuts \
+         (or reuses) a bump-vX-Y-Z branch and runs the GATED flow with the words quoted in \
+         the PR body; on an ungated tagged default the version commit itself is the release. \
+         Re-asking for this order is a violation: only pass it when Scott already gave the \
+         words in this session; otherwise STOP and report.\n\n\
+         CI WAIT: no tag exists until the pushed sha's check runs + legacy commit status are \
+         all green (polled every 15s, up to the timeout flag above, default {ci_timeout}s). \
+         Red, truncated, or errored CI refuses with NO tag created; a re-run reuses the same \
+         version, it never bumps past it. The skip flag above bypasses the wait entirely -- \
+         for a human at a terminal who already knows the repo's CI story, not for an agent \
+         to get unstuck.\n\n\
+         PERSONA TOKENS: gh calls are authed per-org -- a token file, then \
+         GITHUB_PAT_<ORG>, then GITHUB_PAT_WORK for tatari-tv / GITHUB_PAT_HOME otherwise, \
+         else ambient `gh auth` -- so a work-org PR/CI read never goes out under the wrong \
+         account.\n\n\
          REQUIRED TOOLS:\n  {} {:<10} {}\n  {} {:<10} {}\n\n\
-         gh probes branch-protection gates and opens/lists PRs; `bump release` FAILS \
-         CLOSED on an unknown gate verdict (it pushes, unlike plain bump).\n\n\
+         gh probes branch-protection gates, opens/lists PRs, and reads CI; `bump release` \
+         FAILS CLOSED on an unknown gate verdict or an unreadable CI read (it pushes and \
+         tags, unlike plain bump).\n\n\
          Logs are written to: {}",
         git_status.status_icon,
         "git",
@@ -173,28 +253,47 @@ fn get_release_help() -> String {
         gh_status.status_icon,
         "gh",
         gh_status.version,
-        log_path_for_help()
+        log_path_for_help(),
+        ci_timeout = default_ci_timeout_secs(),
     )
 }
 
-/// Generate the `bump finish --help` after-help text: the finish table plus tools/log path.
+/// Generate the `bump finish --help` after-help text: the finish table, RESUME, the CI
+/// gate, the persona token rule, tools and log path.
 fn get_finish_help() -> String {
     let git_status = check_tool_version("git", "--version", "2.20.0");
     let gh_status = check_tool_version("gh", "--version", "2.0.0");
     format!(
-        "STATE TABLE (see the design doc for the full table):\n\
-         \x20 origin/<default> carries an untagged version (the merged bump): checkout -> \
-         pull --ff-only -> tag the merged commit -> push tag -> install\n\
+        "Runs from ANY worktree of the repo: the default branch's OWN checkout, else a \
+         sibling worktree found via `git worktree list`, else it is checked out here.\n\n\
+         STATE TABLE (condensed; see the design doc's API Design section for the full table):\n\
+         \x20 origin/<default> carries an untagged version (the merged bump): fast-forward \
+         (if behind) -> wait for green CI on the merged sha -> tag it -> push tag by name -> \
+         install\n\
          \x20 origin/<default> version == last tag (nothing merged / bump never rode): \
-         refuse \"no untagged version on <default>; bump rides a feature PR\"\n\
-         \x20 tag vX exists on the remote at the merged commit: no-op \"already released\"\n\
-         \x20 tag vX exists LOCALLY only (prior run died before/during the tag push): \
-         resume -- push tag by name, install; never reported as already released\n\
+         refuse \"no untagged version on <default>; bump rides a feature PR\", names \
+         Scott's order flag on `bump release` as the one door\n\
+         \x20 tag vX exists on the remote at the merged commit: no-op \"already released\" -- \
+         install still runs, so a re-run after \"tag pushed, install failed\" installs \
+         (--no-install to skip)\n\
+         \x20 tag vX exists LOCALLY only (RESUME: a prior run died before/during the tag \
+         push): wait for green CI, push the tag, install -- never reported as already \
+         released\n\
+         \x20 local default ahead of origin (commits that never landed): refuse before any \
+         pull, with the literal rescue commands\n\
+         \x20 local default diverged from origin: refuse before any pull, names \
+         `git pull --rebase origin <default>`\n\
          \x20 generic repo (no manifest), gated: refuse -- finish cannot derive a version\n\
-         \x20 tracked changes in the tree: refuse before checkout (would clobber them; \
-         untracked files are fine, nothing is ever staged)\n\n\
+         \x20 tracked changes in the current OR the resolved worktree: refuse before \
+         anything moves (untracked files are fine, nothing is ever staged)\n\n\
+         CI WAIT: same as `bump release --help` -- no tag until the merged sha's CI is green \
+         (default {ci_timeout}s, see the timeout flag above); the skip flag above bypasses \
+         the wait entirely.\n\n\
+         PERSONA TOKENS: same per-org resolution as `bump release --help` (a token file, then \
+         GITHUB_PAT_<ORG>, then GITHUB_PAT_WORK/GITHUB_PAT_HOME, else ambient `gh auth`).\n\n\
          REQUIRED TOOLS:\n  {} {:<10} {}\n  {} {:<10} {}\n\n\
-         gh is used only indirectly (via `bump release`'s PR); finish itself only needs git.\n\n\
+         gh is used only for the CI gate's check-runs/status reads; finish itself moves no \
+         PRs.\n\n\
          Logs are written to: {}",
         git_status.status_icon,
         "git",
@@ -202,7 +301,8 @@ fn get_finish_help() -> String {
         gh_status.status_icon,
         "gh",
         gh_status.version,
-        log_path_for_help()
+        log_path_for_help(),
+        ci_timeout = default_ci_timeout_secs(),
     )
 }
 
@@ -580,6 +680,85 @@ mod tests {
             }
             other => panic!("expected Release, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_cli_release_standalone_flag() {
+        let cli = Cli::try_parse_from(["bump", "release", "--standalone", "his exact words"]).unwrap();
+        match cli.command {
+            Some(Commands::Release(args)) => {
+                assert_eq!(args.standalone, Some("his exact words".to_string()));
+            }
+            other => panic!("expected Release, got {:?}", other),
+        }
+        let cli = Cli::try_parse_from(["bump", "release"]).unwrap();
+        match cli.command {
+            Some(Commands::Release(args)) => assert!(args.standalone.is_none()),
+            other => panic!("expected Release, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_release_no_ci_gate_flag() {
+        let cli = Cli::try_parse_from(["bump", "release", "--no-ci-gate"]).unwrap();
+        match cli.command {
+            Some(Commands::Release(args)) => assert!(args.no_ci_gate),
+            other => panic!("expected Release, got {:?}", other),
+        }
+        let cli = Cli::try_parse_from(["bump", "release"]).unwrap();
+        match cli.command {
+            Some(Commands::Release(args)) => assert!(!args.no_ci_gate),
+            other => panic!("expected Release, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_release_ci_timeout_flag_and_default() {
+        let cli = Cli::try_parse_from(["bump", "release", "--ci-timeout", "60"]).unwrap();
+        match cli.command {
+            Some(Commands::Release(args)) => assert_eq!(args.ci_timeout, 60),
+            other => panic!("expected Release, got {:?}", other),
+        }
+        let cli = Cli::try_parse_from(["bump", "release"]).unwrap();
+        match cli.command {
+            Some(Commands::Release(args)) => assert_eq!(args.ci_timeout, default_ci_timeout_secs()),
+            other => panic!("expected Release, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cli_finish_no_ci_gate_and_ci_timeout_flags() {
+        let cli = Cli::try_parse_from(["bump", "finish", "--no-ci-gate", "--ci-timeout", "30"]).unwrap();
+        match cli.command {
+            Some(Commands::Finish(args)) => {
+                assert!(args.no_ci_gate);
+                assert_eq!(args.ci_timeout, 30);
+            }
+            other => panic!("expected Finish, got {:?}", other),
+        }
+        let cli = Cli::try_parse_from(["bump", "finish"]).unwrap();
+        match cli.command {
+            Some(Commands::Finish(args)) => {
+                assert!(!args.no_ci_gate);
+                assert_eq!(args.ci_timeout, default_ci_timeout_secs());
+            }
+            other => panic!("expected Finish, got {:?}", other),
+        }
+    }
+
+    /// `bump release --help | grep -cE 'standalone|no-ci-gate|ci-timeout'` (the design
+    /// doc's acceptance criterion) must print exactly 3 -- one line per flag. The
+    /// after-help prose (this is the after-help TEXT ITSELF, `RELEASE_HELP_TEXT`'s source)
+    /// must not repeat those literal substrings; the flag list is clap's own Options
+    /// block, exercised end-to-end by `tests/release_cli.rs`.
+    #[test]
+    fn test_release_after_help_does_not_repeat_the_three_flag_names() {
+        let help = get_release_help();
+        let matching_lines = help
+            .lines()
+            .filter(|l| l.contains("standalone") || l.contains("no-ci-gate") || l.contains("ci-timeout"))
+            .count();
+        assert_eq!(matching_lines, 0, "after-help must not repeat the flag names:\n{help}");
     }
 
     #[test]

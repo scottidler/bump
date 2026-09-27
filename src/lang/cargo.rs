@@ -203,6 +203,21 @@ pub fn cargo_toml_exists(dir: &Path) -> bool {
     dir.join("Cargo.toml").exists()
 }
 
+/// True when the root `Cargo.toml` exists and declares its own `[package]` table: a
+/// binary/library crate root, or a workspace member released standalone. False for a
+/// virtual workspace root (`[workspace]` with no `[package]`, e.g. `tatari-tv/marquee`)
+/// and for no `Cargo.toml` at all. `cargo install --path .` fails on a virtual
+/// manifest, so the release verbs' default install must not offer it there.
+pub fn has_package_table(dir: &Path) -> bool {
+    let Ok(content) = fs::read_to_string(dir.join("Cargo.toml")) else {
+        return false;
+    };
+    let Ok(doc) = content.parse::<DocumentMut>() else {
+        return false;
+    };
+    doc.get("package").is_some()
+}
+
 /// Represents a workspace member with an independent version
 #[derive(Debug)]
 pub struct IndependentVersionMember {
@@ -440,6 +455,22 @@ name = "test"
 
         create_cargo_toml(dir.path(), "[package]\nname = \"test\"");
         assert!(cargo_toml_exists(dir.path()));
+    }
+
+    #[test]
+    fn test_has_package_table() {
+        let dir = TempDir::new().unwrap();
+        assert!(!has_package_table(dir.path()), "no Cargo.toml at all");
+
+        create_cargo_toml(dir.path(), "[package]\nname = \"test\"\nversion = \"0.1.0\"\n");
+        assert!(has_package_table(dir.path()));
+    }
+
+    #[test]
+    fn test_has_package_table_false_on_virtual_workspace_root() {
+        let dir = TempDir::new().unwrap();
+        create_cargo_toml(dir.path(), "[workspace]\nmembers = [\"crates/a\"]\nresolver = \"2\"\n");
+        assert!(!has_package_table(dir.path()));
     }
 
     #[test]

@@ -879,7 +879,7 @@ fn execute_release<P: Pusher, I: Installer, R: Pr, C: Ci>(
         println!("[dry-run] git push --no-follow-tags origin {default}");
         println!("[dry-run] (confirm HEAD is on origin/{default} before tagging)");
         echo_tag_steps(target_tag, default, &ci_gate(opts.ci_gate, opts.ci_timeout), false);
-        echo_install(&install_command);
+        echo_install(dir, &opts.install, &install_command);
         return Ok(ReleaseReport {
             install_command,
             dry_run: true,
@@ -947,7 +947,7 @@ fn execute_pending<P: Pusher, I: Installer, R: Pr, C: Ci>(
         }
         println!("[dry-run] (confirm HEAD is on origin/{default} before tagging)");
         echo_tag_steps(tag, default, &ci_gate(opts.ci_gate, opts.ci_timeout), local_tag_present);
-        echo_install(&install_command);
+        echo_install(dir, &opts.install, &install_command);
         return Ok(ReleaseReport {
             resumed: !ahead,
             install_command,
@@ -1175,8 +1175,12 @@ fn confirm_on_origin(dir: &Path, default: &str) -> Result<()> {
     }
 }
 
-/// Resolve the install command (precedence: explicit override > config > default-if-Cargo
-/// > skip) WITHOUT running it. `None` = the install step is skipped.
+/// Resolve the install command (precedence: explicit override > config > default-if-a-
+/// real-package > skip) WITHOUT running it. `None` = the install step is skipped. The
+/// default only fires for a Cargo manifest with its OWN `[package]` table -- a virtual
+/// workspace root (`[workspace]`, no `[package]`, e.g. `tatari-tv/marquee`) has no
+/// default, since `cargo install --path .` fails on it (after the tag is already
+/// pushed, if this ran unchecked).
 pub(crate) fn resolve_install(dir: &Path, choice: &InstallChoice, config: &Config) -> Option<String> {
     debug!(
         "resolve_install: dir={} choice={:?} config.install={:?}",
@@ -1188,12 +1192,27 @@ pub(crate) fn resolve_install(dir: &Path, choice: &InstallChoice, config: &Confi
         InstallChoice::Command(cmd) => Some(cmd.clone()),
         InstallChoice::Skip => None,
         InstallChoice::Auto => config.install.clone().or_else(|| {
-            if lang::cargo::cargo_toml_exists(dir) {
+            if lang::cargo::has_package_table(dir) {
                 Some(DEFAULT_INSTALL_COMMAND.to_string())
             } else {
                 None
             }
         }),
+    }
+}
+
+/// Why the install step was skipped, for the `install: <reason>` line. Only the `Auto`
+/// case on a virtual workspace root (a tracked `[workspace]` `Cargo.toml` with no
+/// `[package]`) gets the specific reason; every other skip (`--no-install`, or no Cargo
+/// manifest at all) prints the plain "skipped".
+fn install_skip_reason(dir: &Path, choice: &InstallChoice) -> &'static str {
+    if matches!(choice, InstallChoice::Auto)
+        && lang::cargo::cargo_toml_exists(dir)
+        && !lang::cargo::has_package_table(dir)
+    {
+        "skipped (virtual workspace root; pass --install or set install: in bump.yml)"
+    } else {
+        "skipped"
     }
 }
 
@@ -1211,17 +1230,17 @@ fn run_install<I: Installer>(
             Ok(Some(cmd))
         }
         None => {
-            println!("install: skipped");
+            println!("install: {}", install_skip_reason(dir, choice));
             Ok(None)
         }
     }
 }
 
 /// Echo the install step for `-n` dry-run.
-fn echo_install(install_command: &Option<String>) {
+fn echo_install(dir: &Path, choice: &InstallChoice, install_command: &Option<String>) {
     match install_command {
         Some(cmd) => println!("[dry-run] install: {cmd}"),
-        None => println!("[dry-run] install: skipped"),
+        None => println!("[dry-run] install: {}", install_skip_reason(dir, choice)),
     }
 }
 

@@ -420,3 +420,85 @@ pr.rs 103, tag.rs 150, tests.rs 585, tests/gate.rs 499 (largest test file).
 - The Acceptance Criterion `git show HEAD:src/release/tests.rs | grep -c 'fn red_ci_leaves_no_tag\|fn gated_standalone_cuts\|fn finish_from_feature_worktree'`
   predates the module split: those tests now live in `src/release/tests/{gate,standalone,finish}.rs`,
   so that exact command prints `0`. Rewrite the criterion to grep `src/release/tests/`?
+
+## Phase 6: CLI surface and docs
+
+### Design decisions
+- `ReleaseArgs` (`src/cli.rs`) gained `--standalone <WORDS>` (`Option<String>`),
+  `--no-ci-gate` (`bool`), `--ci-timeout <SECS>` (`u64`, `default_value_t =
+  default_ci_timeout_secs()`); `FinishArgs` gained the same two CI flags. `main.rs`'s
+  `dispatch_release`/`dispatch_finish` no longer build `ReleaseOpts`/`FinishOpts` inline --
+  the mapping moved into two pure functions, `release_opts_from_args`/
+  `finish_opts_from_args`, so the CLI -> opts conversion is unit-testable without touching
+  git: `bump_type` stays `Option<BumpType>` (`None` on no level flag, unchanged from Phase
+  3), `standalone: args.standalone.clone()`, `ci_gate: !args.no_ci_gate`, `ci_timeout:
+  Duration::from_secs(args.ci_timeout)`.
+- `--ci-timeout`'s default is NOT a duplicated literal: `cli.rs` imports
+  `release::DEFAULT_CI_TIMEOUT` and renders it through `default_ci_timeout_secs() ->
+  u64` (clap's `default_value_t` needs the plain integer it prints in `--help`, not a
+  `Duration`). One source of truth; the CLI default and the verb's own default can't drift.
+- `bump release --help` / `bump finish --help` after-help rewritten (`get_release_help`/
+  `get_finish_help`, `src/cli.rs`) to the two flows, the condensed state table (API Design
+  section, Phases 3-5's actual rows), RESUME, Scott's order flag, the CI wait, and the
+  persona-token resolution order. Deliberately does NOT repeat the literal flag names
+  (`--standalone`, `--no-ci-gate`, `--ci-timeout`) anywhere in the after-help prose --
+  refers to them as "the order flag above", "the timeout flag above", "the skip flag
+  above" instead. That is what makes the acceptance criterion (`bump release --help |
+  grep -cE 'standalone|no-ci-gate|ci-timeout'` == `3`) come out exactly `3`: clap's own
+  Options block is the only place the three names appear. Verified live (see Deviations):
+  `3`.
+- Default install (`resolve_install`, `src/release.rs`): the `Auto` arm now calls the new
+  `lang::cargo::has_package_table(dir)` instead of `cargo_toml_exists(dir)`. A virtual
+  workspace root (`[workspace]`, no `[package]`, `tatari-tv/marquee`'s shape) no longer
+  gets the bare `cargo install --path .` default, which fails on it. `install_skip_reason`
+  (new, private to `release.rs`) prints the specific "skipped (virtual workspace root;
+  pass --install or set install: in bump.yml)" line only for the `Auto` choice on a
+  tracked `Cargo.toml` with no `[package]` table; every other skip (`--no-install`, or no
+  Cargo manifest at all) still prints the plain "skipped". `run_install` and `echo_install`
+  (the `-n` echo) both gained `dir`/`choice` parameters to call it; all four call sites
+  (two in `release.rs`, one in `finish.rs`, one shared) updated.
+- `has_package_table` (`src/lang/cargo.rs`): parses `Cargo.toml` and checks `doc.get
+  ("package").is_some()`. Deliberately simpler than reusing the existing private
+  `is_workspace_only` (which also asserts `workspace.is_some()`) -- the install decision
+  only cares whether a `[package]` table exists to install, not whether a `[workspace]`
+  table is also present alongside it (a workspace member's own `Cargo.toml` has both keys
+  absent for `[workspace]` typically, but the positive check is what the call site needs).
+- README (`README.md`, "The release verbs" section) rewritten to the design doc's API
+  Design tables: the two flows, the condensed release/finish state tables, the standalone
+  order paragraph, a CI gate paragraph, the install precedence (now naming the `[package]`
+  table requirement and the virtual-workspace-root skip message), and the persona-token
+  resolution order.
+
+### Deviations
+- None from the doc's Phase 6 bullets. `otto ci` green: `cargo run -q -- release --help |
+  grep -cE 'standalone|no-ci-gate|ci-timeout'` prints `3` (verified live, matching the
+  design doc's Acceptance Criteria list), and `cargo run -q -- finish --help | grep -cE
+  'standalone|no-ci-gate|ci-timeout'` prints `2` (finish has no `--standalone`, so its
+  count is the two CI flags, not the doc's 3-flag release criterion).
+
+### Tradeoffs
+- Extracting `release_opts_from_args`/`finish_opts_from_args` as free functions in
+  `main.rs` vs. inlining the flag mapping into `dispatch_release`/`dispatch_finish` as
+  before: chose the extraction so the "clap parse tests assert ... reach `ReleaseOpts` as
+  `Some(words)`, `ci_gate == false`, the given `Duration`, and `bump_type == None`"
+  criterion can be a pure unit test (parse with `Cli::try_parse_from`, convert, assert
+  fields) instead of needing a live git fixture just to prove a flag reached a struct
+  field. `src/main.rs` gained two short functions and no new fixture-dependent tests for
+  that criterion; the fixture-dependent proof (the flag reaching EXECUTION, not just the
+  opts struct) is the `tests/release_cli.rs::release_dry_run_no_ci_gate_prints_ci_gate_
+  skipped` end-to-end test instead.
+- The end-to-end "prints `CI gate: SKIPPED`" criterion needed a real (if minimal) ungated
+  git fixture with a bare local `origin` and `BUMP_GATES_PROBE=ungated`, run with `-n` so
+  no real push/tag/install happens: `tests/release_cli.rs` (new), following
+  `tests/skip_member.rs`'s pattern (`CARGO_BIN_EXE_bump`, real stdout, no `gh`/network).
+  The origin bare repo lives in its OWN `TempDir`, not a subdirectory of the work checkout
+  -- an earlier version nested it under the work dir and `bump release` refused on the
+  resulting dirty tree (the bare repo showed up as an untracked path).
+- `install_skip_reason` as a separate function from `resolve_install` vs. folding the
+  reason string into `resolve_install`'s return type (e.g. `Result<Option<String>,
+  SkipReason>`): kept `resolve_install`'s signature (`Option<String>`) unchanged since
+  Phase 2 callers and tests already depend on it; the reason is cheap to recompute from
+  the same two inputs (`dir`, `choice`) at the print site.
+
+### Open questions
+- None.

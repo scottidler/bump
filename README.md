@@ -14,42 +14,79 @@ cargo install --path .
 ## The release verbs (recommended)
 
 For releasing a repo, use `bump release` / `bump finish` -- they absorb every mechanical
-step (pushes, PR open, install) that the primitives below (bare `bump`, `--no-tag`,
-`--tag-only`) otherwise leave to you. Run from inside the repo:
+step (pushes, PR open, the CI wait, install) that the primitives below (bare `bump`,
+`--no-tag`, `--tag-only`) otherwise leave to you. Run from inside the repo, bare, no `&&`
+and no wrapper:
 
 ```bash
-bump release [-m|-M] [-n] [--install "<cmd>"|--no-install]
-bump finish  [-n] [--install "<cmd>"|--no-install]
+bump release [-m|-M] [-n] [--install "<cmd>"|--no-install] [--standalone "<words>"] \
+             [--no-ci-gate] [--ci-timeout SECS]
+bump finish  [-n] [--install "<cmd>"|--no-install] [--no-ci-gate] [--ci-timeout SECS]
 ```
 
 `bump release` inspects the repo's git + gate state and either executes the ONE correct
-sequence or refuses with the exact next command:
+sequence or refuses with the exact next command. Which of the two flows applies is
+decided by `bump --gates` (never both):
+
+| Flow | What it does |
+|---|---|
+| UNGATED | version commit -> push origin `<default>` -> confirm on origin -> wait for green CI -> tag the verified sha -> push tag -> install |
+| GATED | version commit rides the feature branch -> push it (no tags follow) -> open a PR if none is open (title/body built from the branch and its commits) -> pause: `merge the PR, then run: bump finish` |
 
 | Situation | `bump release` does |
 |---|---|
-| Ungated, on default, ahead of origin | version commit -> push branch -> confirm on origin -> tag -> push tag -> install |
-| Ungated, not on default / behind origin / nothing to release | refuses with the exact fix |
-| Ungated RESUME (a prior run died between branch push and tag push) | tags (if needed) and pushes the tag, without re-bumping or falsely claiming "already released" |
-| Gated, on a feature branch, fresh | rides the bump on the branch (`--no-tag` internally), pushes it, opens a PR if none is open, then PAUSES: `merge the PR, then run: bump finish` |
-| Gated, on a feature branch, already bumped | skips the re-bump, ensures the branch/PR, same pause |
-| Gated, on default with stranded commits | refuses with the literal rescue commands (never auto-rescues) |
+| Ungated, on default, ahead of origin, no pending version | the UNGATED flow above |
+| Ungated, PENDING VERSION (manifest untagged, not below the latest tag) | that version IS the release -- pushed if ahead, never re-bumped past it; an explicit `-m`/`-M` implying a different version refuses naming both |
+| Ungated RESUME (pending version, HEAD == origin) | wait for green CI, tag, push tag, install -- never reported as "already released" |
+| Ungated, manifest below the latest tag | refuses by name; bump never lowers a version |
+| Ungated, not on default / behind / diverged / nothing to release | refuses with the one exact fix (checkout, `git pull --ff-only`, `git pull --rebase`, or `--standalone`) |
+| Gated, feature branch, fresh | rides the bump, pushes, opens/ensures the PR, pauses |
+| Gated, feature branch, already bumped (version line already in the diff) | skips the re-bump, ensures branch/PR, same pause; a mismatched level refuses naming both |
+| Gated, feature branch, PENDING VERSION inherited from the default branch | bumps AGAIN from the manifest version; names the untagged one it is burning unless `bump finish` ships it first |
+| Gated, feature branch whose diff vs the default is empty or version-only | refuses, names `--standalone` |
+| Gated, feature branch where the title-guard slug != the branch name | refuses before any mutation, prints `git branch -m <slug>` |
+| Gated, on default with commits not on origin (stranded) | refuses with the literal rescue commands, never auto-rescued |
+| Gated, on default, clean, tagged | refuses "bump rides a feature PR", names `--standalone` |
+| Gate unknown, dirty tree, detached HEAD | refuses with the one exact fix |
 
-After the PR merges, `bump finish` fast-forwards to the merged tip and tags it:
+`--standalone "<words>"` is Scott's words, verbatim: the one legitimate way to ship a
+release whose diff is empty or version-only. Re-asking for this order is a violation --
+an agent runs this flag only when Scott already gave the words in this session; otherwise
+it should STOP and report.
+
+After the PR merges, `bump finish` runs from ANY worktree of the repo (its own checkout of
+the default branch, a sibling worktree found via `git worktree list`, or checks it out):
 
 | Situation | `bump finish` does |
 |---|---|
-| origin/`<default>` carries an untagged version (the merged bump) | checkout -> `pull --ff-only` -> tag the merged commit -> push tag -> install |
-| Nothing merged / bump never rode | refuses: "bump rides a feature PR -- run bump release on a branch" |
-| Already tagged at the merged commit | no-op: "already released" |
-| A tag exists locally only (a prior run died mid-push) | resumes: pushes the tag, never reports it as already released |
+| origin/`<default>` carries an untagged version (the merged bump) | fast-forward (if behind) -> wait for green CI on the merged sha -> tag it -> push tag by name -> install |
+| origin/`<default>` version == last tag (nothing merged / bump never rode) | refuses "bump rides a feature PR", names `--standalone` on `bump release` as the one door |
+| Tag exists on the remote at the merged commit | no-op "already released" -- install still runs, so a re-run after "tag pushed, install failed" installs |
+| Tag exists LOCALLY only (RESUME: a prior run died before/during the tag push) | wait for green CI, push the tag, install -- never reported as already released |
+| Local default ahead of origin (commits that never landed) | refuses before any pull, with the literal rescue commands |
+| Local default diverged from origin | refuses before any pull, names `git pull --rebase origin <default>` |
+| Tracked changes in the current OR the resolved worktree | refuses before anything moves |
 
 Full state tables: `bump release --help` / `bump finish --help`, or the design doc
-(`docs/design/2026-07-06-release-verbs-and-language-adapters.md`).
+(`docs/design/2026-09-26-one-release-command.md`).
+
+**CI gate:** no tag exists until the pushed (or merged) sha's check runs and legacy commit
+status are all green, polled every 15s up to `--ci-timeout` (default 1800s). Red,
+truncated, or errored CI refuses with NO tag created; a re-run reuses the same version,
+never bumping past it. `--no-ci-gate` skips the wait -- for a human at a terminal who
+already knows the repo's CI story, not for an agent to get unstuck.
 
 `--install <cmd>` / `--no-install` control the post-release install step (precedence:
-flag override > repo-root `bump.yml`'s `install:` key > `cargo install --path .` iff a
-Cargo.toml is present > skip). `-n` previews every command the verb would run and
-executes nothing.
+flag override > repo-root `bump.yml`'s `install:` key > `cargo install --path .` iff the
+root `Cargo.toml` declares its own `[package]` table > skip). A virtual workspace root
+(`[workspace]` with no `[package]`, e.g. a Cargo workspace with no root crate) has no
+default install and prints `install: skipped (virtual workspace root; pass --install or
+set install: in bump.yml)`. `-n` previews every command the verb would run and executes
+nothing.
+
+`gh` calls are authed per-org: a token file, then `GITHUB_PAT_<ORG>`, then
+`GITHUB_PAT_WORK` for `tatari-tv` / `GITHUB_PAT_HOME` otherwise, else ambient `gh auth` --
+so a work-org PR/CI read never goes out under the wrong account.
 
 ## Primitives (for humans / advanced or manual use)
 
