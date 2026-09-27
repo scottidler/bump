@@ -304,11 +304,9 @@ fn gated_refusal_message(label: &str, rules: &[String]) -> String {
         "{label} is gated ({}).\n\
          Tagging here would orphan the tag (squash-merge rewrites the SHA).\n\n\
          Gated flow:\n  \
-         bump --no-tag [-m|-M]      # version bump rides your branch/PR\n  \
-         <push branch, open PR, merge>\n  \
-         git checkout main && git pull --ff-only origin main\n  \
-         bump --tag-only            # tag the merged commit\n  \
-         git push origin vX.Y.Z",
+         bump release [-m|-M]       # on the feature branch: version commit, push, PR\n  \
+         <merge the PR>\n  \
+         bump finish                # CI wait, tag the merged commit, push the tag",
         rules.join(", ")
     )
 }
@@ -329,19 +327,15 @@ fn report_gates(dir: &Path) -> Result<()> {
             println!("Gates:  none (ungated)");
             println!();
             println!("Ungated flow:");
-            println!("  bump [-m|-M]");
-            println!("  git push origin {branch}");
-            println!("  git push origin vX.Y.Z");
+            println!("  bump release [-m|-M]       # on {branch}: version commit, push, CI wait, tag, push tag");
         }
         github::Gate::Gated(rules) => {
             println!("Gates:  {} (gated)", rules.join(", "));
             println!();
             println!("Gated flow:");
-            println!("  bump --no-tag [-m|-M]      # version bump rides your branch/PR");
-            println!("  <push branch, open PR, merge>");
-            println!("  git checkout {branch} && git pull --ff-only origin {branch}");
-            println!("  bump --tag-only            # tag the merged commit");
-            println!("  git push origin vX.Y.Z");
+            println!("  bump release [-m|-M]       # on the feature branch: version commit, push, PR");
+            println!("  <merge the PR>");
+            println!("  bump finish                # CI wait on the merged {branch}, tag, push tag");
         }
         github::Gate::Unknown(reason) => {
             println!("Gates:  UNKNOWN (could not verify: {reason})");
@@ -786,8 +780,10 @@ pub(crate) fn process_directory(dir: &Path, cli: &Cli, bump_type: BumpType) -> R
         // which can land the tag even when the branch push is rejected).
         let branch = git::current_branch(dir).unwrap_or_else(|_| "<branch>".to_string());
         println!("Run: git push origin {branch} && git push origin {new_tag}");
-    } else {
-        println!("Run: git push <branch>  (open a PR; after merge, tag with: bump --tag-only)");
+    } else if !cli.never_amend {
+        // The release verb drives its own push/PR/tag, so this hint is only for a
+        // hand-run `bump --no-tag`.
+        println!("Next: `bump release` pushes, opens the PR and tags; after a gated merge, `bump finish`");
     }
 
     if !dir_name.is_empty() && dir != env::current_dir().unwrap_or_default() {
@@ -1691,7 +1687,7 @@ name = "test-pkg"
         let err = result.unwrap_err().to_string();
         assert!(err.contains("gated"), "error must name the gate, got: {err}");
         assert!(
-            err.contains("--tag-only"),
+            err.contains("bump release") && err.contains("bump finish"),
             "error must show the gated recipe, got: {err}"
         );
         assert!(

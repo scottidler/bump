@@ -314,11 +314,10 @@ fn get_tool_validation_help() -> String {
     let gh_status = check_tool_version("gh", "--version", "2.0.0");
     format!(
         "RELEASE FLOWS (run `bump --gates` to see which applies to this repo):\n\
-         \x20 ungated:  bump [-m|-M]  &&  git push origin <branch>  &&  git push origin vX.Y.Z\n\
-         \x20 gated:    bump --no-tag [-m|-M]   (version bump rides your PR branch)\n\
-         \x20           <push branch, open PR, merge>\n\
-         \x20           git checkout <default> && git pull --ff-only origin <default>\n\
-         \x20           bump --tag-only  &&  git push origin vX.Y.Z\n\n\
+         \x20 ungated:  bump release [-m|-M]   (on the default branch: commit, push, CI wait, tag, push tag)\n\
+         \x20 gated:    bump release [-m|-M]   (on the feature branch: commit, push, open the PR)\n\
+         \x20           <merge the PR>\n\
+         \x20           bump finish            (CI wait, tag the merged commit, push the tag)\n\n\
          REQUIRED TOOLS:\n  {} {:<10} {}\n  {} {:<10} {}\n\n\
          gh is used to probe branch-protection gates; without it gated repos cannot be\n\
          detected and bump warns and proceeds as if ungated.\n\n\
