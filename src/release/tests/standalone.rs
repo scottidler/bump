@@ -364,3 +364,62 @@ fn standalone_on_a_pending_version_refuses_naming_bump_finish() {
     assert_no_tag_anywhere(dir, "v0.1.7");
     drop(origin);
 }
+
+/// setup_released at 0.1.5 whose Cargo.toml also carries a table-form dependency
+/// (`[dependencies.itoa] version = "1.0.14"`), pushed; then a feature branch that moves that
+/// dependency to 1.0.15 (plus a work file when `with_work`). The package version is untouched.
+fn setup_dependency_table_bump(with_work: bool) -> (TempDir, TempDir) {
+    let (origin, work) = setup_released("0.1.5");
+    let dir = work.path();
+    let manifest = |dep: &str| {
+        format!("[package]\nname = \"test-pkg\"\nversion = \"0.1.5\"\n\n[dependencies.itoa]\nversion = \"{dep}\"\n")
+    };
+    fs::write(dir.join("Cargo.toml"), manifest("1.0.14")).unwrap();
+    git_ok(dir, &["commit", "-am", "add itoa"]);
+    git_ok(dir, &["push", "origin", "main"]);
+    git_ok(dir, &["checkout", "-b", "bump-itoa"]);
+    fs::write(dir.join("Cargo.toml"), manifest("1.0.15")).unwrap();
+    if with_work {
+        fs::write(dir.join("feature.txt"), "work").unwrap();
+    }
+    git_ok(dir, &["add", "-A"]);
+    git_ok(dir, &["commit", "-m", "bump itoa"]);
+    (origin, work)
+}
+
+/// Audit round 1, must-fix 2: a `version =` line under `[dependencies.<name>]` is not the
+/// branch's own bump. Work plus a table-form dependency bump is fresh work: the version
+/// commit happens and the PR body names the NEW version, not the released one.
+#[test]
+fn dependency_table_version_change_with_work_bumps_fresh() {
+    let _guard = crate::ENV_LOCK.lock().unwrap();
+    let (origin, work) = setup_dependency_table_bump(true);
+    let dir = work.path();
+    let pusher = RecordingPusher::new(false);
+    let pr = RecordingPr::new();
+    let report = gated_release(dir, &auto_opts(None, false), &pusher, &pr).expect("fresh work pauses on a PR");
+
+    assert_eq!(report.tag, "v0.1.6");
+    assert_eq!(read_cargo_version(dir), "0.1.6", "the version commit happened");
+    let body = &pr.created()[0].3;
+    assert!(body.contains("Release: rides this PR (v0.1.6)"), "got: {body}");
+    assert!(!body.contains("(v0.1.5)"), "never names the released version: {body}");
+    drop(origin);
+}
+
+/// Audit round 1, must-fix 2: a dependency-table-only change is a dependency bump, which
+/// the design doc (Bump-only branch) says is NOT bump-only.
+#[test]
+fn dependency_table_only_change_is_not_bump_only() {
+    let _guard = crate::ENV_LOCK.lock().unwrap();
+    let (origin, work) = setup_dependency_table_bump(false);
+    let dir = work.path();
+    let prev = set_probe("gated:pull_request");
+    let state = format!("{:?}", classify(dir, &auto_opts(None, false)).unwrap());
+    restore_probe(prev);
+    assert!(
+        state.starts_with("GatedFresh") && state.contains("force: false"),
+        "a dependency bump is fresh work: {state}"
+    );
+    drop(origin);
+}

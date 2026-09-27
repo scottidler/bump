@@ -651,59 +651,6 @@ pub fn commit_subjects(path: &Path, base: &str) -> Result<Vec<String>> {
         .collect())
 }
 
-/// The root manifests whose version line decides whether a branch carries its own bump
-/// (Gate D's pathspec, `git-release-guard.sh:565`).
-const VERSION_LINE_MANIFESTS: [&str; 3] = ["Cargo.toml", "pyproject.toml", "package.json"];
-
-/// Is this unified-diff line an added or removed `version =` / `"version":` line? The
-/// port of Gate D's `^[-+][[:space:]]*"?version"?[[:space:]]*[:=]`.
-pub fn is_version_diff_line(line: &str) -> bool {
-    let Some(rest) = line.strip_prefix('+').or_else(|| line.strip_prefix('-')) else {
-        return false;
-    };
-    let rest = rest.trim_start();
-    let rest = rest.strip_prefix('"').unwrap_or(rest);
-    let Some(rest) = rest.strip_prefix("version") else {
-        return false;
-    };
-    let rest = rest.strip_prefix('"').unwrap_or(rest);
-    matches!(rest.trim_start().chars().next(), Some(':') | Some('='))
-}
-
-/// Does the branch change a version line in a root manifest relative to `base` (`git diff
-/// base...HEAD -- Cargo.toml pyproject.toml package.json`)? True means the branch bumped
-/// the version itself; a pending version with no such line was inherited from `base`.
-pub fn version_line_changed(path: &Path, base: &str) -> Result<bool> {
-    debug!("version_line_changed: path={} base={}", path.display(), base);
-    let changed = changed_lines(path, base, &VERSION_LINE_MANIFESTS)?
-        .iter()
-        .any(|l| is_version_diff_line(l));
-    debug!("version_line_changed: changed={changed}");
-    Ok(changed)
-}
-
-/// The added and removed lines (`+`/`-` prefix kept, `+++`/`---` file headers dropped) of
-/// `git diff base...HEAD -- <files>`. The raw material for both the version-line test and
-/// the bump-only test.
-pub fn changed_lines(path: &Path, base: &str, files: &[&str]) -> Result<Vec<String>> {
-    debug!("changed_lines: path={} base={} files={:?}", path.display(), base, files);
-    let range = format!("{base}...HEAD");
-    let output = Command::new("git")
-        .args(["diff", &range, "--"])
-        .args(files)
-        .current_dir(path)
-        .output()
-        .context("Failed to run git diff")?;
-    if !output.status.success() {
-        bail!("git diff {} failed: {}", range, String::from_utf8_lossy(&output.stderr));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter(|l| (l.starts_with('+') || l.starts_with('-')) && !l.starts_with("+++") && !l.starts_with("---"))
-        .map(str::to_string)
-        .collect())
-}
-
 /// Does a LOCAL branch named `branch` exist (`git rev-parse --verify --quiet refs/heads/<branch>`)?
 pub fn local_branch_exists(path: &Path, branch: &str) -> Result<bool> {
     debug!("local_branch_exists: path={} branch={}", path.display(), branch);
@@ -1031,25 +978,6 @@ mod tests {
     }
 
     #[test]
-    fn changed_lines_keeps_added_and_removed_lines_without_headers() {
-        let (_origin, work) = bare_remote_and_clone();
-        let w = work.path();
-        std::fs::write(w.join("VERSION"), "1.0.0\n").unwrap();
-        git_in(w, &["add", "-A"]);
-        git_in(w, &["commit", "-m", "version file"]);
-        let base = head_sha(w).unwrap();
-
-        std::fs::write(w.join("VERSION"), "1.0.1\n").unwrap();
-        std::fs::write(w.join("other.txt"), "x\n").unwrap();
-        git_in(w, &["add", "-A"]);
-        git_in(w, &["commit", "-m", "bump"]);
-
-        assert_eq!(changed_lines(w, &base, &["VERSION"]).unwrap(), vec!["-1.0.0", "+1.0.1"]);
-        assert!(changed_lines(w, &base, &["Cargo.toml"]).unwrap().is_empty());
-        assert!(changed_lines(w, "no-such-ref", &["VERSION"]).is_err());
-    }
-
-    #[test]
     fn local_branch_exists_sees_only_local_heads() {
         let (_origin, work) = bare_remote_and_clone();
         let w = work.path();
@@ -1190,34 +1118,6 @@ mod tests {
         let (_origin, work) = bare_remote_and_clone();
         let head = head_sha(work.path()).unwrap();
         assert_eq!(manifest_version_at(work.path(), &head).unwrap(), None);
-    }
-
-    #[test]
-    fn is_version_diff_line_matches_gate_d() {
-        assert!(is_version_diff_line("+version = \"0.1.6\""));
-        assert!(is_version_diff_line("-version = \"0.1.5\""));
-        assert!(is_version_diff_line("+  \"version\": \"1.2.3\","));
-        assert!(is_version_diff_line("+version=\"1\""));
-        assert!(!is_version_diff_line(" version = \"0.1.5\""), "context line");
-        assert!(!is_version_diff_line("+serde = { version = \"1\" }"), "dependency line");
-        assert!(!is_version_diff_line("+versions = 2"), "not the version key");
-        assert!(!is_version_diff_line("+++ b/Cargo.toml"), "diff header");
-    }
-
-    #[test]
-    fn version_line_changed_tells_own_bump_from_work_only() {
-        let (_origin, work) = bare_remote_and_clone();
-        let w = work.path();
-        commit_cargo_version(w, "0.1.5");
-        git_in(w, &["push", "origin", "main"]);
-        git_in(w, &["checkout", "-b", "feature"]);
-        std::fs::write(w.join("work.txt"), "x").unwrap();
-        git_in(w, &["add", "-A"]);
-        git_in(w, &["commit", "-m", "work"]);
-        assert!(!version_line_changed(w, "origin/main").unwrap(), "work only");
-
-        commit_cargo_version(w, "0.1.6");
-        assert!(version_line_changed(w, "origin/main").unwrap(), "the branch's own bump");
     }
 
     #[test]

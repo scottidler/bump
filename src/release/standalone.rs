@@ -4,6 +4,7 @@
 
 use super::ci::Ci;
 use super::pr::{Pr, pr_title};
+use super::version_diff::{ManifestChange, manifest_changes};
 use super::{
     GATED_PAUSE_MESSAGE, Installer, PendingCheck, Ports, Pusher, ReleaseOpts, ReleaseReport, ReleaseState,
     classify_gated_feature, compute_target_tag, execute, pending_version,
@@ -30,7 +31,7 @@ const BUMP_FILES: [&str; 9] = [
     "VERSION",
 ];
 
-/// The manifests whose changed lines must all be version lines for a branch to be bump-only.
+/// The manifests whose only change may be the package version for a branch to be bump-only.
 const BUMP_MANIFESTS: [&str; 4] = ["Cargo.toml", "package.json", "pyproject.toml", "VERSION"];
 
 /// The standalone branch for a target tag: `bump-vX-Y-Z`. Dots become dashes because the PR
@@ -40,29 +41,31 @@ pub(super) fn standalone_branch_name(tag: &str) -> String {
 }
 
 /// Is HEAD's diff against `base` a version bump and nothing else? A port of the hook's
-/// `is_bump_only_ref` with one intended difference: an EMPTY diff (zero commits ahead, or
-/// commits that change nothing) is bump-only here, because the verb has no Gate A.
+/// `is_bump_only_ref` with two intended differences: an EMPTY diff (zero commits ahead, or
+/// commits that change nothing) is bump-only here, because the verb has no Gate A; and only
+/// the PACKAGE version counts as a version line, so a `[dependencies.<name>]` version is a
+/// dependency bump (design doc, "Bump-only branch").
 pub(super) fn is_bump_only_branch(dir: &Path, base: &str) -> Result<bool> {
     debug!("is_bump_only_branch: dir={} base={}", dir.display(), base);
     let files = git::changed_files(dir, base)?;
-    let manifest_lines = git::changed_lines(dir, base, &BUMP_MANIFESTS)?;
-    let bump_only = bump_only(&files, &manifest_lines);
-    debug!("is_bump_only_branch: files={files:?} bump_only={bump_only}");
+    let manifests = manifest_changes(dir, base, &BUMP_MANIFESTS)?;
+    let bump_only = bump_only(&files, &manifests);
+    debug!("is_bump_only_branch: files={files:?} manifests={manifests:?} bump_only={bump_only}");
     Ok(bump_only)
 }
 
 /// The pure decision behind `is_bump_only_branch`: every changed path is a root bump file,
-/// and at least one manifest line changed and every changed manifest line is a version line.
-/// A lockfile-only refresh (no manifest line) and a dependency bump (a non-version manifest
-/// line) are NOT bump-only; THE RULING allows both.
-fn bump_only(files: &[String], manifest_lines: &[String]) -> bool {
+/// at least one manifest's package version changed, and no manifest changed anything else.
+/// A lockfile-only refresh (no version change) and a dependency bump (a non-version
+/// manifest line) are NOT bump-only; THE RULING allows both.
+fn bump_only(files: &[String], manifests: &[ManifestChange]) -> bool {
     if files.is_empty() {
         return true;
     }
     if !files.iter().all(|f| BUMP_FILES.contains(&f.as_str())) {
         return false;
     }
-    !manifest_lines.is_empty() && manifest_lines.iter().all(|l| git::is_version_diff_line(l))
+    manifests.iter().any(|m| m.version) && !manifests.iter().any(|m| m.other)
 }
 
 /// Gated, on the default branch, clean, HEAD == origin, with Scott's order: resolve the
@@ -169,28 +172,47 @@ mod tests {
         assert_eq!(standalone_branch_name("v1.20.1"), "bump-v1-20-1");
     }
 
+    const VERSION: ManifestChange = ManifestChange {
+        version: true,
+        other: false,
+    };
+    const DEPENDENCY: ManifestChange = ManifestChange {
+        version: false,
+        other: true,
+    };
+    const UNCHANGED: ManifestChange = ManifestChange {
+        version: false,
+        other: false,
+    };
+
     #[test]
     fn empty_diff_is_bump_only() {
-        assert!(bump_only(&[], &[]));
+        assert!(bump_only(&[], &[UNCHANGED]));
     }
 
     #[test]
     fn version_lines_in_root_manifests_are_bump_only() {
-        let files = strings(&["Cargo.toml", "Cargo.lock"]);
-        let lines = strings(&["-version = \"0.1.5\"", "+version = \"0.1.6\""]);
-        assert!(bump_only(&files, &lines));
-        let files = strings(&["package.json"]);
-        let lines = strings(&["-  \"version\": \"1.0.0\",", "+  \"version\": \"1.0.1\","]);
-        assert!(bump_only(&files, &lines));
+        assert!(bump_only(
+            &strings(&["Cargo.toml", "Cargo.lock"]),
+            &[VERSION, UNCHANGED]
+        ));
+        assert!(bump_only(&strings(&["package.json"]), &[UNCHANGED, VERSION]));
     }
 
     #[test]
     fn work_file_dependency_line_or_lockfile_only_is_not_bump_only() {
-        let version = strings(&["+version = \"0.1.6\""]);
-        assert!(!bump_only(&strings(&["Cargo.toml", "src/main.rs"]), &version));
-        assert!(!bump_only(&strings(&["crates/x/Cargo.toml"]), &version));
-        let dep = strings(&["+version = \"0.1.6\"", "+serde = \"1\""]);
-        assert!(!bump_only(&strings(&["Cargo.toml"]), &dep));
-        assert!(!bump_only(&strings(&["Cargo.lock"]), &[]));
+        assert!(!bump_only(&strings(&["Cargo.toml", "src/main.rs"]), &[VERSION]));
+        assert!(!bump_only(&strings(&["crates/x/Cargo.toml"]), &[UNCHANGED]));
+        let version_and_dependency = ManifestChange {
+            version: true,
+            other: true,
+        };
+        assert!(!bump_only(&strings(&["Cargo.toml"]), &[version_and_dependency]));
+        assert!(!bump_only(&strings(&["Cargo.toml"]), &[DEPENDENCY]));
+        assert!(!bump_only(
+            &strings(&["Cargo.toml", "package.json"]),
+            &[VERSION, DEPENDENCY]
+        ));
+        assert!(!bump_only(&strings(&["Cargo.lock"]), &[UNCHANGED]));
     }
 }

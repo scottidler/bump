@@ -38,6 +38,7 @@ mod finish;
 mod pr;
 mod standalone;
 mod tag;
+mod version_diff;
 
 pub use ci::{Ci, DEFAULT_CI_TIMEOUT, GhCi};
 pub use finish::finish;
@@ -585,7 +586,7 @@ fn classify_gated_feature(dir: &Path, opts: &ReleaseOpts, branch: String, defaul
         });
     }
 
-    if git::version_line_changed(dir, &base_ref)? {
+    if version_diff::version_line_changed(dir, &base_ref)? {
         let riding = agreed_file_version(&manifests)?.ok_or_else(|| {
             eyre::eyre!("this branch changes a version line but the manifest carries no version; fix the manifest")
         })?;
