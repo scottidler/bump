@@ -54,7 +54,7 @@ use crate::{DEFAULT_UNTOUCHED_VERSION, determine_version_action, process_directo
 use ci::ci_gate;
 use eyre::{Context, Result, bail};
 use log::debug;
-use pr::{branch_slug, pr_body, pr_title};
+use pr::{branch_slug, pr_body, pr_title, standalone_order_line};
 use semver::Version;
 use standalone::{classify_gated_standalone, execute_gated_standalone, is_bump_only_branch};
 use std::path::Path;
@@ -1088,6 +1088,12 @@ fn execute_gated<P: Pusher, I: Installer, R: Pr, C: Ci>(
         println!(
             "[dry-run] gh pr create --head {branch} --base {default} --title \"{title}\" --body \"<subjects>\\n\\nRelease: rides this PR ({tag})\"  (only if no open PR)"
         );
+        if let Some(words) = opts.standalone.as_deref() {
+            println!(
+                "[dry-run] gh pr comment {branch} --body '{}'  (only if a PR is already open)",
+                standalone_order_line(words)
+            );
+        }
         if let Some(notice) = &notice {
             println!("[dry-run] {notice}");
         }
@@ -1116,6 +1122,12 @@ fn execute_gated<P: Pusher, I: Installer, R: Pr, C: Ci>(
     //    body built from the branch and its commits.
     let pr_url = if ports.pr.open_pr_exists(dir, &branch)? {
         println!("open PR already exists for {branch}; not creating another");
+        // That PR's body was built by an earlier run, so Scott's order goes on as a comment.
+        if let Some(words) = opts.standalone.as_deref() {
+            let order = standalone_order_line(words);
+            ports.pr.comment_pr(dir, &branch, &order)?;
+            println!("{order} (commented on the open PR)");
+        }
         None
     } else {
         let subjects = git::commit_subjects(dir, &base_ref)?;

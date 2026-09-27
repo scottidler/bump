@@ -159,5 +159,5 @@ pub(super) fn echo_tag_steps(tag: &str, default: &str, gate: &CiGate, local_tag_
         println!("[dry-run] git tag -a {tag} <sha> -m \"Release {tag}\"");
     }
     println!("[dry-run] git fetch origin {default}  (re-verify before the push)");
-    println!("[dry-run] git push origin {tag}");
+    println!("[dry-run] git push --no-follow-tags origin {tag}");
 }

@@ -538,12 +538,14 @@ pub fn push_branch(path: &Path, branch: &str) -> Result<()> {
 
 /// Push a single tag to origin BY EXPLICIT NAME. Never `git push --tags` / `--follow-tags`
 /// (those can land a tag even when the branch push was rejected -- the okta-auth-rs
-/// orphan). Never `--force`, never tag deletion. Wired to `release::GitPusher::push_tag`
-/// and `release::finish`'s tag-push arms in production.
+/// orphan). `--no-follow-tags` overrides a `push.followTags=true` config, which would
+/// otherwise publish every remote-missing annotated tag on the tag's ancestry, none of
+/// them CI-verified. Never `--force`, never tag deletion. Wired to
+/// `release::GitPusher::push_tag` and `release::finish`'s tag-push arms in production.
 pub fn push_tag(path: &Path, tag: &str) -> Result<()> {
     debug!("push_tag: path={} tag={}", path.display(), tag);
     let output = Command::new("git")
-        .args(["push", "origin", tag])
+        .args(["push", "--no-follow-tags", "origin", tag])
         .current_dir(path)
         .output()
         .context("Failed to run git push")?;
@@ -900,6 +902,28 @@ mod tests {
     }
 
     /// Run a git command in `dir`, returning trimmed stdout (panics on failure).
+    /// Audit round 1, cheap-win 3: with `push.followTags=true`, a bare `git push origin
+    /// <tag>` also publishes remote-missing annotated tags on the tag's ancestry. Only the
+    /// named, CI-verified tag may reach origin.
+    #[test]
+    fn push_tag_pushes_only_the_named_tag_under_follow_tags() {
+        let (_origin, work) = bare_remote_and_clone();
+        let w = work.path();
+        git_in(w, &["push", "origin", "main"]);
+        git_in(w, &["tag", "-a", "stray-v0.0.9", "-m", "stray"]);
+        git_in(w, &["commit", "--allow-empty", "-m", "release"]);
+        git_in(w, &["tag", "-a", "v0.1.6", "-m", "v0.1.6"]);
+        git_in(w, &["config", "push.followTags", "true"]);
+
+        push_tag(w, "v0.1.6").unwrap();
+        assert!(remote_tag_sha(w, "v0.1.6").unwrap().is_some(), "the named tag");
+        assert_eq!(
+            remote_tag_sha(w, "stray-v0.0.9").unwrap(),
+            None,
+            "no follow-tags passenger"
+        );
+    }
+
     fn git_in(dir: &Path, args: &[&str]) -> String {
         let output = Command::new("git").args(args).current_dir(dir).output().unwrap();
         assert!(

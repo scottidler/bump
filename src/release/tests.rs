@@ -87,6 +87,8 @@ struct RecordingPr {
     create_calls: RefCell<u32>,
     /// `(branch, base, title, body)` of every create call.
     created: RefCell<Vec<(String, String, String, String)>>,
+    /// `(branch, body)` of every comment call.
+    comments: RefCell<Vec<(String, String)>>,
 }
 
 impl RecordingPr {
@@ -96,7 +98,17 @@ impl RecordingPr {
             list_calls: RefCell::new(0),
             create_calls: RefCell::new(0),
             created: RefCell::new(Vec::new()),
+            comments: RefCell::new(Vec::new()),
         }
+    }
+    /// A double whose branch already has an open PR (a prior run opened it).
+    fn already_open() -> Self {
+        let pr = Self::new();
+        *pr.exists.borrow_mut() = true;
+        pr
+    }
+    fn comments(&self) -> Vec<(String, String)> {
+        self.comments.borrow().clone()
     }
     fn created(&self) -> Vec<(String, String, String, String)> {
         self.created.borrow().clone()
@@ -122,6 +134,10 @@ impl Pr for RecordingPr {
         // An open PR now exists (models gh): the next probe returns true.
         *self.exists.borrow_mut() = true;
         Ok(format!("https://github.com/o/r/pull/{}", self.create_calls.borrow()))
+    }
+    fn comment_pr(&self, _dir: &Path, branch: &str, body: &str) -> Result<()> {
+        self.comments.borrow_mut().push((branch.into(), body.into()));
+        Ok(())
     }
 }
 

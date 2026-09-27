@@ -175,3 +175,46 @@ fn pr_body_quotes_the_standalone_order_before_the_release_line() {
         "- Bump version to v0.1.6\n\nStandalone release ordered by Scott: \"ship it\"\n\nRelease: rides this PR (v0.1.6)"
     );
 }
+
+/// Audit round 1, cheap-win 5: a gated run carrying Scott's standalone order on a branch
+/// whose PR is already open never builds a body, so the order goes onto that PR as a
+/// comment, verbatim; no second PR is created. Without an order, nothing is commented.
+#[test]
+fn standalone_order_is_commented_on_an_already_open_pr() {
+    let _guard = crate::ENV_LOCK.lock().unwrap();
+    let (origin, work) = setup_gated_feature_branch("0.1.5");
+    let dir = work.path();
+    let pr = RecordingPr::already_open();
+    let bare_pr = RecordingPr::already_open();
+    let prev = set_probe("gated:pull_request");
+    let ordered = release(
+        dir,
+        &standalone_opts(None, "ship it with the fix"),
+        &RecordingPusher::new(false),
+        &RecordingInstaller::new(),
+        &pr,
+        &NoCi,
+    );
+    let bare = release(
+        dir,
+        &auto_opts(None, false),
+        &RecordingPusher::new(false),
+        &RecordingInstaller::new(),
+        &bare_pr,
+        &NoCi,
+    );
+    restore_probe(prev);
+
+    assert!(ordered.expect("the ordered run pauses").paused);
+    assert_eq!(pr.create_calls(), 0, "no second PR");
+    assert_eq!(
+        pr.comments(),
+        vec![(
+            "feature".to_string(),
+            "Standalone release ordered by Scott: \"ship it with the fix\"".to_string()
+        )]
+    );
+    assert!(bare.expect("the bare re-run pauses").paused);
+    assert!(bare_pr.comments().is_empty(), "no order, no comment");
+    drop(origin);
+}

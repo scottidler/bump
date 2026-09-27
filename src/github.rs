@@ -504,6 +504,36 @@ pub fn create_pr(path: &Path, branch: &str, base: &str, title: &str, body: &str)
     Ok(url)
 }
 
+/// The `gh` argv for commenting on the open PR for `branch` (gh resolves a branch name to
+/// its PR).
+fn pr_comment_args(branch: &str, body: &str) -> Vec<String> {
+    ["pr", "comment", branch, "--body", body]
+        .into_iter()
+        .map(String::from)
+        .collect()
+}
+
+/// Comment `body` on the open PR for `branch`, per-org token-authed. Wired to
+/// `release::GhPr::comment_pr` in production.
+pub fn comment_pr(path: &Path, branch: &str, body: &str) -> Result<()> {
+    debug!("comment_pr: path={} branch={}", path.display(), branch);
+    let org = remote_slug(path).map(|s| org_of(&s).to_string()).unwrap_or_default();
+    let args = pr_comment_args(branch, body);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let output = gh_command(&org)
+        .args(&arg_refs)
+        .current_dir(path)
+        .output()
+        .context("Failed to run gh pr comment")?;
+    if !output.status.success() {
+        eyre::bail!(
+            "gh pr comment failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 /// The legacy commit-status API's combined verdict for a commit (`GET
 /// .../commits/{sha}/status`), read off `total_count` first -- see `status_from_json`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -538,7 +568,9 @@ pub struct CheckRuns {
 /// read). A missing `check_runs` array is a loud error, never a silent empty summary.
 /// Truncation -- the API's own `total_count` claiming more runs than were actually
 /// returned (i.e. `per_page=100` wasn't enough) -- is ALSO a loud error: a truncated
-/// read cannot tell red from green, so it must never be read as "all green so far".
+/// read cannot tell red from green, so it must never be read as "all green so far". A
+/// missing or non-integer `total_count` fails closed the same way: without it the
+/// truncation check cannot run.
 pub fn check_runs_from_json(text: &str) -> Result<CheckRuns> {
     let value: serde_json::Value = serde_json::from_str(text).context("check-runs payload is not JSON")?;
     let runs = value
@@ -546,15 +578,17 @@ pub fn check_runs_from_json(text: &str) -> Result<CheckRuns> {
         .and_then(|v| v.as_array())
         .ok_or_else(|| eyre::eyre!("check-runs payload has no check_runs array"))?;
 
-    if let Some(total_count) = value.get("total_count").and_then(|v| v.as_u64()) {
-        let total_count = total_count as usize;
-        if total_count > runs.len() {
-            eyre::bail!(
-                "check-runs payload truncated: total_count={} but only {} returned",
-                total_count,
-                runs.len()
-            );
-        }
+    let total_count = value
+        .get("total_count")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| eyre::eyre!("check-runs payload has no integer total_count; cannot rule out truncation"))?
+        as usize;
+    if total_count > runs.len() {
+        eyre::bail!(
+            "check-runs payload truncated: total_count={} but only {} returned",
+            total_count,
+            runs.len()
+        );
     }
 
     let mut summary = CheckRuns {
@@ -665,6 +699,14 @@ mod tests {
             ]
         );
         assert!(!args.iter().any(|a| a == "--fill"));
+    }
+
+    #[test]
+    fn pr_comment_args_name_the_branch_and_body() {
+        assert_eq!(
+            pr_comment_args("add-thing", "ordered"),
+            vec!["pr", "comment", "add-thing", "--body", "ordered"]
+        );
     }
 
     #[test]
@@ -870,6 +912,21 @@ mod tests {
         let payload = format!(r#"{{"total_count":101,"check_runs":[{}]}}"#, runs.join(","));
         let err = check_runs_from_json(&payload).unwrap_err().to_string();
         assert!(err.contains("truncated"), "error must name the truncation: {err}");
+    }
+
+    /// Audit round 1, cheap-win 4: without an integer `total_count` the truncation guard
+    /// cannot run, so the read fails closed instead of skipping it.
+    #[test]
+    fn check_runs_from_json_missing_or_non_integer_total_count_is_a_loud_error() {
+        let run = r#"{"name":"t","status":"completed","conclusion":"success","html_url":""}"#;
+        for payload in [
+            format!(r#"{{"check_runs":[{run}]}}"#),
+            format!(r#"{{"total_count":"1","check_runs":[{run}]}}"#),
+            format!(r#"{{"total_count":-1,"check_runs":[{run}]}}"#),
+        ] {
+            let err = check_runs_from_json(&payload).unwrap_err().to_string();
+            assert!(err.contains("total_count"), "names the field for {payload}: {err}");
+        }
     }
 
     #[test]

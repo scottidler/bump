@@ -571,3 +571,91 @@ left in place above (append-only) rather than edited.
 
 ### Open questions
 - None.
+
+## Implementation audit round 1: fold
+
+Source: review-panel round 1 synthesis (must-fix 1-2, cheap-win 3-6, doc-only 7-8). Each
+must-fix and cheap-win was reproduced by a failing test before the fix.
+
+### Design decisions
+- Must-fix 1, ungated generic repos: `gate_tag_and_push` (`src/release/tag.rs`) skips
+  ONLY the manifest-version sub-check when `detect_project_type == Generic`; sha ==
+  origin tip equality is kept at both re-verifies. A tip that moved during the CI wait
+  refuses for generic (no manifest can prove the new tip is the same release) instead of
+  following it. Tests: `ungated_generic_release_tags_and_pushes`,
+  `ungated_generic_red_ci_rerun_resumes` (`src/release/tests/ungated.rs`).
+- Must-fix 1, generic resume: `classify_generic_resume` (`src/release.rs`) makes an
+  ungated generic tip at HEAD == origin that no remote tag names the RESUME row: the
+  latest local tag when it sits at HEAD unpushed (the local-tag resume row), else the tag
+  the level computes from the latest tag. A computed tag that origin already carries but
+  the local repo lacks refuses naming `git fetch --tags origin`. Generic has no manifest,
+  so "the version is untagged" is read off the tip, the only version source it has.
+- Must-fix 2, package version only: new module `src/release/version_diff.rs` compares
+  each root manifest at the merge base with `origin/<default>` and at HEAD, split into
+  the PACKAGE version line (Cargo `[package]`/`[workspace.package]`, pyproject
+  `[project]`/`[tool.poetry]`, package.json top-level `"version"` by brace depth, the
+  whole `VERSION` file) and everything else. `version_line_changed` (the branch's own
+  bump) and `is_bump_only_branch` (`src/release/standalone.rs`) both read that split.
+  `git::is_version_diff_line`, `git::version_line_changed`, `git::changed_lines` and
+  their tests were removed; `version_line_changed_tells_own_bump_from_work_only` moved to
+  `version_diff::tests::version_line_changed_tells_own_bump_from_work_and_dependency_bumps`
+  with the dependency-table case added. Tests:
+  `dependency_table_version_change_with_work_bumps_fresh`,
+  `dependency_table_only_change_is_not_bump_only` (`src/release/tests/standalone.rs`),
+  plus the split unit tests in `version_diff.rs`.
+- Cheap-win 3: `git::push_tag` passes `--no-follow-tags` (the dry-run echo in
+  `tag::echo_tag_steps` says so too). Test:
+  `git::tests::push_tag_pushes_only_the_named_tag_under_follow_tags`.
+- Cheap-win 4: `github::check_runs_from_json` errors when `total_count` is missing or not
+  a non-negative integer. Test:
+  `check_runs_from_json_missing_or_non_integer_total_count_is_a_loud_error`.
+- Cheap-win 5: the `Pr` port gained `comment_pr` (`gh pr comment <branch> --body`,
+  `github::comment_pr`); `execute_gated` comments `Standalone release ordered by Scott:
+  "<words>"` on an already-open PR and prints it; the dry run echoes the comment step.
+  The body line and the comment share `pr::standalone_order_line`. Test:
+  `standalone_order_is_commented_on_an_already_open_pr` (`src/release/tests/pr.rs`).
+- Cheap-win 6: `node::read_version` names the full path again ("Failed to parse <path>
+  as JSON", "... (found 1) in <path>"), the v0.3.3 text; the blob reader still says
+  `package.json`. Shared parse: `node::parse_top_level_version`. Test:
+  `read_version_errors_name_the_file_path`.
+
+### Deviations
+- Doc correction (item 7): the tag-race sentence in "Tag placement and the two
+  re-verifies" said the local-tag resume row re-runs the gate on the tip. It now says what
+  the code does: fails safe, and the refusal names `git tag -d <tag>` for when origin no
+  longer carries the tagged sha.
+- Doc correction (item 8): `is_head_pushed` checks every remote-tracking ref (`git branch
+  -r --contains HEAD`), not only `origin/*`; the Architecture bullet for `src/git.rs` and
+  the Phase 1 bullet now say so.
+- Doc correction (must-fix 1): a new ungated generic RESUME row in the release table.
+- Doc correction (must-fix 2): "Bump-only branch" and "Whose pending version it is" now
+  scope the version line to the PACKAGE version, noting the hook's regex would count a
+  dependency-table line.
+- Doc correction (cheap-win 5): the two `--standalone` bullets say the order goes onto an
+  already-open PR as a comment.
+- Unrelated test flake fixed: `tests::amend_path_honors_explicit_message`
+  (`src/main.rs`) creates a tag, and tagging consults `BUMP_GATES_PROBE`, but it did not
+  hold `ENV_LOCK`; it failed once with the gated refusal while a gated test held the
+  probe. It now takes the lock. The other unlocked `process_directory` tests all run
+  `--no-tag` and never read the probe.
+
+### Tradeoffs
+- Generic resume reads "untagged tip" as pending vs refusing ungated generic before any
+  push: resume keeps the v0.3.3 behavior (ungated generic releases) and recovers from a
+  red CI. Side effect: an ungated generic repo whose pushed tip was never tagged now
+  releases on a bare `bump release` instead of refusing "nothing to release".
+- Package-version split by line scanning (TOML table headers, JSON brace depth) vs
+  parsing both sides with `toml_edit`/`serde_json`: scanning keeps "any other byte
+  changed" exact (formatting changes count as work, like the hook), where a parsed
+  compare would hide them. Cost: a `[` at the start of a line inside a multi-line TOML
+  array would be read as a table header.
+- Cheap-win 5 comment vs print only: a comment keeps the order on the PR, the audit trail
+  the doc promises, where a print survives only in the transcript. Cost: each re-run with
+  `--standalone` against the same open PR adds another comment.
+
+### Open questions
+- Is the generic side effect above acceptable (an untagged pushed tip in an ungated
+  generic repo releases on a bare `bump release`), or should that row demand the tip be a
+  prior run's push (no marker exists today)?
+- Hook parity (Phase 8): `git-release-guard.sh` Gate D and `is_bump_only_ref` still use
+  the line regex that counts `[dependencies.<name>] version`.

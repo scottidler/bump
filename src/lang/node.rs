@@ -46,21 +46,30 @@ pub fn package_json_path(dir: &Path) -> PathBuf {
 pub fn read_version(path: &Path) -> Result<Option<String>> {
     debug!("node::read_version: path={}", path.display());
     let content = fs::read_to_string(path).context(format!("Failed to read {}", path.display()))?;
-    read_version_from_str(&content)
+    parse_top_level_version(&content, Some(path))
 }
 
 /// Same as `read_version`, but from already-loaded content rather than a path on disk
 /// -- lets `git::manifest_version_at` parse a `git show <sha>:package.json` blob
 /// without writing it to a temp file first.
 pub fn read_version_from_str(content: &str) -> Result<Option<String>> {
-    let value: serde_json::Value = serde_json::from_str(content).context("Failed to parse package.json as JSON")?;
+    parse_top_level_version(content, None)
+}
+
+/// The shared parse behind both readers. `path` is the file on disk, named in every error
+/// so a multi-directory `bump a b c` says which package.json is broken; `None` for a blob.
+fn parse_top_level_version(content: &str, path: Option<&Path>) -> Result<Option<String>> {
+    let source = path.map_or_else(|| "package.json".to_string(), |p| p.display().to_string());
+    let location = path.map(|p| format!(" in {}", p.display())).unwrap_or_default();
+    let value: serde_json::Value =
+        serde_json::from_str(content).context(format!("Failed to parse {source} as JSON"))?;
     match value.get("version") {
         None => {
             debug!("node::read_version: no top-level version field");
             Ok(None)
         }
         Some(serde_json::Value::String(s)) => Ok(Some(s.clone())),
-        Some(other) => bail!("package.json \"version\" is not a string (found {other})"),
+        Some(other) => bail!("package.json \"version\" is not a string (found {other}){location}"),
     }
 }
 

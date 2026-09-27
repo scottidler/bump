@@ -13,10 +13,12 @@ use std::path::Path;
 /// `open_pr_exists` is the Phase-0 open-PR probe (`gh pr list --head <branch> --state
 /// open --json number`, NOT `gh pr view`); `create_pr` is `gh pr create` with an explicit
 /// head, base, title and body, only ever called when `open_pr_exists` returns false, and
-/// returns the new PR's URL.
+/// returns the new PR's URL. `comment_pr` (`gh pr comment <branch> --body <body>`) records
+/// Scott's standalone order on a PR that was already open, whose body this run never built.
 pub trait Pr {
     fn open_pr_exists(&self, dir: &Path, branch: &str) -> Result<bool>;
     fn create_pr(&self, dir: &Path, branch: &str, base: &str, title: &str, body: &str) -> Result<String>;
+    fn comment_pr(&self, dir: &Path, branch: &str, body: &str) -> Result<()>;
 }
 
 /// Production `Pr`: the real `gh` PR operations (list-probe + explicit create).
@@ -29,6 +31,10 @@ impl Pr for GhPr {
 
     fn create_pr(&self, dir: &Path, branch: &str, base: &str, title: &str, body: &str) -> Result<String> {
         github::create_pr(dir, branch, base, title, body)
+    }
+
+    fn comment_pr(&self, dir: &Path, branch: &str, body: &str) -> Result<()> {
+        github::comment_pr(dir, branch, body)
     }
 }
 
@@ -100,8 +106,14 @@ pub fn pr_body(subjects: &[String], tag: &str, standalone: Option<&str>) -> Stri
         body.push_str("- version bump\n");
     }
     if let Some(words) = standalone {
-        body.push_str(&format!("\nStandalone release ordered by Scott: \"{words}\"\n"));
+        body.push_str(&format!("\n{}\n", standalone_order_line(words)));
     }
     body.push_str(&format!("\nRelease: rides this PR ({tag})"));
     body
+}
+
+/// Scott's standalone order as it is quoted on the PR: in the body of a PR this run opens,
+/// or as a comment on one that was already open.
+pub(super) fn standalone_order_line(words: &str) -> String {
+    format!("Standalone release ordered by Scott: \"{words}\"")
 }

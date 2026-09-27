@@ -187,3 +187,27 @@ fn npm_round_trip_updates_both_lock_sites() {
         "packages[\"\"] version must update"
     );
 }
+
+/// Audit round 1, cheap-win 6: a bad package.json read from disk names its full path, so
+/// a multi-directory `bump a b c` says which one is broken.
+#[test]
+fn read_version_errors_name_the_file_path() {
+    let tmp = TempDir::new().unwrap();
+    let path = package_json_path(tmp.path());
+    fs::write(&path, "{\n  \"version\": 1\n}\n").unwrap();
+    let err = read_version(&path).unwrap_err().to_string();
+    assert!(
+        err.contains(&path.display().to_string()),
+        "not-a-string names the path: {err}"
+    );
+
+    fs::write(&path, "{\n").unwrap();
+    let err = read_version(&path).unwrap_err().to_string();
+    assert!(
+        err.contains(&path.display().to_string()),
+        "bad JSON names the path: {err}"
+    );
+
+    let err = read_version_from_str("{\n").unwrap_err().to_string();
+    assert!(err.contains("package.json"), "a blob still names the manifest: {err}");
+}

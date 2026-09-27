@@ -1832,6 +1832,8 @@ name = "test-pkg"
     /// kept the OLD commit's message no matter what was asked for. Now it must apply.
     #[test]
     fn amend_path_honors_explicit_message() {
+        // Tagging consults the gate, and a concurrent test may hold BUMP_GATES_PROBE=gated.
+        let _guard = ENV_LOCK.lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         setup_git_repo(dir); // no remote/upstream configured -> is_head_pushed() == false
