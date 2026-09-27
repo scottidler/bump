@@ -649,7 +649,7 @@ pub(crate) fn process_directory(dir: &Path, cli: &Cli, bump_type: BumpType) -> R
         if !create_tag {
             println!("[dry-run] Would commit version bump to {} (no tag)", new_file_version);
         } else if !has_changes && !git::head_has_tag(dir)? {
-            let is_pushed = git::is_head_pushed(dir)?;
+            let is_pushed = cli.never_amend || git::is_head_pushed(dir)?;
             if is_pushed {
                 println!("[dry-run] Would create new commit and tag: {}", new_tag);
             } else {
@@ -708,8 +708,10 @@ pub(crate) fn process_directory(dir: &Path, cli: &Cli, bump_type: BumpType) -> R
             bail!("HEAD already has a tag. Make changes first, then run bump. Use --force to override.");
         }
 
-        // Check if HEAD has been pushed
-        let is_pushed = git::is_head_pushed(dir)?;
+        // Check if HEAD has been pushed. `never_amend` (set by the release verbs, never by
+        // an operator flag) forces the "create a new commit" branch below even when this
+        // check alone would say HEAD is unpushed.
+        let is_pushed = cli.never_amend || git::is_head_pushed(dir)?;
 
         // Update version file(s): write EVERY detected manifest in lockstep and sync
         // their lockfiles.
@@ -1734,6 +1736,66 @@ name = "test-pkg"
         assert!(git::tag_exists(dir, "v0.1.5").unwrap(), "prior tag untouched");
         let version = read_file_version(dir, ProjectType::Rust).unwrap().unwrap();
         assert_eq!(version, "0.1.6", "version file must still be bumped");
+    }
+
+    /// Phase 1 success criterion / regression test for the amend fix: a branch cut from
+    /// `origin/main` with NO upstream, on a clean tree, must be recognized as pushed via
+    /// remote-containment and produce a NEW commit whose parent is `origin/main` -- not an
+    /// amend of the commit that rode in from origin.
+    #[test]
+    fn no_tag_on_freshly_cut_branch_creates_new_commit_not_amend() {
+        let origin = TempDir::new().unwrap();
+        Command::new("git")
+            .args(["init", "--bare", "-b", "main"])
+            .current_dir(origin.path())
+            .output()
+            .unwrap();
+
+        let work = TempDir::new().unwrap();
+        setup_git_repo(work.path());
+        create_cargo_toml(work.path(), Some("0.1.0"));
+        create_initial_commit(work.path());
+        create_git_tag(work.path(), "v0.1.0");
+        git_in(work.path(), &["branch", "-M", "main"]);
+        git_in(
+            work.path(),
+            &["remote", "add", "origin", origin.path().to_str().unwrap()],
+        );
+        git_in(work.path(), &["push", "-u", "origin", "main"]);
+        git_in(work.path(), &["push", "origin", "v0.1.0"]);
+        git_in(work.path(), &["remote", "set-head", "origin", "main"]);
+
+        // A second, UNTAGGED commit on main, also pushed -- the commit an amend would
+        // wrongly rewrite if `is_head_pushed` missed the remote-containment case.
+        fs::write(work.path().join("README2.md"), "more").unwrap();
+        git_in(work.path(), &["add", "-A"]);
+        git_in(work.path(), &["commit", "-m", "second commit"]);
+        git_in(work.path(), &["push", "origin", "main"]);
+        let origin_tip = git_in(work.path(), &["rev-parse", "origin/main"]);
+
+        // Cut a branch at that tip with NO upstream configured.
+        git_in(work.path(), &["fetch", "origin"]);
+        git_in(work.path(), &["checkout", "-b", "feature", "--no-track", "origin/main"]);
+
+        let cli = Cli::try_parse_from(["bump", "--no-tag"]).unwrap();
+        process_directory(work.path(), &cli, BumpType::Patch).unwrap();
+
+        let head = git_in(work.path(), &["rev-parse", "HEAD"]);
+        assert_ne!(head, origin_tip, "a new commit must have been created");
+        let parent = git_in(work.path(), &["rev-parse", "HEAD^"]);
+        assert_eq!(
+            parent, origin_tip,
+            "the new commit's parent must be origin/main's tip, proving no amend happened"
+        );
+
+        let subject = git_in(work.path(), &["log", "-1", "--format=%s", "HEAD^"]);
+        assert_eq!(
+            subject, "second commit",
+            "the pre-existing origin commit must be untouched"
+        );
+
+        let version = read_file_version(work.path(), ProjectType::Rust).unwrap().unwrap();
+        assert_eq!(version, "0.1.1", "version file must still be bumped");
     }
 
     /// Regression test: on the "clean tree, HEAD not pushed" (amend) path, an explicit

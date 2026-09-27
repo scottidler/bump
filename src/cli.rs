@@ -74,6 +74,13 @@ pub struct Cli {
     /// Paths to git repository roots
     #[arg(value_name = "DIRECTORIES")]
     pub directories: Vec<PathBuf>,
+
+    /// Never fall back to amending the previous commit, even when HEAD looks unpushed --
+    /// always create a NEW commit. Not a CLI flag: `#[arg(skip)]` because the release
+    /// verbs set this programmatically before delegating into the shared bump logic; no
+    /// operator flag should let an ordinary `bump` invocation flip it.
+    #[arg(skip)]
+    pub never_amend: bool,
 }
 
 /// The two release verbs. `None` (no subcommand) is today's legacy `bump` behavior,

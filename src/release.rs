@@ -758,6 +758,10 @@ fn version_commit(dir: &Path, bump_type: BumpType) -> Result<()> {
         no_verify: false,
         skip_member: Vec::new(),
         directories: Vec::new(),
+        // The release verb's own bump commit must never silently rewrite a commit that
+        // might already be public (a re-run after a partial push, a branch someone else
+        // fetched): always a new commit, never `process_directory`'s amend fallback.
+        never_amend: true,
     };
     process_directory(dir, &cli, bump_type)
 }

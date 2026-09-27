@@ -1,6 +1,6 @@
 use eyre::{Context, Result, bail};
 use log::debug;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Check if the given path is inside a git repository
@@ -120,6 +120,23 @@ pub fn head_has_tag(path: &Path) -> Result<bool> {
 /// Check if HEAD has been pushed to the remote tracking branch
 /// Returns false if there's no upstream or if HEAD is ahead of upstream
 pub fn is_head_pushed(path: &Path) -> Result<bool> {
+    debug!("is_head_pushed: path={}", path.display());
+
+    // A branch cut with `--no-track` (the standalone release path, and any feature
+    // branch someone forgot to set an upstream on) has no `@{u}` at all, but its tip can
+    // still be sitting on origin -- e.g. cut straight from origin/<default>. Checking any
+    // `origin/*` ref containment FIRST catches that case; the `@{u}` check below only
+    // ever sees branches that DO have an upstream configured.
+    let contained = Command::new("git")
+        .args(["branch", "-r", "--contains", "HEAD"])
+        .current_dir(path)
+        .output()
+        .context("Failed to run git branch -r --contains")?;
+    if contained.status.success() && !String::from_utf8_lossy(&contained.stdout).trim().is_empty() {
+        debug!("is_head_pushed: HEAD is contained in a remote-tracking ref");
+        return Ok(true);
+    }
+
     // First check if we have an upstream
     let upstream_check = Command::new("git")
         .args(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
@@ -554,6 +571,120 @@ pub fn pull_ff_only(path: &Path, branch: &str) -> Result<()> {
     Ok(())
 }
 
+/// Commit subjects on `base..HEAD`, oldest first (`git log --reverse --format=%s`). Used
+/// to derive a gated PR's title (the first subject) and body (one `- <subject>` line
+/// each).
+// Phase 1 lands this helper on its own; `pr_title`/`pr_body` call it starting in Phase 3.
+#[allow(dead_code)]
+pub fn commit_subjects(path: &Path, base: &str) -> Result<Vec<String>> {
+    debug!("commit_subjects: path={} base={}", path.display(), base);
+    let range = format!("{base}..HEAD");
+    let output = Command::new("git")
+        .args(["log", "--reverse", "--format=%s", &range])
+        .current_dir(path)
+        .output()
+        .context("Failed to run git log")?;
+    if !output.status.success() {
+        bail!("git log {} failed: {}", range, String::from_utf8_lossy(&output.stderr));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// Paths changed on HEAD relative to `base` (`git diff --name-only base...HEAD`, the
+/// merge-base form). Used to classify a bump-only branch and to tell a branch's own
+/// version bump from an inherited pending version.
+// Wired into `is_bump_only_branch` / the version-line-in-diff check starting in Phase 3/4.
+#[allow(dead_code)]
+pub fn changed_files(path: &Path, base: &str) -> Result<Vec<String>> {
+    debug!("changed_files: path={} base={}", path.display(), base);
+    let range = format!("{base}...HEAD");
+    let output = Command::new("git")
+        .args(["diff", "--name-only", &range])
+        .current_dir(path)
+        .output()
+        .context("Failed to run git diff --name-only")?;
+    if !output.status.success() {
+        bail!(
+            "git diff --name-only {} failed: {}",
+            range,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// Create `branch` at `upstream` and check it out, with `upstream` as its tracking ref:
+/// `git checkout -b <branch> --track <upstream>`. The standalone release path uses this so
+/// the new branch has an upstream from its first second (see `is_head_pushed`).
+// Wired into `execute_gated_standalone` starting in Phase 4.
+#[allow(dead_code)]
+pub fn checkout_new_tracking(path: &Path, branch: &str, upstream: &str) -> Result<()> {
+    debug!(
+        "checkout_new_tracking: path={} branch={} upstream={}",
+        path.display(),
+        branch,
+        upstream
+    );
+    let output = Command::new("git")
+        .args(["checkout", "-b", branch, "--track", upstream])
+        .current_dir(path)
+        .output()
+        .context("Failed to run git checkout -b")?;
+    if !output.status.success() {
+        bail!(
+            "git checkout -b {} --track {} failed: {}",
+            branch,
+            upstream,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
+}
+
+/// The worktree (of the repository containing `path`) that has `branch` checked out, or
+/// `None`. `bump finish` runs from wherever the agent is, which under a worktree layout is
+/// usually a feature-branch worktree while the default branch lives in the main checkout;
+/// `git checkout <default>` fails there ("already checked out"), so finish goes to the
+/// worktree that holds it instead.
+// Wired into `finish_dir` starting in Phase 5.
+#[allow(dead_code)]
+pub fn worktree_for_branch(path: &Path, branch: &str) -> Result<Option<PathBuf>> {
+    debug!("worktree_for_branch: path={} branch={}", path.display(), branch);
+    let output = Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(path)
+        .output()
+        .context("Failed to run git worktree list")?;
+    if !output.status.success() {
+        bail!("git worktree list failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let wanted = format!("refs/heads/{branch}");
+    let mut current: Option<PathBuf> = None;
+    for line in text.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            current = Some(PathBuf::from(p));
+        } else if let Some(r) = line.strip_prefix("branch ") {
+            if r == wanted {
+                return Ok(current);
+            }
+        } else if line.is_empty() {
+            current = None;
+        }
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -663,6 +794,150 @@ mod tests {
         assert!(
             push_tag(work.path(), "v0.1.0").is_err(),
             "push_tag must error when origin is missing"
+        );
+    }
+
+    /// Run a git command in `dir`, returning trimmed stdout (panics on failure).
+    fn git_in(dir: &Path, args: &[&str]) -> String {
+        let output = Command::new("git").args(args).current_dir(dir).output().unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// Phase 1 success criterion: a branch cut from `origin/main` with NO upstream is
+    /// reported pushed by remote-containment alone; one local commit ahead of that tip
+    /// flips it back to unpushed.
+    #[test]
+    fn is_head_pushed_true_by_containment_then_false_after_local_commit() {
+        let (_origin, work) = bare_remote_and_clone();
+        push_branch(work.path(), "main").unwrap();
+
+        // Cut a branch at origin/main's tip with `--no-track`: no `@{u}` at all.
+        git_in(work.path(), &["fetch", "origin"]);
+        git_in(work.path(), &["checkout", "-b", "feature", "--no-track", "origin/main"]);
+        assert!(
+            is_head_pushed(work.path()).unwrap(),
+            "a fresh branch cut from origin/main's tip must read as pushed via containment, even with no upstream"
+        );
+
+        // One local commit ahead of origin: no remote ref contains HEAD, and there is
+        // still no upstream, so this must now read as NOT pushed.
+        std::fs::write(work.path().join("feature.txt"), "work").unwrap();
+        git_in(work.path(), &["add", "-A"]);
+        git_in(work.path(), &["commit", "-m", "feature work"]);
+        assert!(
+            !is_head_pushed(work.path()).unwrap(),
+            "a local commit ahead of origin, with no upstream, must read as not pushed"
+        );
+    }
+
+    #[test]
+    fn commit_subjects_lists_oldest_first() {
+        let (_origin, work) = bare_remote_and_clone();
+        let base = head_sha(work.path()).unwrap();
+
+        std::fs::write(work.path().join("a.txt"), "a").unwrap();
+        git_in(work.path(), &["add", "-A"]);
+        git_in(work.path(), &["commit", "-m", "first commit"]);
+        std::fs::write(work.path().join("b.txt"), "b").unwrap();
+        git_in(work.path(), &["add", "-A"]);
+        git_in(work.path(), &["commit", "-m", "second commit"]);
+
+        let subjects = commit_subjects(work.path(), &base).unwrap();
+        assert_eq!(subjects, vec!["first commit", "second commit"]);
+    }
+
+    #[test]
+    fn commit_subjects_errors_on_unknown_base() {
+        let (_origin, work) = bare_remote_and_clone();
+        assert!(
+            commit_subjects(work.path(), "not-a-real-ref").is_err(),
+            "an unresolvable base must error, not return an empty list"
+        );
+    }
+
+    #[test]
+    fn changed_files_lists_diff_paths() {
+        let (_origin, work) = bare_remote_and_clone();
+        let base = head_sha(work.path()).unwrap();
+
+        std::fs::write(work.path().join("a.txt"), "a").unwrap();
+        std::fs::write(work.path().join("b.txt"), "b").unwrap();
+        git_in(work.path(), &["add", "-A"]);
+        git_in(work.path(), &["commit", "-m", "add two files"]);
+
+        let mut files = changed_files(work.path(), &base).unwrap();
+        files.sort();
+        assert_eq!(files, vec!["a.txt", "b.txt"]);
+    }
+
+    #[test]
+    fn changed_files_errors_on_unknown_base() {
+        let (_origin, work) = bare_remote_and_clone();
+        assert!(
+            changed_files(work.path(), "not-a-real-ref").is_err(),
+            "an unresolvable base must error, not return an empty list"
+        );
+    }
+
+    #[test]
+    fn checkout_new_tracking_creates_branch_with_upstream() {
+        let (_origin, work) = bare_remote_and_clone();
+        push_branch(work.path(), "main").unwrap();
+        git_in(work.path(), &["fetch", "origin"]);
+
+        checkout_new_tracking(work.path(), "bump-v0-1-0", "origin/main").unwrap();
+
+        assert_eq!(current_branch(work.path()).unwrap(), "bump-v0-1-0");
+        let upstream = git_in(
+            work.path(),
+            &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+        );
+        assert_eq!(upstream, "origin/main");
+    }
+
+    #[test]
+    fn checkout_new_tracking_errors_when_branch_already_exists() {
+        let (_origin, work) = bare_remote_and_clone();
+        push_branch(work.path(), "main").unwrap();
+        git_in(work.path(), &["fetch", "origin"]);
+        git_in(work.path(), &["branch", "dup"]);
+
+        assert!(
+            checkout_new_tracking(work.path(), "dup", "origin/main").is_err(),
+            "checking out an already-existing branch name must error"
+        );
+    }
+
+    #[test]
+    fn worktree_for_branch_finds_sibling_worktree_and_none_otherwise() {
+        let (_origin, work) = bare_remote_and_clone();
+        assert_eq!(
+            worktree_for_branch(work.path(), "main").unwrap(),
+            Some(work.path().to_path_buf()),
+            "the branch checked out in the primary worktree must resolve to it"
+        );
+        assert_eq!(
+            worktree_for_branch(work.path(), "no-such-branch").unwrap(),
+            None,
+            "a branch checked out nowhere must resolve to None"
+        );
+
+        let sibling = TempDir::new().unwrap();
+        // Detach the sibling dir name so `git worktree add` can create it fresh.
+        std::fs::remove_dir(sibling.path()).unwrap();
+        git_in(
+            work.path(),
+            &["worktree", "add", "-b", "feature", sibling.path().to_str().unwrap()],
+        );
+        assert_eq!(
+            worktree_for_branch(work.path(), "feature").unwrap(),
+            Some(sibling.path().to_path_buf()),
+            "a branch checked out in a sibling worktree must resolve to that worktree's path"
         );
     }
 
