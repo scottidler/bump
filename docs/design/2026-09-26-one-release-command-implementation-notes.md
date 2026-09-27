@@ -357,3 +357,66 @@ pr.rs 103, tag.rs 150, tests.rs 585, tests/gate.rs 499 (largest test file).
 - Test: `standalone_on_a_pending_version_refuses_naming_bump_finish`. Gated: no branch cut,
   no commit, no push, no PR probe, no tag. Ungated twin: resumes `v0.1.6`, no version commit,
   only the tag push.
+
+## Phase 5: finish from any worktree
+
+### Design decisions
+- `finish_dir` (`src/release/finish.rs`) is read-only and returns `FinishDir::{Own,
+  Sibling(path), CheckoutHere}`: current branch == default -> own checkout; else
+  `git::worktree_for_branch` -> the sibling; else check out here. The checkout for
+  `CheckoutHere` happens later, in `reach_merged_tip`, after classification, so nothing
+  moves before a refusal.
+- Order in `finish`: git-repo check -> resolve -> tracked changes on the current worktree,
+  then on the resolved one (named by path) -> generic check on the resolved worktree ->
+  dry run -> `reach_merged_tip` -> `config::load(work)` -> `tag_ladder(work)` -> gate, tag,
+  push, install, all on `work`.
+- `reach_merged_tip`: `fetch_branch`, then the new `git::compare_branch_to_remote` (the
+  LOCAL `refs/heads/<default>` vs `origin/<default>`, whether or not it is checked out
+  here). Behind -> `pull --ff-only` after the checkout; Equal -> nothing; Ahead -> refuse
+  with the literal rescue (`git branch stranded-<sha8>` + `git reset --hard origin/<default>`
+  after `cd <worktree>`, or `git branch -f` when the default is checked out nowhere, same
+  shape as the release verb's `GatedStranded`); Diverged -> refuse naming `cd <worktree> &&
+  git pull --rebase origin <default>`, then re-run. No local default at all -> the checkout
+  creates it from origin (DWIM), after which the ladder sees Equal.
+- `compare_head_to_remote` now delegates to a shared `compare_rev_to_remote`, so HEAD and
+  branch comparisons use one ancestry rule. `git::rev_parse` became `pub` for the rescue
+  branch name. `worktree_for_branch` lost its `#[allow(dead_code)]`.
+- Already released (remote tag at the merged tip) runs `run_install` in the resolved
+  worktree; `--no-install` (`InstallChoice::Skip`) skips it.
+- Dry run resolves the worktree (read-only) and prints where it would finish, plus the
+  classify-then-pull steps. It still fetches nothing.
+- Test `finish_remote_tag_is_clean_noop_across_two_runs` was renamed and inverted to
+  `finish_already_released_still_installs`. It pinned "no install on already released".
+- `RecordingInstaller` records the dir too, so the worktree test asserts install ran in
+  the main worktree.
+- Tests (`src/release/tests/finish.rs`): the four named criteria, plus
+  `finish_ahead_default_refuses_before_pull`,
+  `finish_refuses_tracked_change_in_the_resolved_worktree`,
+  `finish_creates_a_missing_default_branch_from_origin`; each worktree test compares a
+  snapshot (branch, HEAD, `status --porcelain` with an untracked scratch file, Cargo.toml)
+  of the feature worktree before and after. `git::tests::compare_branch_to_remote_reads_the_branch_not_head`
+  covers the helper.
+- Break-the-code checks, run by hand and reverted: letting Diverged fall through to the
+  pull fails `finish_diverged_default_refuses_before_pull` (git's ff-only error instead of
+  the rebase line); forcing `CheckoutHere` over a found sibling fails
+  `finish_from_feature_worktree_finishes_in_the_default_worktree` ("'main' is already used
+  by worktree").
+
+### Deviations
+- `finish_dir` does not check out; it only decides. The doc lists "checkout here" as part
+  of resolution, but the same doc requires classification before anything moves. Same
+  effect, correct seam.
+- The Ahead refusal wording is not in the doc (it says only "refuse before any pull");
+  it follows the release verb's stranded rescue so the refusal names exact commands.
+
+### Tradeoffs
+- Classifying the local branch ref vs checking out first and classifying HEAD: the ref
+  comparison is what lets the `CheckoutHere` case refuse without switching branches.
+- Treating a missing local default as "nothing to classify" vs refusing: a clone with only
+  a feature branch is a normal state, and the checkout creates the branch at origin's tip,
+  which cannot carry local-only commits.
+
+### Open questions
+- The Acceptance Criterion `git show HEAD:src/release/tests.rs | grep -c 'fn red_ci_leaves_no_tag\|fn gated_standalone_cuts\|fn finish_from_feature_worktree'`
+  predates the module split: those tests now live in `src/release/tests/{gate,standalone,finish}.rs`,
+  so that exact command prints `0`. Rewrite the criterion to grep `src/release/tests/`?

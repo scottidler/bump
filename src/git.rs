@@ -274,7 +274,7 @@ pub enum HeadRemote {
 }
 
 /// Run `git rev-parse <rev>` and return the resolved SHA.
-fn rev_parse(path: &Path, rev: &str) -> Result<String> {
+pub fn rev_parse(path: &Path, rev: &str) -> Result<String> {
     let output = Command::new("git")
         .args(["rev-parse", rev])
         .current_dir(path)
@@ -404,18 +404,34 @@ pub fn manifest_version_at(dir: &Path, sha: &str) -> Result<Option<String>> {
 
 /// Compare local HEAD to `origin/<branch>` (call `fetch_branch` first).
 pub fn compare_head_to_remote(path: &Path, branch: &str) -> Result<HeadRemote> {
-    let head = head_sha(path)?;
+    compare_rev_to_remote(path, "HEAD", branch)
+}
+
+/// Compare the LOCAL branch `refs/heads/<branch>` to `origin/<branch>` (call `fetch_branch`
+/// first), whether or not it is checked out anywhere. `Ok(None)` when no local branch of
+/// that name exists. `bump finish` classifies the default branch with this BEFORE it
+/// checks anything out or pulls, so an ahead or diverged default refuses untouched.
+pub fn compare_branch_to_remote(path: &Path, branch: &str) -> Result<Option<HeadRemote>> {
+    debug!("compare_branch_to_remote: path={} branch={}", path.display(), branch);
+    if !local_branch_exists(path, branch)? {
+        return Ok(None);
+    }
+    compare_rev_to_remote(path, &format!("refs/heads/{branch}"), branch).map(Some)
+}
+
+fn compare_rev_to_remote(path: &Path, rev: &str, branch: &str) -> Result<HeadRemote> {
+    let local = rev_parse(path, rev)?;
     let remote_ref = format!("origin/{branch}");
     let remote = rev_parse(path, &remote_ref)?;
 
-    if head == remote {
+    if local == remote {
         return Ok(HeadRemote::Equal);
     }
 
-    let head_is_ancestor = is_ancestor(path, "HEAD", &remote_ref)?;
-    let remote_is_ancestor = is_ancestor(path, &remote_ref, "HEAD")?;
+    let local_is_ancestor = is_ancestor(path, rev, &remote_ref)?;
+    let remote_is_ancestor = is_ancestor(path, &remote_ref, rev)?;
 
-    Ok(match (head_is_ancestor, remote_is_ancestor) {
+    Ok(match (local_is_ancestor, remote_is_ancestor) {
         (true, false) => HeadRemote::Behind,
         (false, true) => HeadRemote::Ahead,
         _ => HeadRemote::Diverged,
@@ -796,8 +812,6 @@ pub fn checkout_new_tracking(path: &Path, branch: &str, upstream: &str) -> Resul
 /// usually a feature-branch worktree while the default branch lives in the main checkout;
 /// `git checkout <default>` fails there ("already checked out"), so finish goes to the
 /// worktree that holds it instead.
-// Wired into `finish_dir` starting in Phase 5.
-#[allow(dead_code)]
 pub fn worktree_for_branch(path: &Path, branch: &str) -> Result<Option<PathBuf>> {
     debug!("worktree_for_branch: path={} branch={}", path.display(), branch);
     let output = Command::new("git")
@@ -1042,6 +1056,31 @@ mod tests {
         let current = current_branch(w).unwrap();
         assert!(local_branch_exists(w, &current).unwrap());
         assert!(!local_branch_exists(w, "no-such-branch").unwrap());
+    }
+
+    #[test]
+    fn compare_branch_to_remote_reads_the_branch_not_head() {
+        let (_origin, work) = bare_remote_and_clone();
+        let w = work.path();
+        push_branch(w, "main").unwrap();
+        fetch_branch(w, "main").unwrap();
+        assert_eq!(compare_branch_to_remote(w, "main").unwrap(), Some(HeadRemote::Equal));
+        assert_eq!(compare_branch_to_remote(w, "no-such-branch").unwrap(), None);
+
+        // HEAD moves ahead on another branch; local main is untouched and still Equal.
+        git_in(w, &["checkout", "-b", "feature"]);
+        git_in(w, &["commit", "--allow-empty", "-m", "feature"]);
+        assert_eq!(compare_head_to_remote(w, "main").unwrap(), HeadRemote::Ahead);
+        assert_eq!(compare_branch_to_remote(w, "main").unwrap(), Some(HeadRemote::Equal));
+
+        // origin moves on; local main (not checked out) is Behind, then Diverged once it
+        // carries a commit of its own.
+        git_in(w, &["push", "origin", "feature:main"]);
+        fetch_branch(w, "main").unwrap();
+        assert_eq!(compare_branch_to_remote(w, "main").unwrap(), Some(HeadRemote::Behind));
+        git_in(w, &["checkout", "main"]);
+        git_in(w, &["commit", "--allow-empty", "-m", "local only"]);
+        assert_eq!(compare_branch_to_remote(w, "main").unwrap(), Some(HeadRemote::Diverged));
     }
 
     #[test]

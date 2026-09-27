@@ -106,26 +106,35 @@ fn finish_local_only_tag_resumes_and_pushes() {
     drop(origin);
 }
 
-/// Row 3: a fully-released version (tag on origin at the merged tip) is a clean NO-OP, and a
-/// SECOND full finish run is still a clean no-op -- never a resume, never a push, never an
-/// install.
+/// Phase 5 criterion, row 3: the tag is on the remote at the merged tip -> "already
+/// released", and the install step STILL runs, so a re-run after "tag pushed, install
+/// failed" installs. Two runs install twice and never push; `--no-install` skips it.
 #[test]
-fn finish_remote_tag_is_clean_noop_across_two_runs() {
+fn finish_already_released_still_installs() {
     let (origin, work) = setup_finish_fully_released("0.1.5", "0.1.6");
     let dir = work.path();
 
     let pusher = RecordingPusher::new(false);
     let installer = RecordingInstaller::new();
-    let first = finish(dir, &finish_opts(false), &pusher, &installer, &NoCi).expect("first finish no-ops");
-    let second = finish(dir, &finish_opts(false), &pusher, &installer, &NoCi).expect("second finish also no-ops");
+    let first = finish(dir, &finish_opts(false), &pusher, &installer, &NoCi).expect("first finish reports released");
+    let second = finish(dir, &finish_opts(false), &pusher, &installer, &NoCi).expect("second finish too");
 
     for report in [first, second] {
         assert_eq!(report.tag, "v0.1.6");
         assert!(!report.resumed, "already-released is NOT a resume");
-        assert!(report.install_command.is_none(), "no install on a no-op");
+        assert_eq!(report.install_command.as_deref(), Some("cargo install --path ."));
     }
-    assert!(pusher.calls().is_empty(), "no-op never pushes a tag");
-    assert!(installer.calls().is_empty(), "no-op never installs");
+    assert!(pusher.calls().is_empty(), "already released never pushes a tag");
+    assert_eq!(installer.calls(), vec!["cargo install --path .".to_string(); 2]);
+
+    let skip = FinishOpts {
+        install: InstallChoice::Skip,
+        ..finish_opts(false)
+    };
+    let skipped = finish(dir, &skip, &pusher, &installer, &NoCi).expect("--no-install run");
+    assert!(skipped.install_command.is_none(), "--no-install skips the install");
+    assert_eq!(installer.calls().len(), 2, "no third install under --no-install");
+    assert!(pusher.calls().is_empty());
     drop(origin);
 }
 
@@ -242,5 +251,227 @@ fn tag_ladder_splits_behind_and_diverged() {
     assert!(!diverged.contains("--ff-only"), "got: {diverged}");
     assert_eq!(git::tag_sha(dir, "v0.1.5").unwrap(), c1, "no tag moved or created");
     assert!(!git::tag_exists(dir, "v0.1.6").unwrap());
+    drop(origin);
+}
+
+// ---- Phase 5: finish from any worktree -------------------------------------------
+
+/// A main worktree plus a feature worktree beside it (`git worktree add`), the herdr
+/// layout. origin/main carries the untagged merged bump to `to`; the main worktree's `main`
+/// was never pulled since the merge (BEHIND); the feature worktree sits on `feature` at the
+/// merged bump with an untracked scratch file.
+struct Worktrees {
+    origin: TempDir,
+    main: TempDir,
+    feature: TempDir,
+}
+
+fn setup_finish_worktrees(from: &str, to: &str) -> Worktrees {
+    let (origin, main) = setup_released(from);
+    let m = main.path();
+    let base = git_ok(m, &["rev-parse", "HEAD"]);
+    write_cargo(m, to);
+    git_ok(m, &["commit", "-am", &format!("Bump version to {to}")]);
+    git_ok(m, &["push", "origin", "main"]);
+    git_ok(m, &["branch", "feature"]);
+    git_ok(m, &["reset", "--hard", &base]);
+    let feature = add_feature_worktree(m);
+    Worktrees { origin, main, feature }
+}
+
+/// `git worktree add <tmp> feature` (the branch must exist) plus an untracked scratch file.
+fn add_feature_worktree(main: &Path) -> TempDir {
+    let feature = TempDir::new().unwrap();
+    fs::remove_dir(feature.path()).unwrap(); // `git worktree add` creates it fresh
+    git_ok(main, &["worktree", "add", feature.path().to_str().unwrap(), "feature"]);
+    fs::write(feature.path().join("scratch.txt"), "wip").unwrap();
+    feature
+}
+
+/// Everything about a worktree finish must not touch: branch, HEAD, full status (untracked
+/// included), and the manifest on disk.
+fn snapshot(dir: &Path) -> (String, String, String, String) {
+    (
+        git::current_branch(dir).unwrap(),
+        git::head_sha(dir).unwrap(),
+        git_ok(dir, &["status", "--porcelain"]),
+        fs::read_to_string(dir.join("Cargo.toml")).unwrap(),
+    )
+}
+
+fn same_path(a: &Path, b: &Path) -> bool {
+    fs::canonicalize(a).unwrap() == fs::canonicalize(b).unwrap()
+}
+
+/// Phase 5 criterion: run finish from a feature worktree. The main worktree fast-forwards
+/// to `0.1.6`, the tag lands on origin/main's tip and is pushed, install runs in the main
+/// worktree, and the feature worktree is untouched.
+#[test]
+fn finish_from_feature_worktree_finishes_in_the_default_worktree() {
+    let wt = setup_finish_worktrees("0.1.5", "0.1.6");
+    let (main, feature) = (wt.main.path(), wt.feature.path());
+    let feature_before = snapshot(feature);
+
+    let pusher = RecordingPusher::new(false);
+    let installer = RecordingInstaller::new();
+    let report = finish(feature, &finish_opts(false), &pusher, &installer, &NoCi)
+        .expect("finish from a feature worktree must release in the main one");
+
+    assert_eq!(report.tag, "v0.1.6");
+    assert!(!report.resumed);
+    assert_eq!(pusher.calls(), vec!["tag:v0.1.6".to_string()]);
+    assert_eq!(read_cargo_version(main), "0.1.6", "main worktree fast-forwarded");
+    assert_eq!(git::current_branch(main).unwrap(), "main");
+    let tip = git_ok(main, &["rev-parse", "origin/main"]);
+    assert_eq!(git::head_sha(main).unwrap(), tip, "main worktree at origin/main");
+    assert_eq!(git::tag_sha(main, "v0.1.6").unwrap(), tip, "tag on origin/main's tip");
+    assert_eq!(
+        git::remote_tag_commit(main, "v0.1.6").unwrap().as_deref(),
+        Some(tip.as_str()),
+        "tag pushed, pointing at origin/main's tip"
+    );
+    assert_eq!(installer.calls(), vec!["cargo install --path .".to_string()]);
+    assert!(
+        same_path(&installer.dirs()[0], main),
+        "install ran in the main worktree"
+    );
+    assert_eq!(snapshot(feature), feature_before, "feature worktree untouched");
+    drop(wt.origin);
+}
+
+/// Phase 5 criterion: red CI on the merged sha leaves NO tag, local or remote, pushes
+/// nothing and installs nothing; the refusal says the re-run reuses the version.
+#[test]
+fn finish_red_ci_leaves_no_tag() {
+    let wt = setup_finish_worktrees("0.1.5", "0.1.6");
+    let (main, feature) = (wt.main.path(), wt.feature.path());
+    let feature_before = snapshot(feature);
+
+    let pusher = RecordingPusher::new(false);
+    let installer = RecordingInstaller::new();
+    let err = finish(feature, &finish_opts(false), &pusher, &installer, &RedCi)
+        .expect_err("red CI must refuse")
+        .to_string();
+
+    assert!(err.contains("CI is RED"), "got: {err}");
+    assert!(err.contains("re-run bump finish"), "got: {err}");
+    assert!(err.contains("reuses v0.1.6"), "got: {err}");
+    assert_no_tag_anywhere(main, "v0.1.6");
+    assert!(pusher.calls().is_empty(), "no tag push on red CI");
+    assert!(installer.calls().is_empty(), "no install on red CI");
+    assert_eq!(snapshot(feature), feature_before, "feature worktree untouched");
+    drop(wt.origin);
+}
+
+/// Phase 5 criterion: the main worktree's `main` has a local commit origin lacks AND origin
+/// has moved. finish refuses naming `git pull --rebase` before any pull (no git
+/// fast-forward error in the message), and both worktrees are untouched.
+#[test]
+fn finish_diverged_default_refuses_before_pull() {
+    let wt = setup_finish_worktrees("0.1.5", "0.1.6");
+    let (main, feature) = (wt.main.path(), wt.feature.path());
+    git_ok(main, &["commit", "--allow-empty", "-m", "local only"]);
+    let main_before = snapshot(main);
+    let feature_before = snapshot(feature);
+
+    let pusher = RecordingPusher::new(false);
+    let installer = RecordingInstaller::new();
+    let err = finish(feature, &finish_opts(false), &pusher, &installer, &NoCi)
+        .expect_err("a diverged default must refuse")
+        .to_string();
+
+    assert!(err.contains("has diverged from origin/main"), "got: {err}");
+    assert!(err.contains("git pull --rebase origin main"), "got: {err}");
+    assert!(
+        err.contains(&format!("cd {}", main.display())),
+        "names the worktree: {err}"
+    );
+    assert!(
+        !err.contains("Not possible to fast-forward"),
+        "refused before the pull: {err}"
+    );
+    assert_eq!(snapshot(main), main_before, "main worktree untouched");
+    assert_eq!(snapshot(feature), feature_before, "feature worktree untouched");
+    assert_no_tag_anywhere(main, "v0.1.6");
+    assert!(pusher.calls().is_empty());
+    assert!(installer.calls().is_empty());
+    drop(wt.origin);
+}
+
+/// The main worktree's `main` carries a commit origin lacks, and origin has not moved:
+/// ahead refuses with the literal rescue (branch it, reset to origin) before any pull.
+#[test]
+fn finish_ahead_default_refuses_before_pull() {
+    let (origin, main_wt) = setup_released("0.1.5");
+    let main = main_wt.path();
+    git_ok(main, &["branch", "feature"]);
+    git_ok(main, &["commit", "--allow-empty", "-m", "never landed"]);
+    let feature_wt = add_feature_worktree(main);
+    let feature = feature_wt.path();
+    let main_before = snapshot(main);
+    let feature_before = snapshot(feature);
+
+    let pusher = RecordingPusher::new(false);
+    let installer = RecordingInstaller::new();
+    let err = finish(feature, &finish_opts(false), &pusher, &installer, &NoCi)
+        .expect_err("an ahead default must refuse")
+        .to_string();
+
+    assert!(err.contains("NOT on origin/main"), "got: {err}");
+    assert!(err.contains("git branch stranded-"), "got: {err}");
+    assert!(err.contains("git reset --hard origin/main"), "got: {err}");
+    assert!(
+        err.contains(&format!("cd {}", main.display())),
+        "names the worktree: {err}"
+    );
+    assert_eq!(snapshot(main), main_before, "main worktree untouched");
+    assert_eq!(snapshot(feature), feature_before, "feature worktree untouched");
+    assert!(pusher.calls().is_empty());
+    assert!(installer.calls().is_empty());
+    drop(origin);
+}
+
+/// Tracked changes in the RESOLVED worktree (not the current one) refuse before anything
+/// moves, naming that worktree; both worktrees untouched.
+#[test]
+fn finish_refuses_tracked_change_in_the_resolved_worktree() {
+    let wt = setup_finish_worktrees("0.1.5", "0.1.6");
+    let (main, feature) = (wt.main.path(), wt.feature.path());
+    let cargo_toml = main.join("Cargo.toml");
+    let contents = fs::read_to_string(&cargo_toml).unwrap();
+    fs::write(&cargo_toml, format!("{contents}\n# tracked edit\n")).unwrap();
+    let main_before = snapshot(main);
+    let feature_before = snapshot(feature);
+
+    let pusher = RecordingPusher::new(false);
+    let installer = RecordingInstaller::new();
+    let err = finish(feature, &finish_opts(false), &pusher, &installer, &NoCi)
+        .expect_err("a dirty main worktree must refuse")
+        .to_string();
+
+    assert!(err.contains("uncommitted tracked changes"), "got: {err}");
+    assert!(err.contains(&main.display().to_string()), "names the worktree: {err}");
+    assert_eq!(snapshot(main), main_before, "main worktree untouched");
+    assert_eq!(snapshot(feature), feature_before, "feature worktree untouched");
+    assert!(pusher.calls().is_empty());
+    drop(wt.origin);
+}
+
+/// No local default branch anywhere (a clone that only ever had the feature branch): the
+/// checkout creates `main` from origin, and finish releases the merged tip.
+#[test]
+fn finish_creates_a_missing_default_branch_from_origin() {
+    let (origin, work) = setup_finish_untagged_merged("0.1.5", "0.1.6");
+    let dir = work.path();
+    git_ok(dir, &["branch", "-D", "main"]);
+
+    let pusher = RecordingPusher::new(false);
+    let installer = RecordingInstaller::new();
+    let report = finish(dir, &finish_opts(false), &pusher, &installer, &NoCi).expect("finish must create main");
+
+    assert_eq!(report.tag, "v0.1.6");
+    assert_eq!(git::current_branch(dir).unwrap(), "main");
+    assert_eq!(read_cargo_version(dir), "0.1.6");
+    assert_eq!(pusher.calls(), vec!["tag:v0.1.6".to_string()]);
     drop(origin);
 }

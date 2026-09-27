@@ -131,25 +131,32 @@ fn no_pr() -> RecordingPr {
     RecordingPr::new()
 }
 
-/// Records the RESOLVED install command WITHOUT executing it (no real `cargo install`).
+/// Records the RESOLVED install command, and the dir it would run in, WITHOUT executing it
+/// (no real `cargo install`).
 struct RecordingInstaller {
     calls: RefCell<Vec<String>>,
+    dirs: RefCell<Vec<std::path::PathBuf>>,
 }
 
 impl RecordingInstaller {
     fn new() -> Self {
         Self {
             calls: RefCell::new(Vec::new()),
+            dirs: RefCell::new(Vec::new()),
         }
     }
     fn calls(&self) -> Vec<String> {
         self.calls.borrow().clone()
     }
+    fn dirs(&self) -> Vec<std::path::PathBuf> {
+        self.dirs.borrow().clone()
+    }
 }
 
 impl Installer for RecordingInstaller {
-    fn install(&self, _dir: &Path, command: &str) -> Result<()> {
+    fn install(&self, dir: &Path, command: &str) -> Result<()> {
         self.calls.borrow_mut().push(command.to_string());
+        self.dirs.borrow_mut().push(dir.to_path_buf());
         Ok(())
     }
 }
