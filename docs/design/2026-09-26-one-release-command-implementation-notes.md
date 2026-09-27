@@ -340,3 +340,20 @@ pr.rs 103, tag.rs 150, tests.rs 585, tests/gate.rs 499 (largest test file).
 - `src/main.rs` is 2396 lines (2394 before this phase), over the 1500-line cap in
   rules/rust.md. That predates this doc. Split it before Phase 6 touches `dispatch_*`
   and the after-help, or leave it?
+
+## Phase 4 addendum: standalone on a pending version refuses
+
+- Ruling (team lead, from the doc): both standalone rows are scoped to a TAGGED default
+  (design doc lines 82-84). An untagged version on a gated default is the `bump finish`
+  state (finish table row 1), and the "bump again" ruling covers a feature branch carrying
+  work, not a bump-only standalone branch. This supersedes Phase 4's tradeoff "a pending
+  version on the gated default plus `--standalone` bumps again".
+- `classify_gated_standalone` (`src/release/standalone.rs`) now returns the new
+  `ReleaseState::GatedStandalonePending { pending, default }` on `PendingCheck::Pending`. It
+  refuses before any checkout, naming the pending `vX.Y.Z` and `Run: bump finish`.
+- Ungated side unchanged, and now pinned by a test: the pending version is classified before
+  the standalone split, so `--standalone` on an ungated default with a pending version takes
+  the `UngatedPending` row and only prints the order.
+- Test: `standalone_on_a_pending_version_refuses_naming_bump_finish`. Gated: no branch cut,
+  no commit, no push, no PR probe, no tag. Ungated twin: resumes `v0.1.6`, no version commit,
+  only the tag push.

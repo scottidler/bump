@@ -66,8 +66,8 @@ fn bump_only(files: &[String], manifest_lines: &[String]) -> bool {
 }
 
 /// Gated, on the default branch, clean, HEAD == origin, with Scott's order: resolve the
-/// version the standalone PR releases (the same target the fresh-cut branch will classify
-/// to) and name its branch.
+/// version the standalone PR releases and name its branch. Scoped to a TAGGED default: an
+/// untagged version there refuses naming `bump finish`.
 pub(super) fn classify_gated_standalone(dir: &Path, opts: &ReleaseOpts, default: String) -> Result<ReleaseState> {
     debug!("classify_gated_standalone: dir={} default={}", dir.display(), default);
     if lang::detect(dir)?.is_empty() {
@@ -81,9 +81,14 @@ pub(super) fn classify_gated_standalone(dir: &Path, opts: &ReleaseOpts, default:
                 latest: version::format_tag(&latest),
             });
         }
-        // An untagged version inherited from the default branch: the branch bumps again
-        // from it, exactly as `classify_gated_feature` will decide once it is cut.
-        PendingCheck::Pending(inherited) => version::format_tag(&version::bump_version(&inherited, level)),
+        // An untagged version on the default is `bump finish`'s state, not a standalone one:
+        // bumping past it would burn the number with no work riding.
+        PendingCheck::Pending(pending) => {
+            return Ok(ReleaseState::GatedStandalonePending {
+                pending: version::format_tag(&pending),
+                default,
+            });
+        }
         PendingCheck::NotPending => compute_target_tag(dir, level)?,
     };
     Ok(ReleaseState::GatedStandalone {

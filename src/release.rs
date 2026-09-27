@@ -235,6 +235,9 @@ enum ReleaseState {
     /// Gated feature branch whose diff vs origin/<default> is empty or version lines only,
     /// with no standalone order: the bump never rides alone (THE RULING). REFUSE.
     GatedBumpOnlyBranch { branch: String, default: String },
+    /// Gated, on the default branch, clean, HEAD == origin, WITH Scott's order, but the
+    /// default carries an untagged (pending) version: that is `bump finish`'s job. REFUSE.
+    GatedStandalonePending { pending: String, default: String },
     /// Gated, on the default branch, clean, HEAD == origin, WITH Scott's standalone order:
     /// cut (or reuse) `branch` from origin/<default>, then the gated flow on it.
     GatedStandalone {
@@ -814,6 +817,11 @@ fn execute<P: Pusher, I: Installer, R: Pr, C: Ci>(
             "branch '{branch}' is not its own slug ('{slug}'): the PR title is built from the branch name and must \
              slugify back to it.\n\
              Run: git branch -m {slug}, then bump release"
+        ),
+        ReleaseState::GatedStandalonePending { pending, default } => bail!(
+            "{default} carries {pending}, committed and untagged: that version IS the pending release, so a \
+             standalone bump past it would burn the number.\n\
+             Run: bump finish"
         ),
         ReleaseState::GatedBumpOnlyBranch { branch, default } => bail!(
             "branch '{branch}' carries nothing but a version bump (its diff against origin/{default} is empty or \

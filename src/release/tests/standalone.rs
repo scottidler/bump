@@ -318,3 +318,49 @@ fn standalone_on_work_carrying_branches_only_quotes_the_order() {
     );
     drop(origin);
 }
+
+/// A gated default carrying an untagged version is `bump finish`'s state: `--standalone`
+/// refuses naming the pending version and `bump finish`, and nothing is cut, committed,
+/// pushed or tagged. The ungated twin takes the pending row (the order is only printed).
+#[test]
+fn standalone_on_a_pending_version_refuses_naming_bump_finish() {
+    let _guard = crate::ENV_LOCK.lock().unwrap();
+    let (origin, work) = setup_pending_on_origin("0.1.5", "0.1.6");
+    let dir = work.path();
+    let head = git::head_sha(dir).unwrap();
+    let branches = git_ok(dir, &["branch", "--format=%(refname:short)"]);
+
+    let pusher = RecordingPusher::new(false);
+    let pr = RecordingPr::new();
+    let err = gated_release(dir, &standalone_opts(None, ORDER), &pusher, &pr)
+        .expect_err("a pending version on the gated default must refuse")
+        .to_string();
+    assert!(err.contains("v0.1.6"), "names the pending version: {err}");
+    assert!(err.contains("Run: bump finish"), "names the next command: {err}");
+    assert_eq!(git::current_branch(dir).unwrap(), "main", "nothing checked out");
+    assert_eq!(
+        git_ok(dir, &["branch", "--format=%(refname:short)"]),
+        branches,
+        "no bump branch cut"
+    );
+    assert!(!git::local_branch_exists(dir, "bump-v0-1-7").unwrap());
+    assert_eq!(git::head_sha(dir).unwrap(), head, "nothing committed");
+    assert_eq!(read_cargo_version(dir), "0.1.6", "nothing bumped");
+    assert!(pusher.calls().is_empty(), "nothing pushed");
+    assert_eq!(pr.list_calls(), 0, "no PR touched");
+    assert_no_tag_anywhere(dir, "v0.1.6");
+    assert_no_tag_anywhere(dir, "v0.1.7");
+    drop(origin);
+
+    let (origin, work) = setup_pending_on_origin("0.1.5", "0.1.6");
+    let dir = work.path();
+    let head = git::head_sha(dir).unwrap();
+    let pusher = RecordingPusher::new(false);
+    let report = ungated_release(dir, &standalone_opts(None, ORDER), &pusher).expect("ungated pending is the release");
+    assert_eq!(report.tag, "v0.1.6");
+    assert!(report.resumed, "the RESUME row, never a standalone bump");
+    assert_eq!(git::head_sha(dir).unwrap(), head, "no version commit");
+    assert_eq!(pusher.calls(), vec!["tag:v0.1.6".to_string()]);
+    assert_no_tag_anywhere(dir, "v0.1.7");
+    drop(origin);
+}
