@@ -497,3 +497,58 @@ fn finish_gates_both_tag_arms_on_ci() {
     assert_eq!(git::remote_tag_sha(dir, "v0.1.6").unwrap(), None);
     drop(origin);
 }
+
+/// End to end through `release`: tracked workflows + zero runs refuses naming `bump.yml`;
+/// an untracked (ignored, so the tree stays clean) `bump.yml` with `ci: none` still
+/// refuses; the same line COMMITTED proceeds and the tag is pushed.
+#[test]
+fn zero_check_runs_refuses_with_workflows_and_proceeds_with_ci_none() {
+    let _guard = crate::ENV_LOCK.lock().unwrap();
+    let (origin, work) = setup_released("0.1.5");
+    let dir = work.path();
+    fs::create_dir_all(dir.join(".github/workflows")).unwrap();
+    fs::write(dir.join(".github/workflows/ci.yml"), "on: workflow_dispatch\n").unwrap();
+    git_ok(dir, &["add", "-A"]);
+    git_ok(dir, &["commit", "-m", "manual-only ci"]);
+    let pusher = RecordingPusher::new(false);
+    let run = |dir: &Path| {
+        release(
+            dir,
+            &auto_opts(None, false),
+            &pusher,
+            &RecordingInstaller::new(),
+            &no_pr(),
+            &SilentCi,
+        )
+    };
+    let prev = set_probe("ungated");
+
+    let err = run(dir).expect_err("workflows + zero runs must refuse").to_string();
+    assert!(err.contains("bump.yml"), "names bump.yml: {err}");
+    assert_no_tag_anywhere(dir, "v0.1.6");
+    assert_eq!(
+        read_cargo_version(dir),
+        "0.1.6",
+        "the version commit rode to origin untagged"
+    );
+
+    fs::write(dir.join("bump.yml"), "ci: none\n").unwrap();
+    fs::write(dir.join(".git/info/exclude"), "bump.yml\n").unwrap();
+    let err = run(dir)
+        .expect_err("an untracked ci: none must not switch the gate off")
+        .to_string();
+    assert!(err.contains("bump.yml"), "the same CI refusal, not a dirty tree: {err}");
+    assert_no_tag_anywhere(dir, "v0.1.6");
+
+    git_ok(dir, &["add", "-f", "bump.yml"]);
+    git_ok(dir, &["commit", "-m", "declare ci: none"]);
+    let report = run(dir).expect("a committed ci: none proceeds");
+    restore_probe(prev);
+    assert_eq!(report.tag, "v0.1.6");
+    assert_eq!(
+        git::remote_tag_commit(dir, "v0.1.6").unwrap(),
+        Some(git::head_sha(dir).unwrap()),
+        "tagged at the commit that declares ci: none"
+    );
+    drop(origin);
+}

@@ -36,6 +36,7 @@
 mod ci;
 mod finish;
 mod pr;
+mod standalone;
 mod tag;
 
 pub use ci::{Ci, DEFAULT_CI_TIMEOUT, GhCi};
@@ -54,6 +55,7 @@ use eyre::{Context, Result, bail};
 use log::debug;
 use pr::{branch_slug, pr_body, pr_title};
 use semver::Version;
+use standalone::{classify_gated_standalone, execute_gated_standalone, is_bump_only_branch};
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
@@ -66,6 +68,12 @@ const DEFAULT_INSTALL_COMMAND: &str = "cargo install --path .";
 /// everything mechanical up to (and including) opening the PR, and now hands control back
 /// to the human/agent to merge and then run `bump finish`.
 const GATED_PAUSE_MESSAGE: &str = "merge the PR, then run: bump finish";
+
+/// The standalone door, appended to every refusal a bump-only release hits without Scott's
+/// order (design doc, "Refusal wording"). It names the door and forbids inventing an order,
+/// so no refusal says STOP without the one legitimate way through.
+pub(crate) const STANDALONE_DOOR: &str = "If Scott already ordered a standalone release in this session, re-run with \
+     `--standalone \"<his exact words>\"`. Otherwise STOP and report; do not invent an order.";
 
 /// How the install step is resolved. Precedence (general.md): CLI override > config
 /// `install` > default (`cargo install --path .` iff a `Cargo.toml` is present) > skip.
@@ -90,6 +98,9 @@ pub struct ReleaseOpts {
     pub dry_run: bool,
     /// How to resolve the post-release install step.
     pub install: InstallChoice,
+    /// Scott's standalone order, verbatim (`--standalone "<words>"`). `None`: a bump-only
+    /// release refuses. Quoted in the PR body (gated) or printed (ungated) whenever given.
+    pub standalone: Option<String>,
     /// `false` skips the CI gate with a printed warning (`--no-ci-gate`).
     pub ci_gate: bool,
     /// How long the CI gate waits on incomplete runs before refusing (`--ci-timeout`).
@@ -172,21 +183,30 @@ enum ReleaseState {
     BelowLatest { manifest: String, latest: String },
     /// Ungated, not on the default branch.
     NotOnDefault { default: String, current: String },
-    /// Ungated, behind (or diverged from) origin.
+    /// Behind origin (ungated, or the gated default branch): fast-forward fixes it.
     Behind { default: String },
-    /// Ungated, nothing ahead and the version is already tagged.
+    /// Ungated, diverged from origin (a rejected push, someone pushed first): a rebase
+    /// fixes it, a fast-forward cannot.
+    Diverged { default: String },
+    /// Ungated, nothing ahead, the version already tagged, no standalone order.
     Nothing { default: String },
+    /// Ungated, nothing ahead, the version already tagged, WITH Scott's standalone order:
+    /// the version commit is the release (made with `force`, the tip carries the old tag).
+    UngatedStandalone { target_tag: String, default: String },
     /// Dirty working tree.
     DirtyTree,
     /// Detached HEAD.
     DetachedHead,
     /// Gated, on a feature branch, no pending version, no version line in the diff:
     /// fresh gated release. Version commit by level, push branch, ensure PR, PAUSE.
+    /// `force` is set only for a standalone-ordered branch with an empty diff, whose tip is
+    /// the already-tagged default tip.
     GatedFresh {
         branch: String,
         default: String,
         target_tag: String,
         bump_type: BumpType,
+        force: bool,
     },
     /// Gated, on a feature branch whose diff vs origin/<default> changes a version line
     /// (the branch's own bump, e.g. an idempotent re-run). Skip the re-bump, ensure the
@@ -212,6 +232,16 @@ enum ReleaseState {
     /// branch, so it could not slugify back to it (`branch-pr-title-guard.sh`). REFUSE
     /// before any mutation.
     GatedBadBranchName { branch: String, slug: String },
+    /// Gated feature branch whose diff vs origin/<default> is empty or version lines only,
+    /// with no standalone order: the bump never rides alone (THE RULING). REFUSE.
+    GatedBumpOnlyBranch { branch: String, default: String },
+    /// Gated, on the default branch, clean, HEAD == origin, WITH Scott's standalone order:
+    /// cut (or reuse) `branch` from origin/<default>, then the gated flow on it.
+    GatedStandalone {
+        branch: String,
+        default: String,
+        target_tag: String,
+    },
     /// Gated, on the local default branch, with commits NOT on origin (stranded). REFUSE
     /// with the LITERAL rescue commands; the verb never invents a branch or resets.
     GatedStranded { default: String, suggested_branch: String },
@@ -321,6 +351,14 @@ pub fn release<P: Pusher, I: Installer, R: Pr, C: Ci>(
         opts.ci_gate,
         opts.ci_timeout
     );
+    if let Some(words) = &opts.standalone
+        && words.trim().is_empty()
+    {
+        bail!(
+            "--standalone needs Scott's words, verbatim; an empty order is no order.\n\
+             Re-run with --standalone \"<his exact words>\", or without --standalone."
+        );
+    }
     let config = config::load(dir)?;
     let state = classify(dir, opts)?;
     debug!("release: classified state={:?}", state);
@@ -366,7 +404,8 @@ fn classify(dir: &Path, opts: &ReleaseOpts) -> Result<ReleaseState> {
     }
 
     let ahead = match git::compare_head_to_remote(dir, &default)? {
-        HeadRemote::Behind | HeadRemote::Diverged => return Ok(ReleaseState::Behind { default }),
+        HeadRemote::Behind => return Ok(ReleaseState::Behind { default }),
+        HeadRemote::Diverged => return Ok(ReleaseState::Diverged { default }),
         HeadRemote::Ahead => true,
         HeadRemote::Equal => false,
     };
@@ -382,6 +421,10 @@ fn classify(dir: &Path, opts: &ReleaseOpts) -> Result<ReleaseState> {
         PendingCheck::NotPending if ahead => {
             let target_tag = compute_target_tag(dir, opts.bump_type.unwrap_or_default())?;
             Ok(ReleaseState::Release { target_tag, default })
+        }
+        PendingCheck::NotPending if opts.standalone.is_some() => {
+            let target_tag = compute_target_tag(dir, opts.bump_type.unwrap_or_default())?;
+            Ok(ReleaseState::UngatedStandalone { target_tag, default })
         }
         PendingCheck::NotPending => Ok(ReleaseState::Nothing { default }),
     }
@@ -457,7 +500,9 @@ fn classify_gated(dir: &Path, opts: &ReleaseOpts, current: &str) -> Result<Relea
             }
             // Stale local default: same fix as the ungated behind row.
             HeadRemote::Behind => Ok(ReleaseState::Behind { default }),
-            // Clean and in sync: bump must ride a feature PR, not the default branch.
+            // Clean and in sync: Scott's order cuts the standalone branch; without it, bump
+            // must ride a feature PR, not the default branch.
+            HeadRemote::Equal if opts.standalone.is_some() => classify_gated_standalone(dir, opts, default),
             HeadRemote::Equal => Ok(ReleaseState::GatedDefaultClean { default }),
         };
     }
@@ -466,8 +511,9 @@ fn classify_gated(dir: &Path, opts: &ReleaseOpts, current: &str) -> Result<Relea
 }
 
 /// Classify a gated repo when HEAD is on a FEATURE branch. Order: generic, branch-name
-/// precondition, below-latest, then the branch's own bump (a version line in the diff vs
-/// origin/<default>, Gate D's test) vs an inherited pending version vs a fresh release.
+/// precondition, bump-only without an order, below-latest, then the branch's own bump (a
+/// version line in the diff vs origin/<default>, Gate D's test) vs an inherited pending
+/// version vs a fresh release.
 fn classify_gated_feature(dir: &Path, opts: &ReleaseOpts, branch: String, default: String) -> Result<ReleaseState> {
     debug!("classify_gated_feature: dir={} branch={}", dir.display(), branch);
     let manifests = lang::detect(dir)?;
@@ -482,6 +528,12 @@ fn classify_gated_feature(dir: &Path, opts: &ReleaseOpts, branch: String, defaul
         return Ok(ReleaseState::GatedBadBranchName { branch, slug });
     }
 
+    let base_ref = format!("origin/{default}");
+    let bump_only = is_bump_only_branch(dir, &base_ref)?;
+    if bump_only && opts.standalone.is_none() {
+        return Ok(ReleaseState::GatedBumpOnlyBranch { branch, default });
+    }
+
     let pending = pending_version(dir)?;
     if let PendingCheck::BelowLatest { manifest, latest } = &pending {
         return Ok(ReleaseState::BelowLatest {
@@ -490,7 +542,6 @@ fn classify_gated_feature(dir: &Path, opts: &ReleaseOpts, branch: String, defaul
         });
     }
 
-    let base_ref = format!("origin/{default}");
     if git::version_line_changed(dir, &base_ref)? {
         let riding = agreed_file_version(&manifests)?.ok_or_else(|| {
             eyre::eyre!("this branch changes a version line but the manifest carries no version; fix the manifest")
@@ -524,12 +575,16 @@ fn classify_gated_feature(dir: &Path, opts: &ReleaseOpts, branch: String, defaul
 
     // Fresh: version == last tag (or an initial release). Compute the target the requested
     // level yields via bump's own version rules (no re-derivation, no stdout parsing).
+    // A bump-only branch reaching here carries Scott's order and no manifest version line,
+    // so its tip can be the already-tagged default tip: the one gated row whose version
+    // commit needs `force`.
     let target_tag = compute_target_tag(dir, bump_type)?;
     Ok(ReleaseState::GatedFresh {
         branch,
         default,
         target_tag,
         bump_type,
+        force: bump_only,
     })
 }
 
@@ -642,7 +697,10 @@ fn execute<P: Pusher, I: Installer, R: Pr, C: Ci>(
     );
     match state {
         ReleaseState::Release { target_tag, default } => {
-            execute_release(dir, opts, config, &target_tag, &default, ports)
+            execute_release(dir, opts, config, &target_tag, &default, false, ports)
+        }
+        ReleaseState::UngatedStandalone { target_tag, default } => {
+            execute_release(dir, opts, config, &target_tag, &default, true, ports)
         }
         ReleaseState::UngatedPending {
             tag,
@@ -665,9 +723,13 @@ fn execute<P: Pusher, I: Installer, R: Pr, C: Ci>(
             "{default} is behind origin/{default}; releasing a stale branch would orphan the tag.\n\
              Run: git pull --ff-only origin {default}, then bump release"
         ),
+        ReleaseState::Diverged { default } => bail!(
+            "{default} has diverged from origin/{default} (someone pushed first); a fast-forward cannot apply.\n\
+             Run: git pull --rebase origin {default}, then bump release"
+        ),
         ReleaseState::Nothing { default } => bail!(
             "nothing to release: nothing ahead of origin/{default} and the version is already tagged.\n\
-             Commit a change first, then bump release"
+             {STANDALONE_DOOR}"
         ),
         ReleaseState::DirtyTree => bail!(
             "the working tree is dirty; bump release only performs the mechanical release on a CLEAN tree.\n\
@@ -686,13 +748,17 @@ fn execute<P: Pusher, I: Installer, R: Pr, C: Ci>(
             default,
             target_tag,
             bump_type,
+            force,
         } => execute_gated(
             dir,
             opts,
             GatedPlan {
                 branch,
                 default,
-                commit: VersionCommit::Level(bump_type),
+                commit: VersionCommit::Level {
+                    level: bump_type,
+                    force,
+                },
                 tag: target_tag,
                 notice: None,
             },
@@ -710,6 +776,11 @@ fn execute<P: Pusher, I: Installer, R: Pr, C: Ci>(
             },
             ports,
         ),
+        ReleaseState::GatedStandalone {
+            branch,
+            default,
+            target_tag,
+        } => execute_gated_standalone(dir, opts, config, &branch, &default, &target_tag, ports),
         ReleaseState::GatedInheritedPending {
             branch,
             default,
@@ -744,6 +815,11 @@ fn execute<P: Pusher, I: Installer, R: Pr, C: Ci>(
              slugify back to it.\n\
              Run: git branch -m {slug}, then bump release"
         ),
+        ReleaseState::GatedBumpOnlyBranch { branch, default } => bail!(
+            "branch '{branch}' carries nothing but a version bump (its diff against origin/{default} is empty or \
+             version lines only); the bump rides a feature PR with work, never alone.\n\
+             {STANDALONE_DOOR}"
+        ),
         ReleaseState::GatedStranded {
             default,
             suggested_branch,
@@ -757,7 +833,7 @@ fn execute<P: Pusher, I: Installer, R: Pr, C: Ci>(
         ),
         ReleaseState::GatedDefaultClean { default } => bail!(
             "this repo is GATED and you are on the default branch '{default}'; bump rides a feature PR, not the default branch.\n\
-             Run: git checkout -b <feature>, commit your change, then bump release"
+             {STANDALONE_DOOR}"
         ),
         ReleaseState::GatedGeneric => bail!(
             "this repo is GATED and has no version-bearing manifest (generic).\n\
@@ -768,25 +844,30 @@ fn execute<P: Pusher, I: Installer, R: Pr, C: Ci>(
 
 /// Fresh ungated release: version commit -> push branch -> confirm on origin -> CI gate
 /// -> re-verify -> tag the verified sha -> re-verify -> push tag by name -> install.
+/// `force` is the ungated standalone row: the tip already carries the previous tag.
 fn execute_release<P: Pusher, I: Installer, R: Pr, C: Ci>(
     dir: &Path,
     opts: &ReleaseOpts,
     config: &Config,
     target_tag: &str,
     default: &str,
+    force: bool,
     ports: &Ports<P, I, R, C>,
 ) -> Result<ReleaseReport> {
     debug!(
-        "execute_release: dir={} target_tag={} default={} dry_run={}",
+        "execute_release: dir={} target_tag={} default={} force={} dry_run={}",
         dir.display(),
         target_tag,
         default,
+        force,
         opts.dry_run
     );
+    announce_order(opts);
 
     if opts.dry_run {
         let install_command = resolve_install(dir, &opts.install, config);
-        println!("[dry-run] bump --no-tag  (commit the version bump for {target_tag})");
+        let force_flag = if force { " --force" } else { "" };
+        println!("[dry-run] bump --no-tag{force_flag}  (commit the version bump for {target_tag})");
         println!("[dry-run] git push --no-follow-tags origin {default}");
         println!("[dry-run] (confirm HEAD is on origin/{default} before tagging)");
         echo_tag_steps(target_tag, default, &ci_gate(opts.ci_gate, opts.ci_timeout), false);
@@ -800,7 +881,7 @@ fn execute_release<P: Pusher, I: Installer, R: Pr, C: Ci>(
 
     // 1. The version commit is the existing `--no-tag` code path (version bump + commit,
     //    no tag). Reused verbatim -- release never re-implements commit/version logic.
-    version_commit(dir, opts.bump_type.unwrap_or_default())?;
+    version_commit(dir, opts.bump_type.unwrap_or_default(), force)?;
     // 2. Push the branch FIRST.
     ports.pusher.push_branch(dir, default)?;
     // 3. Confirm it landed on origin BEFORE any tag exists (a rejected push errored above
@@ -848,6 +929,7 @@ fn execute_pending<P: Pusher, I: Installer, R: Pr, C: Ci>(
         opts.dry_run
     );
     let local_tag_present = git::tag_exists(dir, tag)?;
+    announce_order(opts);
 
     if opts.dry_run {
         let install_command = resolve_install(dir, &opts.install, config);
@@ -894,8 +976,9 @@ fn execute_pending<P: Pusher, I: Installer, R: Pr, C: Ci>(
 /// How the gated flow's version commit is made.
 #[derive(Debug)]
 enum VersionCommit {
-    /// Bump by level through the existing `--no-tag` path (fresh release).
-    Level(BumpType),
+    /// Bump by level through the existing `--no-tag` path (fresh release). `force` only on
+    /// the standalone row, whose tip is the already-tagged default tip.
+    Level { level: BumpType, force: bool },
     /// Set this exact version (the inherited-pending row bumps from the manifest version,
     /// which `determine_version_action` would refuse as a tag mismatch).
     To(Version),
@@ -943,7 +1026,7 @@ fn execute_gated<P: Pusher, I: Installer, R: Pr, C: Ci>(
 
     if opts.dry_run {
         match &commit {
-            VersionCommit::Level(_) | VersionCommit::To(_) => {
+            VersionCommit::Level { .. } | VersionCommit::To(_) => {
                 println!("[dry-run] commit the version bump for {tag} on {branch} (a new commit, never an amend)");
             }
             VersionCommit::AlreadyRiding => {
@@ -970,7 +1053,7 @@ fn execute_gated<P: Pusher, I: Installer, R: Pr, C: Ci>(
 
     // 1. The version commit: always a NEW commit, never an amend (`never_amend`).
     match &commit {
-        VersionCommit::Level(level) => version_commit(dir, *level)?,
+        VersionCommit::Level { level, force } => version_commit(dir, *level, *force)?,
         VersionCommit::To(target) => version_commit_to(dir, target)?,
         VersionCommit::AlreadyRiding => debug!("execute_gated: version already bumped on {branch}; skipping re-bump"),
     }
@@ -988,7 +1071,7 @@ fn execute_gated<P: Pusher, I: Installer, R: Pr, C: Ci>(
     } else {
         let subjects = git::commit_subjects(dir, &base_ref)?;
         let title = pr_title(&branch, &subjects);
-        let body = pr_body(&subjects, &tag);
+        let body = pr_body(&subjects, &tag, opts.standalone.as_deref());
         let url = ports.pr.create_pr(dir, &branch, &default, &title, &body)?;
         println!("opened PR: {url}");
         Some(url)
@@ -1008,9 +1091,15 @@ fn execute_gated<P: Pusher, I: Installer, R: Pr, C: Ci>(
 }
 
 /// The internal version commit: bump the version file(s) and commit, NO tag. This is
-/// exactly `bump --no-tag`'s `process_directory` code path, reused.
-fn version_commit(dir: &Path, bump_type: BumpType) -> Result<()> {
-    debug!("version_commit: dir={} bump_type={:?}", dir.display(), bump_type);
+/// exactly `bump --no-tag`'s `process_directory` code path, reused. `force` passes the
+/// "HEAD already has a tag" guard; only the two standalone rows set it.
+fn version_commit(dir: &Path, bump_type: BumpType, force: bool) -> Result<()> {
+    debug!(
+        "version_commit: dir={} bump_type={:?} force={}",
+        dir.display(),
+        bump_type,
+        force
+    );
     let cli = Cli {
         command: None,
         major: bump_type == BumpType::Major,
@@ -1018,7 +1107,7 @@ fn version_commit(dir: &Path, bump_type: BumpType) -> Result<()> {
         dry_run: false,
         message: None,
         automatic: false,
-        force: false,
+        force,
         no_tag: true,
         tag_only: false,
         gates: false,
@@ -1054,6 +1143,14 @@ fn version_commit_to(dir: &Path, target: &Version) -> Result<()> {
         version::format_file_version(target)
     );
     Ok(())
+}
+
+/// Print Scott's standalone order when one was given on an ungated row: the audit trail the
+/// gated flow gets from the PR body.
+fn announce_order(opts: &ReleaseOpts) {
+    if let Some(words) = &opts.standalone {
+        println!("Standalone release ordered by Scott: \"{words}\"");
+    }
 }
 
 /// The strengthened-ordering guard: re-fetch and require HEAD == origin/<default> before

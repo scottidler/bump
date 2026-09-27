@@ -418,8 +418,8 @@ pub(crate) fn tag_ladder(dir: &Path) -> Result<TagCheck> {
              Merge the PR first, then run --tag-only on the merged commit."
         ),
         git::HeadRemote::Diverged => bail!(
-            "HEAD has diverged from origin/{default}; reconcile before tagging.\n\
-             Run: git pull --ff-only origin {default}"
+            "HEAD has diverged from origin/{default}; a fast-forward cannot reconcile it.\n\
+             Run: git pull --rebase origin {default}, then re-run"
         ),
     }
 
@@ -894,6 +894,8 @@ fn dispatch_release(dir: &Path, args: &cli::ReleaseArgs) -> Result<()> {
         bump_type,
         dry_run: args.dry_run,
         install: install_choice(&args.install, args.no_install),
+        // `--standalone` is Phase 6's flag; until then the verb only sees no order.
+        standalone: None,
         ci_gate: true,
         ci_timeout: release::DEFAULT_CI_TIMEOUT,
     };

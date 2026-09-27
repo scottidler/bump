@@ -88,15 +88,19 @@ fn parse_conventional_prefix(subject: &str) -> Option<(String, Option<String>)> 
     Some((kind.to_string(), scope.map(str::to_string)))
 }
 
-/// The PR body: one `- <subject>` per commit on the branch, then the release-intent line
-/// Gate D looks for as the LAST line.
-pub fn pr_body(subjects: &[String], tag: &str) -> String {
+/// The PR body: one `- <subject>` per commit on the branch, Scott's standalone order quoted
+/// verbatim when there is one, then the release-intent line Gate D looks for as the LAST
+/// line.
+pub fn pr_body(subjects: &[String], tag: &str, standalone: Option<&str>) -> String {
     let mut body = String::new();
     for s in subjects {
         body.push_str(&format!("- {s}\n"));
     }
     if subjects.is_empty() {
         body.push_str("- version bump\n");
+    }
+    if let Some(words) = standalone {
+        body.push_str(&format!("\nStandalone release ordered by Scott: \"{words}\"\n"));
     }
     body.push_str(&format!("\nRelease: rides this PR ({tag})"));
     body

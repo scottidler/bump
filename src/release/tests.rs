@@ -425,8 +425,17 @@ fn auto_opts(bump_type: Option<BumpType>, dry_run: bool) -> ReleaseOpts {
         bump_type,
         dry_run,
         install: InstallChoice::Auto,
+        standalone: None,
         ci_gate: true,
         ci_timeout: DEFAULT_CI_TIMEOUT,
+    }
+}
+
+/// `auto_opts` carrying Scott's standalone order.
+fn standalone_opts(bump_type: Option<BumpType>, words: &str) -> ReleaseOpts {
+    ReleaseOpts {
+        standalone: Some(words.to_string()),
+        ..auto_opts(bump_type, false)
     }
 }
 
@@ -447,12 +456,16 @@ fn setup_gated_feature_branch(version: &str) -> (TempDir, TempDir) {
     (origin, work)
 }
 
-/// setup_released at `base_tag` + a feature branch whose manifest is ALREADY bumped to
-/// `bumped` (a prior gated run's `--no-tag` bump rode the branch).
+/// setup_released at `base_tag` + a feature branch carrying a work commit whose manifest is
+/// ALREADY bumped to `bumped` (a prior gated run's `--no-tag` bump rode the branch). The
+/// work commit keeps it from being a bump-only branch.
 fn setup_gated_already_bumped(base_tag: &str, bumped: &str) -> (TempDir, TempDir) {
     let (origin, work) = setup_released(base_tag);
     let w = work.path();
     git_ok(w, &["checkout", "-b", "feature"]);
+    fs::write(w.join("feature.txt"), "work").unwrap();
+    git_ok(w, &["add", "-A"]);
+    git_ok(w, &["commit", "-m", "feature work"]);
     write_cargo(w, bumped);
     git_ok(w, &["commit", "-am", &format!("Bump version to {bumped}")]);
     (origin, work)
@@ -582,4 +595,5 @@ mod gate;
 mod gated;
 mod install;
 mod pr;
+mod standalone;
 mod ungated;

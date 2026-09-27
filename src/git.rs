@@ -659,21 +659,44 @@ pub fn is_version_diff_line(line: &str) -> bool {
 /// the version itself; a pending version with no such line was inherited from `base`.
 pub fn version_line_changed(path: &Path, base: &str) -> Result<bool> {
     debug!("version_line_changed: path={} base={}", path.display(), base);
+    let changed = changed_lines(path, base, &VERSION_LINE_MANIFESTS)?
+        .iter()
+        .any(|l| is_version_diff_line(l));
+    debug!("version_line_changed: changed={changed}");
+    Ok(changed)
+}
+
+/// The added and removed lines (`+`/`-` prefix kept, `+++`/`---` file headers dropped) of
+/// `git diff base...HEAD -- <files>`. The raw material for both the version-line test and
+/// the bump-only test.
+pub fn changed_lines(path: &Path, base: &str, files: &[&str]) -> Result<Vec<String>> {
+    debug!("changed_lines: path={} base={} files={:?}", path.display(), base, files);
     let range = format!("{base}...HEAD");
     let output = Command::new("git")
         .args(["diff", &range, "--"])
-        .args(VERSION_LINE_MANIFESTS)
+        .args(files)
         .current_dir(path)
         .output()
         .context("Failed to run git diff")?;
     if !output.status.success() {
         bail!("git diff {} failed: {}", range, String::from_utf8_lossy(&output.stderr));
     }
-    let changed = String::from_utf8_lossy(&output.stdout)
+    Ok(String::from_utf8_lossy(&output.stdout)
         .lines()
-        .any(is_version_diff_line);
-    debug!("version_line_changed: changed={changed}");
-    Ok(changed)
+        .filter(|l| (l.starts_with('+') || l.starts_with('-')) && !l.starts_with("+++") && !l.starts_with("---"))
+        .map(str::to_string)
+        .collect())
+}
+
+/// Does a LOCAL branch named `branch` exist (`git rev-parse --verify --quiet refs/heads/<branch>`)?
+pub fn local_branch_exists(path: &Path, branch: &str) -> Result<bool> {
+    debug!("local_branch_exists: path={} branch={}", path.display(), branch);
+    let output = Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")])
+        .current_dir(path)
+        .output()
+        .context("Failed to run git rev-parse --verify")?;
+    Ok(output.status.success())
 }
 
 /// The content of `file` at commit `sha` (`git show <sha>:<file>`), `None` when the file
@@ -718,10 +741,7 @@ pub fn has_workflows_at(path: &Path, sha: &str) -> Result<bool> {
 }
 
 /// Paths changed on HEAD relative to `base` (`git diff --name-only base...HEAD`, the
-/// merge-base form). Used to classify a bump-only branch and to tell a branch's own
-/// version bump from an inherited pending version.
-// Wired into `is_bump_only_branch` / the version-line-in-diff check starting in Phase 3/4.
-#[allow(dead_code)]
+/// merge-base form). Used to classify a bump-only branch.
 pub fn changed_files(path: &Path, base: &str) -> Result<Vec<String>> {
     debug!("changed_files: path={} base={}", path.display(), base);
     let range = format!("{base}...HEAD");
@@ -748,8 +768,6 @@ pub fn changed_files(path: &Path, base: &str) -> Result<Vec<String>> {
 /// Create `branch` at `upstream` and check it out, with `upstream` as its tracking ref:
 /// `git checkout -b <branch> --track <upstream>`. The standalone release path uses this so
 /// the new branch has an upstream from its first second (see `is_head_pushed`).
-// Wired into `execute_gated_standalone` starting in Phase 4.
-#[allow(dead_code)]
 pub fn checkout_new_tracking(path: &Path, branch: &str, upstream: &str) -> Result<()> {
     debug!(
         "checkout_new_tracking: path={} branch={} upstream={}",
@@ -996,6 +1014,34 @@ mod tests {
         let mut files = changed_files(work.path(), &base).unwrap();
         files.sort();
         assert_eq!(files, vec!["a.txt", "b.txt"]);
+    }
+
+    #[test]
+    fn changed_lines_keeps_added_and_removed_lines_without_headers() {
+        let (_origin, work) = bare_remote_and_clone();
+        let w = work.path();
+        std::fs::write(w.join("VERSION"), "1.0.0\n").unwrap();
+        git_in(w, &["add", "-A"]);
+        git_in(w, &["commit", "-m", "version file"]);
+        let base = head_sha(w).unwrap();
+
+        std::fs::write(w.join("VERSION"), "1.0.1\n").unwrap();
+        std::fs::write(w.join("other.txt"), "x\n").unwrap();
+        git_in(w, &["add", "-A"]);
+        git_in(w, &["commit", "-m", "bump"]);
+
+        assert_eq!(changed_lines(w, &base, &["VERSION"]).unwrap(), vec!["-1.0.0", "+1.0.1"]);
+        assert!(changed_lines(w, &base, &["Cargo.toml"]).unwrap().is_empty());
+        assert!(changed_lines(w, "no-such-ref", &["VERSION"]).is_err());
+    }
+
+    #[test]
+    fn local_branch_exists_sees_only_local_heads() {
+        let (_origin, work) = bare_remote_and_clone();
+        let w = work.path();
+        let current = current_branch(w).unwrap();
+        assert!(local_branch_exists(w, &current).unwrap());
+        assert!(!local_branch_exists(w, "no-such-branch").unwrap());
     }
 
     #[test]

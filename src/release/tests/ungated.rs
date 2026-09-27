@@ -338,6 +338,7 @@ fn refuses_when_nothing_to_release() {
     restore_probe(prev);
     assert!(err.contains("nothing ahead"), "got: {err}");
     assert!(err.contains("already tagged"), "got: {err}");
+    assert!(err.contains(STANDALONE_DOOR), "must name the standalone door: {err}");
     assert!(pusher.calls().is_empty());
     drop(origin);
 }
@@ -398,9 +399,89 @@ fn gated_on_default_clean_refuses_bump_rides_a_pr() {
         .to_string();
     restore_probe(prev);
     assert!(err.contains("bump rides a feature PR"), "got: {err}");
+    assert!(err.contains(STANDALONE_DOOR), "must name the standalone door: {err}");
     assert!(pusher.calls().is_empty());
     assert_eq!(pr.create_calls(), 0, "no PR touched on a refusal");
     // NO tag created on this gated path either.
     assert!(!git::tag_exists(dir, "v0.1.6").unwrap());
+    drop(origin);
+}
+
+/// Diverged is not behind: a fast-forward cannot apply, so the refusal names the rebase.
+#[test]
+fn refuses_when_diverged_from_origin_naming_rebase() {
+    let _guard = crate::ENV_LOCK.lock().unwrap();
+    let (origin, work) = setup_released("0.1.5");
+    let dir = work.path();
+    let c1 = git::head_sha(dir).unwrap();
+    git_ok(dir, &["commit", "--allow-empty", "-m", "someone else pushed first"]);
+    git_ok(dir, &["push", "origin", "main"]);
+    git_ok(dir, &["reset", "--hard", &c1]);
+    git_ok(dir, &["commit", "--allow-empty", "-m", "local work"]);
+    let head = git::head_sha(dir).unwrap();
+
+    let pusher = RecordingPusher::new(false);
+    let prev = set_probe("ungated");
+    let err = release(
+        dir,
+        &auto_opts(None, false),
+        &pusher,
+        &RecordingInstaller::new(),
+        &no_pr(),
+        &NoCi,
+    )
+    .expect_err("diverged must refuse")
+    .to_string();
+    restore_probe(prev);
+    assert!(err.contains("git pull --rebase origin main"), "got: {err}");
+    assert!(!err.contains("--ff-only"), "a fast-forward cannot apply: {err}");
+    assert_eq!(git::head_sha(dir).unwrap(), head, "no version commit");
+    assert!(pusher.calls().is_empty(), "nothing pushed");
+    assert_no_tag_anywhere(dir, "v0.1.6");
+    drop(origin);
+}
+
+/// main carries an UNPUSHED commit setting 0.1.6 over tag v0.1.5 (a design doc's Phase 1
+/// bumped it). `-m` refuses naming both versions and touches nothing; a bare run pushes,
+/// tags v0.1.6, and never re-bumps.
+#[test]
+fn ungated_pending_version_is_pushed_and_tagged_not_rebumped() {
+    let _guard = crate::ENV_LOCK.lock().unwrap();
+    let (origin, work) = setup_released("0.1.5");
+    let dir = work.path();
+    write_cargo(dir, "0.1.6");
+    git_ok(dir, &["commit", "-am", "Bump version to v0.1.6"]);
+    let head = git::head_sha(dir).unwrap();
+
+    let pusher = RecordingPusher::new(false);
+    let installer = RecordingInstaller::new();
+    let prev = set_probe("ungated");
+    let minor = release(
+        dir,
+        &auto_opts(Some(BumpType::Minor), false),
+        &pusher,
+        &installer,
+        &no_pr(),
+        &NoCi,
+    );
+    let minor_pushes = pusher.calls();
+    let bare = release(dir, &auto_opts(None, false), &pusher, &installer, &no_pr(), &NoCi);
+    restore_probe(prev);
+
+    let err = minor.expect_err("-m implies a different version").to_string();
+    assert!(err.contains("v0.1.6") && err.contains("v0.2.0"), "names both: {err}");
+    assert!(minor_pushes.is_empty(), "the refusal pushed nothing");
+
+    let report = bare.expect("bare run ships the pending version");
+    assert_eq!(report.tag, "v0.1.6");
+    assert!(!report.resumed, "ahead of origin is not a resume");
+    assert_eq!(git::head_sha(dir).unwrap(), head, "no version commit");
+    assert_eq!(read_cargo_version(dir), "0.1.6", "never re-bumped");
+    assert_eq!(
+        pusher.calls(),
+        vec!["branch:main".to_string(), "tag:v0.1.6".to_string()]
+    );
+    assert_eq!(git::remote_tag_commit(dir, "v0.1.6").unwrap(), Some(head));
+    assert_no_tag_anywhere(dir, "v0.1.7");
     drop(origin);
 }

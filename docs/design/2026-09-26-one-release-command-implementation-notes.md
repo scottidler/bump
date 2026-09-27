@@ -245,3 +245,98 @@ placement, and the state machine. Tests: `src/release/tests.rs` keeps the shared
 harness and fixtures; test functions moved into `tests/{ungated,gated,install,finish,gate,pr}.rs`.
 Test count unchanged (297 + 1). Line counts after: release.rs 1124, ci.rs 148, finish.rs 170,
 pr.rs 103, tag.rs 150, tests.rs 585, tests/gate.rs 499 (largest test file).
+
+## Phase 4: standalone, bump-only, bad branch name
+
+### Design decisions
+- `ReleaseOpts.standalone: Option<String>` (`src/release.rs`). `release()` refuses words that
+  are empty or whitespace before classification, so an empty order mutates nothing
+  (`standalone_with_empty_words_refuses`).
+- New states: `UngatedStandalone`, `GatedStandalone { branch, default, target_tag }`,
+  `GatedBumpOnlyBranch`, `Diverged`; `GatedFresh` gained `force`. `UngatedPending`,
+  `GatedInheritedPending` and `GatedBadBranchName` landed in Phase 3 and are unchanged.
+- `force` reaches `process_directory` through `version_commit(dir, level, force)`. It is true
+  on exactly two paths: `UngatedStandalone` (`execute_release(.., force = true, ..)`) and a
+  `GatedFresh` whose branch is bump-only and carries the order (`force: bump_only` in
+  `classify_gated_feature`). A bump-only branch only gets that far with the order, so the
+  gated side of "the standalone rows" is decided by the branch's diff, not by how the verb
+  got there. That covers the fresh-cut `bump-vX-Y-Z` and a leftover empty one the same way.
+- `src/release/standalone.rs` (new): `standalone_branch_name`, `is_bump_only_branch` plus the
+  pure `bump_only(files, manifest_lines)`, `classify_gated_standalone`,
+  `execute_gated_standalone`. The bump-only port matches `is_bump_only_ref`
+  (`git-release-guard.sh:234-257`: root bump files only, at least one manifest line
+  changed, and every changed manifest line a version line), with the doc's one difference:
+  an empty file list (zero commits ahead, or commits that change nothing) IS bump-only.
+- `classify_gated_standalone` picks the target the same way the new branch will classify
+  once cut: a pending version inherited from the default bumps again from it
+  (`bump_version(pending, level)`), otherwise `compute_target_tag`; below-latest and generic
+  refuse first. `execute_gated_standalone` then checks out the existing branch
+  (`git::local_branch_exists`) or cuts it with `checkout_new_tracking(branch, origin/<default>)`,
+  runs `classify_gated_feature` on it and hands the resulting state back to `execute`. That
+  is how "classify it like any feature branch from its actual diff" works: empty -> fresh
+  with `force`, version line -> `GatedAlreadyBumped`, work -> fresh without `force`.
+- `pr_body(subjects, tag, standalone)` quotes `Standalone release ordered by Scott:
+  "<words>"` whenever the order is present, including on work-carrying gated branches.
+  Ungated rows print the same line (`announce_order`) from `execute_release` and
+  `execute_pending`.
+- `git::changed_lines(dir, base, files)` (new) returns the `+`/`-` lines without the
+  `+++`/`---` headers. `version_line_changed` now uses it too, so Gate D's test and the
+  bump-only test read one diff helper. `git::local_branch_exists` is new too.
+  `changed_files` and `checkout_new_tracking` lost their `#[allow(dead_code)]`.
+- Refusal wording: `STANDALONE_DOOR` (`src/release.rs`) is the doc's sentence verbatim,
+  appended to `Nothing` (ungated tagged, no order), `GatedDefaultClean` and
+  `GatedBumpOnlyBranch`. The finish missed-bump refusal (`src/release/finish.rs:missed_bump`)
+  carries the same door with the command spelled out (`run bump release on <default> with
+  --standalone ...`), because it is not a re-run of `finish`.
+- Behind vs Diverged: ungated classification returns `Diverged` (`git pull --rebase origin
+  <default>`, then re-run). `tag_ladder`'s Diverged arm (`src/main.rs`) now names the rebase
+  too. The gated default branch keeps Diverged under `GatedStranded` (the doc's "commits not
+  on origin" row, unchanged).
+- Fixture `setup_gated_already_bumped` now puts a work commit in front of the bump. Before,
+  it was a version-only branch, which is now `GatedBumpOnlyBranch`. The level-mismatch test
+  it serves is about a branch carrying work plus its own bump.
+- Test `finish_missed_bump_refuses_with_branch_instruction` was renamed and inverted to
+  `finish_missed_bump_refuses_naming_the_standalone_door`. It pinned the old "run bump
+  release on a branch" text.
+- Break-the-code checks, run by hand and then reverted: `force: false` in place of
+  `force: bump_only` fails `gated_standalone_cuts_tracking_branch_bumps_and_quotes_scott` at
+  its `expect` ("HEAD already has a tag"). Disabling the bump-only refusal fails
+  `gated_bump_only_branch_refuses_without_standalone` and the version-only arm of
+  `dep_bump_and_lockfile_only_branches_are_not_bump_only`.
+
+### Deviations
+- `--standalone` is NOT a CLI flag yet. `dispatch_release` passes `standalone: None` until
+  Phase 6 adds the flags (Phase 6: "Flags per API Design"), the same pattern Phase 3 used for
+  `ci_gate`/`ci_timeout`. Until then the standalone rows can only be reached from tests.
+- `GatedFresh.force` is decided by the branch's diff (bump-only + order) instead of being
+  flagged by the standalone path. Same effect, correct seam: see Design decisions.
+- The doc's `UngatedPending { tag, default, ahead }` also carries `version` (from Phase 3).
+- `dep_bump_and_lockfile_only_branches_are_not_bump_only` asserts on `classify()`
+  (`GatedFresh { force: false }`, and a version-only control branch that comes out as
+  `GatedBumpOnlyBranch`) instead of running the whole release. With a `Cargo.lock` present
+  the version commit runs `cargo update -p`, which a fixture with a fake lockfile and no
+  sources cannot satisfy. Classification is what the criterion names.
+- `zero_check_runs_refuses_with_workflows_and_proceeds_with_ci_none` makes the untracked
+  `bump.yml` ignored (`.git/info/exclude`). Without that, the verb refuses on the dirty tree
+  before the CI gate ever runs. The test checks that the refusal is the CI one. The "notice"
+  line is printed and not captured; the test asserts the proceed through the tag landing on
+  origin at the `ci: none` commit.
+- The finish missed-bump door wording lands here, not in Phase 5. The doc's "Refusal
+  wording" paragraph groups it with the two door rows, and no Phase 5 bullet claims it.
+
+### Tradeoffs
+- `execute_gated_standalone` calls back into `classify_gated_feature` + `execute` vs. a
+  dedicated standalone executor: reusing them means the existing-branch cases can't drift
+  from ordinary feature-branch behavior. The recursion stops after one level because
+  `classify_gated_feature` never returns `GatedStandalone`.
+- A pending version on the gated default plus `--standalone` bumps again (the inherited-
+  pending rule, with its notice) vs. refusing and pointing at `bump finish`: chose
+  consistency with the feature-branch row Scott ruled on. The notice still tells the
+  operator how to ship the inherited version first.
+- Tests for the tag_ladder split live in `src/release/tests/finish.rs`, not in `main.rs`'s
+  test module, to keep `main.rs` from growing.
+
+### Open questions
+- `src/main.rs` is 2396 lines (2394 before this phase), over the 1500-line cap in
+  rules/rust.md. That predates this doc. Split it before Phase 6 touches `dispatch_*`
+  and the after-help, or leave it?

@@ -49,9 +49,10 @@ fn finish_tags_merged_tip_and_pushes_by_name() {
 }
 
 /// Row 2: a commit merged to origin/main WITHOUT a version bump (version == last tag).
-/// finish refuses with the branch instruction; nothing tagged or installed.
+/// finish refuses naming the standalone door (and forbidding an invented order); nothing
+/// tagged or installed.
 #[test]
-fn finish_missed_bump_refuses_with_branch_instruction() {
+fn finish_missed_bump_refuses_naming_the_standalone_door() {
     let (origin, work) = setup_finish_missed_bump("0.1.5");
     let dir = work.path();
 
@@ -62,9 +63,10 @@ fn finish_missed_bump_refuses_with_branch_instruction() {
         .to_string();
     assert!(err.contains("no untagged version"), "got: {err}");
     assert!(
-        err.contains("run bump release on a branch"),
-        "must point at the branch flow: {err}"
+        err.contains("--standalone \"<his exact words>\""),
+        "must name the door: {err}"
     );
+    assert!(err.contains("do not invent an order"), "got: {err}");
     assert!(pusher.calls().is_empty(), "no tag push on a refusal");
     assert!(installer.calls().is_empty(), "no install on a refusal");
     drop(origin);
@@ -217,5 +219,28 @@ fn finish_dry_run_executes_nothing() {
     assert!(pusher.calls().is_empty(), "no push in dry-run");
     assert!(installer.calls().is_empty(), "no install in dry-run");
     assert!(!git::tag_exists(dir, "v0.1.6").unwrap(), "no tag in dry-run");
+    drop(origin);
+}
+
+/// `tag_ladder` (shared by `--tag-only` and `finish`) splits behind from diverged: only
+/// behind can fast-forward; diverged names the rebase.
+#[test]
+fn tag_ladder_splits_behind_and_diverged() {
+    let (origin, work) = setup_released("0.1.5");
+    let dir = work.path();
+    let c1 = git::head_sha(dir).unwrap();
+    git_ok(dir, &["commit", "--allow-empty", "-m", "c2"]);
+    git_ok(dir, &["push", "origin", "main"]);
+    git_ok(dir, &["reset", "--hard", &c1]);
+
+    let behind = crate::tag_ladder(dir).expect_err("behind refuses").to_string();
+    assert!(behind.contains("git pull --ff-only origin main"), "got: {behind}");
+
+    git_ok(dir, &["commit", "--allow-empty", "-m", "local only"]);
+    let diverged = crate::tag_ladder(dir).expect_err("diverged refuses").to_string();
+    assert!(diverged.contains("git pull --rebase origin main"), "got: {diverged}");
+    assert!(!diverged.contains("--ff-only"), "got: {diverged}");
+    assert_eq!(git::tag_sha(dir, "v0.1.5").unwrap(), c1, "no tag moved or created");
+    assert!(!git::tag_exists(dir, "v0.1.6").unwrap());
     drop(origin);
 }

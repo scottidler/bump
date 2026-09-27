@@ -155,10 +155,23 @@ fn pr_title_takes_type_and_scope_from_first_subject_else_chore() {
 
 #[test]
 fn pr_body_lists_subjects_and_ends_with_release_line() {
-    let body = pr_body(&["feat: a".to_string(), "Bump version to v0.1.6".to_string()], "v0.1.6");
+    let body = pr_body(
+        &["feat: a".to_string(), "Bump version to v0.1.6".to_string()],
+        "v0.1.6",
+        None,
+    );
     assert_eq!(
         body,
         "- feat: a\n- Bump version to v0.1.6\n\nRelease: rides this PR (v0.1.6)"
     );
-    assert!(pr_body(&[], "v1.0.0").ends_with("Release: rides this PR (v1.0.0)"));
+    assert!(pr_body(&[], "v1.0.0", None).ends_with("Release: rides this PR (v1.0.0)"));
+}
+
+#[test]
+fn pr_body_quotes_the_standalone_order_before_the_release_line() {
+    let body = pr_body(&["Bump version to v0.1.6".to_string()], "v0.1.6", Some("ship it"));
+    assert_eq!(
+        body,
+        "- Bump version to v0.1.6\n\nStandalone release ordered by Scott: \"ship it\"\n\nRelease: rides this PR (v0.1.6)"
+    );
 }

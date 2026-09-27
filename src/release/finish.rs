@@ -137,7 +137,11 @@ pub fn finish<P: Pusher, I: Installer, C: Ci>(
 /// without a version bump, so origin/<default>'s version still equals the last tag. The
 /// bump rides the NEXT feature PR.
 fn missed_bump(default: &str) -> Result<ReleaseReport> {
-    bail!("no untagged version on {default}; bump rides a feature PR -- run bump release on a branch")
+    bail!(
+        "no untagged version on {default}: bump never rode this merge, and bump rides a feature PR.\n\
+         If Scott already ordered a standalone release in this session, run bump release on {default} with \
+         `--standalone \"<his exact words>\"`. Otherwise STOP and report; do not invent an order."
+    )
 }
 
 /// `-n` dry run for `bump finish`: echo every command it would run and mutate NOTHING (no
