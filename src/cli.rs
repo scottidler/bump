@@ -110,7 +110,7 @@ pub enum Commands {
 }
 
 /// `bump release [-m|-M] [-n] [--install "<cmd>"|--no-install] [--standalone "<words>"]
-/// [--no-ci-gate] [--ci-timeout SECS]`
+/// [--no-ci-gate] [--ci-timeout SECS] [DIR]`
 #[derive(clap::Args, Debug)]
 pub struct ReleaseArgs {
     /// Bump major version (X.0.0)
@@ -151,9 +151,14 @@ pub struct ReleaseArgs {
     /// Never tags on a timeout -- the re-run reuses the same version.
     #[arg(long, value_name = "SECS", default_value_t = default_ci_timeout_secs())]
     pub ci_timeout: u64,
+
+    /// Repo to release (default: the current directory). Lets a caller whose shell cannot
+    /// `cd` into the repo (a subagent) run `bump release <dir>` from anywhere.
+    #[arg(value_name = "DIR")]
+    pub dir: Option<PathBuf>,
 }
 
-/// `bump finish [-n] [--install "<cmd>"|--no-install] [--no-ci-gate] [--ci-timeout SECS]`
+/// `bump finish [-n] [--install "<cmd>"|--no-install] [--no-ci-gate] [--ci-timeout SECS] [DIR]`
 #[derive(clap::Args, Debug)]
 pub struct FinishArgs {
     /// Preview every command that would run; execute nothing
@@ -176,6 +181,11 @@ pub struct FinishArgs {
     /// How long the CI gate waits on incomplete check runs before refusing (seconds).
     #[arg(long, value_name = "SECS", default_value_t = default_ci_timeout_secs())]
     pub ci_timeout: u64,
+
+    /// Repo to finish (default: the current directory). Lets a caller whose shell cannot
+    /// `cd` into the repo (a subagent) run `bump finish <dir>` from anywhere.
+    #[arg(value_name = "DIR")]
+    pub dir: Option<PathBuf>,
 }
 
 /// Generate the `bump release --help` after-help text: the state table (condensed), the

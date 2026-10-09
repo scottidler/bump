@@ -858,16 +858,27 @@ fn main() -> Result<()> {
 }
 
 /// Dispatch `bump release` / `bump finish` to the `release` module's state machines,
-/// wired to their PRODUCTION ports (`GitPusher`, `ShellInstaller`, `GhPr`, `GhCi`). Both verbs
-/// operate on the current directory (the design doc's API contract takes no directory
-/// argument -- callers `cd` into the repo, matching the bash driver they replace).
+/// wired to their PRODUCTION ports (`GitPusher`, `ShellInstaller`, `GhPr`, `GhCi`). Each verb
+/// operates on its optional `[DIR]` positional, else the current directory.
 fn dispatch_command(command: &cli::Commands) -> Result<()> {
     debug!("dispatch_command: command={:?}", command);
-    let dir = env::current_dir().context("Failed to get current directory")?;
     match command {
-        cli::Commands::Release(args) => dispatch_release(&dir, args),
-        cli::Commands::Finish(args) => dispatch_finish(&dir, args),
+        cli::Commands::Release(args) => dispatch_release(&resolve_verb_dir(args.dir.as_deref())?, args),
+        cli::Commands::Finish(args) => dispatch_finish(&resolve_verb_dir(args.dir.as_deref())?, args),
     }
+}
+
+/// The repo a release verb operates on: the explicit `[DIR]` (made absolute against the
+/// cwd), else the cwd. A pure path decision; whether it is a git repo is the verb's call.
+fn resolve_verb_dir(dir: Option<&Path>) -> Result<PathBuf> {
+    let cwd = env::current_dir().context("Failed to get current directory")?;
+    let resolved = match dir {
+        Some(d) if d.is_absolute() => d.to_path_buf(),
+        Some(d) => cwd.join(d),
+        None => cwd,
+    };
+    debug!("resolve_verb_dir: explicit={:?} resolved={}", dir, resolved.display());
+    Ok(resolved)
 }
 
 /// The shared `--install`/`--no-install` -> `InstallChoice` mapping for both verbs.
@@ -2368,6 +2379,37 @@ name = "test-pkg"
     }
 
     // =========================================================================
+    #[test]
+    fn test_release_verb_honors_dir_positional() {
+        let cli = Cli::try_parse_from(["bump", "release", "-n", "/some/repo"]).unwrap();
+        let Some(cli::Commands::Release(args)) = cli.command else {
+            panic!("not release")
+        };
+        assert_eq!(
+            resolve_verb_dir(args.dir.as_deref()).unwrap(),
+            PathBuf::from("/some/repo")
+        );
+    }
+
+    #[test]
+    fn test_finish_verb_honors_dir_positional() {
+        let cli = Cli::try_parse_from(["bump", "finish", "-n", "/some/repo"]).unwrap();
+        let Some(cli::Commands::Finish(args)) = cli.command else {
+            panic!("not finish")
+        };
+        assert_eq!(
+            resolve_verb_dir(args.dir.as_deref()).unwrap(),
+            PathBuf::from("/some/repo")
+        );
+    }
+
+    #[test]
+    fn test_verb_dir_defaults_to_cwd_and_absolutizes_relative() {
+        let cwd = env::current_dir().unwrap();
+        assert_eq!(resolve_verb_dir(None).unwrap(), cwd);
+        assert_eq!(resolve_verb_dir(Some(Path::new("rel"))).unwrap(), cwd.join("rel"));
+    }
+
     // PHASE 8: --install / --no-install -> InstallChoice mapping (dispatch_release /
     // dispatch_finish share this).
     // =========================================================================

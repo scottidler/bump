@@ -15,13 +15,13 @@ cargo install --path .
 
 For releasing a repo, use `bump release` / `bump finish` -- they absorb every mechanical
 step (pushes, PR open, the CI wait, install) that the primitives below (bare `bump`,
-`--no-tag`, `--tag-only`) otherwise leave to you. Run from inside the repo, bare, no `&&`
+`--no-tag`, `--tag-only`) otherwise leave to you. Run from inside the repo, or pass `[DIR]` to name it (default: the cwd), bare, no `&&`
 and no wrapper:
 
 ```bash
 bump release [-m|-M] [-n] [--install "<cmd>"|--no-install] [--standalone "<words>"] \
-             [--no-ci-gate] [--ci-timeout SECS]
-bump finish  [-n] [--install "<cmd>"|--no-install] [--no-ci-gate] [--ci-timeout SECS]
+             [--no-ci-gate] [--ci-timeout SECS] [DIR]
+bump finish  [-n] [--install "<cmd>"|--no-install] [--no-ci-gate] [--ci-timeout SECS] [DIR]
 ```
 
 `bump release` inspects the repo's git + gate state and either executes the ONE correct
