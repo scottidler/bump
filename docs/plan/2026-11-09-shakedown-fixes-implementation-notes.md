@@ -19,3 +19,15 @@
 - Cherry-pick plus amend vs. a rebase: the orchestrator asked for the branch ref to stay put, and the result is one Phase 2 commit on main.
 ### Open questions
 - None.
+
+## Phase 3: Land release-verbs-take-dir
+### Design decisions
+- Cherry-picked eba0468 onto main rather than rebasing, so `origin/release-verbs-take-dir` and every other branch ref stay untouched; one Phase 3 commit on main.
+- Resolved the `README.md` conflict by keeping HEAD's "the open-PR probe" wording (Phase 2) and adding eba0468's "or pass `[DIR]` to name it (default: the cwd)" clause.
+- Subject reworded to "Release and finish take an optional directory" (no `feat(cli):` prefix).
+### Deviations
+- None. No code changes beyond the cherry-picked diff; `src/cli.rs` and `src/main.rs` applied cleanly.
+### Tradeoffs
+- Cherry-pick plus amend vs. a rebase: the orchestrator asked for no branch ref to move, and this yields one commit.
+### Open questions
+- Deleting the merged `release-verbs-take-dir` branch (local and origin) is in the doc's Rollout Plan but was not done: this run was told not to touch branch refs. The parent should do it after the phases land.
