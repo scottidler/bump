@@ -89,7 +89,7 @@ fn gated_standalone_cuts_tracking_branch_bumps_and_quotes_scott() {
     let (branch, base, title, body) = &created[0];
     assert_eq!(branch, "bump-v0-1-6");
     assert_eq!(base, "main");
-    assert_eq!(title, "chore: bump v0 1 6");
+    assert_eq!(title, "chore: bump v0.1.6");
     assert!(
         body.contains(&format!("Standalone release ordered by Scott: \"{ORDER}\"")),
         "body: {body}"

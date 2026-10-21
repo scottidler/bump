@@ -154,6 +154,19 @@ fn pr_title_takes_type_and_scope_from_first_subject_else_chore() {
 }
 
 #[test]
+fn pr_title_restores_the_dots_of_a_flattened_version() {
+    let fix = vec!["fix(jev): pin it".to_string()];
+    assert_eq!(pr_title("pin-jev-1-14-0", &fix), "fix(jev): pin jev 1.14.0");
+    assert_eq!(pr_title("bump-v0-1-6", &[]), "chore: bump v0.1.6");
+    assert_eq!(pr_title("add-2-things", &[]), "chore: add 2 things");
+    for branch in ["pin-jev-1-14-0", "bump-v0-1-6", "add-2-things"] {
+        let title = pr_title(branch, &[]);
+        let words = title.split_once(": ").unwrap().1;
+        assert_eq!(branch_slug(words), branch, "title must slugify back to the branch");
+    }
+}
+
+#[test]
 fn pr_body_lists_subjects_and_ends_with_release_line() {
     let body = pr_body(
         &["feat: a".to_string(), "Bump version to v0.1.6".to_string()],

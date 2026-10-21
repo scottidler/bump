@@ -60,7 +60,7 @@ pub(super) fn branch_slug(branch: &str) -> String {
 /// subject on the branch (`chore` when it has no conventional prefix). By construction it
 /// slugifies back to the branch, which `branch-pr-title-guard.sh` enforces.
 pub fn pr_title(branch: &str, subjects: &[String]) -> String {
-    let words = branch.replace('-', " ");
+    let words = restore_version_dots(&branch.replace('-', " "));
     let (kind, scope) = subjects
         .first()
         .and_then(|s| parse_conventional_prefix(s))
@@ -69,6 +69,30 @@ pub fn pr_title(branch: &str, subjects: &[String]) -> String {
         Some(scope) => format!("{kind}({scope}): {words}"),
         None => format!("{kind}: {words}"),
     }
+}
+
+/// Two or more consecutive numeric words (`v0 1 6`, `1 14 0`) are a version the branch slug
+/// flattened: join them with dots (`v0.1.6`, `1.14.0`). The title still slugifies back to the
+/// branch, because the guard turns `.` into `-`.
+fn restore_version_dots(words: &str) -> String {
+    let is_number = |w: &str| {
+        let digits = w.strip_prefix('v').unwrap_or(w);
+        !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
+    };
+    let mut out: Vec<String> = Vec::new();
+    let mut prev_number = false;
+    for word in words.split(' ') {
+        let number = is_number(word);
+        match out.last_mut() {
+            Some(last) if number && prev_number => {
+                last.push('.');
+                last.push_str(word);
+            }
+            _ => out.push(word.to_string()),
+        }
+        prev_number = number;
+    }
+    out.join(" ")
 }
 
 /// `feat(scope)!: subject` -> `("feat", Some("scope"))`. `None` when the subject has no
