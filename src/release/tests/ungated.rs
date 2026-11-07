@@ -454,7 +454,7 @@ fn gated_on_default_clean_refuses_bump_rides_a_pr() {
     assert!(err.contains("bump rides a feature PR"), "got: {err}");
     assert!(err.contains(STANDALONE_DOOR), "must name the standalone door: {err}");
     assert!(pusher.calls().is_empty());
-    assert_eq!(pr.create_calls(), 0, "no PR touched on a refusal");
+    assert!(pr.calls().is_empty(), "no PR touched on a refusal");
     // NO tag created on this gated path either.
     assert!(!git::tag_exists(dir, "v0.1.6").unwrap());
     drop(origin);

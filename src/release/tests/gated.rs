@@ -2,11 +2,11 @@
 
 use super::*;
 
-/// Gated e2e: two runs, PAUSED both times, branch pushed, PR-create invoked EXACTLY ONCE
-/// (first run creates; second sees the open PR via the list-probe fake and skips), and NO
-/// tag anywhere across the fresh + resume paths.
+/// Gated e2e: two runs, PAUSED both times, branch pushed, the PR seam touched ONLY by the
+/// open-PR probe (bump never opens a PR; both runs hand off to `/pr:create` with the
+/// release-intent line), and NO tag anywhere across the fresh + resume paths.
 #[test]
-fn gated_release_pauses_and_creates_pr_once_across_two_runs() {
+fn gated_release_pauses_and_hands_pr_to_pr_create_across_two_runs() {
     let _guard = crate::ENV_LOCK.lock().unwrap();
     let (origin, work) = setup_gated_feature_branch("0.1.5");
     let dir = work.path();
@@ -30,9 +30,11 @@ fn gated_release_pauses_and_creates_pr_once_across_two_runs() {
     let second = second.expect("second gated run also pauses (idempotent)");
     assert!(second.paused);
 
-    // PR created EXACTLY ONCE across two runs; the probe ran on each.
-    assert_eq!(pr.create_calls(), 1, "PR create must run exactly once");
-    assert!(pr.list_calls() >= 2, "the open-PR probe runs on every run");
+    // The probe ran on each run and nothing else touched the PR seam.
+    assert_eq!(pr.calls(), vec!["list:feature".to_string(), "list:feature".to_string()]);
+    let line = vec!["Release: rides this PR (v0.1.6)".to_string()];
+    assert_eq!(first.pr_body_lines, line, "first run hands off the release-intent line");
+    assert_eq!(second.pr_body_lines, line, "the re-run hands off the same line");
 
     // Only feature-branch pushes, NEVER a tag push.
     assert!(
@@ -86,7 +88,7 @@ fn gated_level_mismatch_refuses_naming_both_versions() {
     assert!(err.contains("v1.0.0"), "must name the implied version: {err}");
     // Nothing touched: no push, no PR, no re-bump.
     assert!(pusher.calls().is_empty(), "nothing pushed on a mismatch refusal");
-    assert_eq!(pr.create_calls(), 0);
+    assert!(pr.calls().is_empty(), "no PR touched on a refusal");
     assert_eq!(
         read_cargo_version(dir),
         "0.2.0",
@@ -148,6 +150,6 @@ fn gated_generic_repo_is_unsupported() {
     assert!(err.contains("generic"), "got: {err}");
     assert!(err.contains("unsupported"), "got: {err}");
     assert!(pusher.calls().is_empty());
-    assert_eq!(pr.create_calls(), 0);
+    assert!(pr.calls().is_empty(), "no PR touched on a refusal");
     drop(origin);
 }

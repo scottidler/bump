@@ -54,7 +54,7 @@ use crate::{DEFAULT_UNTOUCHED_VERSION, determine_version_action, process_directo
 use ci::ci_gate;
 use eyre::{Context, Result, bail};
 use log::debug;
-use pr::{branch_slug, pr_body, pr_title, standalone_order_line};
+use pr::{branch_slug, pr_body_lines, pr_create_handoff, standalone_order_line};
 use semver::Version;
 use standalone::{classify_gated_standalone, execute_gated_standalone, is_bump_only_branch};
 use std::path::{Path, PathBuf};
@@ -66,8 +66,9 @@ use tag::{TagTarget, echo_tag_steps, gate_tag_and_push};
 const DEFAULT_INSTALL_COMMAND: &str = "cargo install --path .";
 
 /// The pause message printed at the end of the gated `release` flow: the verb has done
-/// everything mechanical up to (and including) opening the PR, and now hands control back
-/// to the human/agent to merge and then run `bump finish`.
+/// everything mechanical up to (and including) pushing the branch, and now hands control
+/// back to the human/agent to open the PR with `/pr:create` (when none is open), merge it,
+/// and then run `bump finish`.
 const GATED_PAUSE_MESSAGE: &str = "merge the PR, then run: bump finish";
 
 /// The standalone door, appended to every refusal a bump-only release hits without Scott's
@@ -100,7 +101,8 @@ pub struct ReleaseOpts {
     /// How to resolve the post-release install step.
     pub install: InstallChoice,
     /// Scott's standalone order, verbatim (`--standalone "<words>"`). `None`: a bump-only
-    /// release refuses. Quoted in the PR body (gated) or printed (ungated) whenever given.
+    /// release refuses. Printed whenever given: gated, as a line the `/pr:create` body must
+    /// carry; ungated, as the audit trail.
     pub standalone: Option<String>,
     /// `false` skips the CI gate with a printed warning (`--no-ci-gate`).
     pub ci_gate: bool,
@@ -133,17 +135,20 @@ pub struct ReleaseReport {
     pub tag: String,
     /// True when this completed a partial-release RESUME rather than a fresh release.
     pub resumed: bool,
-    /// True when this was a GATED run that pushed the branch, ensured a PR, and PAUSED
-    /// (exit 0) for the human to merge -- no tag, no install.
+    /// True when this was a GATED run that pushed the branch and PAUSED (exit 0) for the
+    /// PR to be opened with `/pr:create` (when none is open) and merged -- no tag, no
+    /// install.
     pub paused: bool,
     /// The resolved install command that ran (`None` = install skipped, always `None`
     /// on a paused gated run).
     pub install_command: Option<String>,
     /// True when this was a `-n` dry run (nothing was mutated).
     pub dry_run: bool,
-    /// The URL of the PR this run CREATED (`None` when one was already open, or on any
-    /// ungated / finish run).
-    pub pr_url: Option<String>,
+    /// The lines the body of the PR `/pr:create` must open carry, verbatim (Scott's
+    /// standalone order when given, then `Release: rides this PR (vX.Y.Z)`). Empty when an
+    /// open PR already exists for the branch, and on any ungated / finish run. bump never
+    /// opens the PR itself.
+    pub pr_body_lines: Vec<String>,
     /// A warning printed alongside the pause (the inherited-pending-version notice).
     pub notice: Option<String>,
 }
@@ -156,7 +161,7 @@ impl ReleaseReport {
             paused: false,
             install_command: None,
             dry_run: false,
-            pr_url: None,
+            pr_body_lines: Vec::new(),
             notice: None,
         }
     }
@@ -1283,9 +1288,11 @@ struct GatedPlan {
 
 /// The GATED release flow: on a feature branch, make the version commit (unless the
 /// branch already carries its own bump), push the branch with `--no-follow-tags -u`,
-/// ensure an OPEN PR exists (list-probe, then create with the derived title and body), and
-/// PAUSE (exit 0) for the human to merge. NO tag is created or pushed here -- tagging the
-/// merged commit is `bump finish`'s job.
+/// probe for an OPEN PR, and PAUSE (exit 0). With no open PR it prints the `/pr:create`
+/// hand-off and the release-intent line the body must carry; it never runs `gh pr create`,
+/// because a PR opened inside this binary bypasses the PreToolUse guards on `/pr:create`'s
+/// body contract. NO tag is created or pushed here -- tagging the merged commit is `bump
+/// finish`'s job.
 fn execute_gated<P: Pusher, I: Installer, R: Pr, C: Ci>(
     dir: &Path,
     opts: &ReleaseOpts,
@@ -1308,7 +1315,6 @@ fn execute_gated<P: Pusher, I: Installer, R: Pr, C: Ci>(
         tag,
         opts.dry_run
     );
-    let base_ref = format!("origin/{default}");
 
     if opts.dry_run {
         match &commit {
@@ -1319,12 +1325,12 @@ fn execute_gated<P: Pusher, I: Installer, R: Pr, C: Ci>(
                 println!("[dry-run] (version already bumped on {branch}; no re-bump)");
             }
         }
-        let title = pr_title(&branch, &git::commit_subjects(dir, &base_ref)?);
         println!("[dry-run] git push --no-follow-tags -u origin {branch}");
         println!("[dry-run] gh pr list --head {branch} --state open --json number  (open-PR probe)");
-        println!(
-            "[dry-run] gh pr create --head {branch} --base {default} --title \"{title}\" --body \"<subjects>\\n\\nRelease: rides this PR ({tag})\"  (only if no open PR)"
-        );
+        println!("[dry-run] (only if no open PR) bump opens no PR; it prints:");
+        for line in pr_create_handoff(&branch, &pr_body_lines(&tag, opts.standalone.as_deref())).lines() {
+            println!("[dry-run]   {line}");
+        }
         if let Some(words) = opts.standalone.as_deref() {
             println!(
                 "[dry-run] gh pr comment {branch} --body '{}'  (only if a PR is already open)",
@@ -1354,25 +1360,22 @@ fn execute_gated<P: Pusher, I: Installer, R: Pr, C: Ci>(
     //    ride; tagging is `bump finish`'s job on the merged commit).
     ports.pusher.push_feature_branch(dir, &branch)?;
 
-    // 3. Ensure an OPEN PR exists: the list-probe FIRST (exit-0 in all cases, reused
-    //    branch names read correctly), create ONLY if none is open, with the title and
-    //    body built from the branch and its commits.
-    let pr_url = if ports.pr.open_pr_exists(dir, &branch)? {
-        println!("open PR already exists for {branch}; not creating another");
-        // That PR's body was built by an earlier run, so Scott's order goes on as a comment.
+    // 3. Probe for an OPEN PR (exit-0 in all cases, reused branch names read correctly).
+    //    None open: print the `/pr:create` hand-off with the lines its body must carry.
+    //    bump never opens the PR itself.
+    let pr_body_lines = if ports.pr.open_pr_exists(dir, &branch)? {
+        println!("open PR already exists for {branch}");
+        // That PR's body was written before this run, so Scott's order goes on as a comment.
         if let Some(words) = opts.standalone.as_deref() {
             let order = standalone_order_line(words);
             ports.pr.comment_pr(dir, &branch, &order)?;
             println!("{order} (commented on the open PR)");
         }
-        None
+        Vec::new()
     } else {
-        let subjects = git::commit_subjects(dir, &base_ref)?;
-        let title = pr_title(&branch, &subjects);
-        let body = pr_body(&subjects, &tag, opts.standalone.as_deref());
-        let url = ports.pr.create_pr(dir, &branch, &default, &title, &body)?;
-        println!("opened PR: {url}");
-        Some(url)
+        let lines = pr_body_lines(&tag, opts.standalone.as_deref());
+        println!("{}", pr_create_handoff(&branch, &lines));
+        lines
     };
 
     // 4. PAUSE. No tag, no install -- both are `bump finish`'s after the merge.
@@ -1382,7 +1385,7 @@ fn execute_gated<P: Pusher, I: Installer, R: Pr, C: Ci>(
     println!("{GATED_PAUSE_MESSAGE}");
     Ok(ReleaseReport {
         paused: true,
-        pr_url,
+        pr_body_lines,
         notice,
         ..ReleaseReport::new(&tag)
     })
@@ -1444,7 +1447,7 @@ fn version_commit_to(dir: &Path, target: &Version) -> Result<()> {
 }
 
 /// Print Scott's standalone order when one was given on an ungated row: the audit trail the
-/// gated flow gets from the PR body.
+/// gated flow gets from the `/pr:create` body line.
 fn announce_order(opts: &ReleaseOpts) {
     if let Some(words) = &opts.standalone {
         println!("Standalone release ordered by Scott: \"{words}\"");

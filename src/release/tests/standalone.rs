@@ -84,17 +84,19 @@ fn gated_standalone_cuts_tracking_branch_bumps_and_quotes_scott() {
         git::head_sha(dir).unwrap(),
         "the bump commit is on origin's branch"
     );
-    let created = pr.created();
-    assert_eq!(created.len(), 1);
-    let (branch, base, title, body) = &created[0];
-    assert_eq!(branch, "bump-v0-1-6");
-    assert_eq!(base, "main");
-    assert_eq!(title, "chore: bump v0.1.6");
-    assert!(
-        body.contains(&format!("Standalone release ordered by Scott: \"{ORDER}\"")),
-        "body: {body}"
+    assert_eq!(
+        pr.calls(),
+        vec!["list:bump-v0-1-6".to_string()],
+        "only the probe; bump opens no PR"
     );
-    assert_eq!(body.lines().last(), Some("Release: rides this PR (v0.1.6)"));
+    assert_eq!(
+        report.pr_body_lines,
+        vec![
+            format!("Standalone release ordered by Scott: \"{ORDER}\""),
+            "Release: rides this PR (v0.1.6)".to_string(),
+        ],
+        "the /pr:create body must carry Scott's words, then the release-intent line"
+    );
     assert_eq!(*pusher.calls.borrow(), vec!["feature:bump-v0-1-6".to_string()]);
     assert_no_tag_anywhere(dir, "v0.1.6");
     drop(origin);
@@ -145,8 +147,12 @@ fn gated_standalone_reuses_an_existing_branch_by_its_diff() {
             );
         }
         assert_eq!(pusher.calls(), vec!["feature:bump-v0-1-6".to_string()], "{case}");
-        let body = &pr.created()[0].3;
-        assert!(body.contains(ORDER), "{case}: {body}");
+        assert_eq!(pr.calls(), vec!["list:bump-v0-1-6".to_string()], "{case}");
+        assert!(
+            report.pr_body_lines.iter().any(|l| l.contains(ORDER)),
+            "{case}: {:?}",
+            report.pr_body_lines
+        );
         assert_no_tag_anywhere(dir, "v0.1.6");
         drop(origin);
     }
@@ -171,7 +177,7 @@ fn gated_bump_only_branch_refuses_without_standalone() {
     assert_eq!(git::head_sha(dir).unwrap(), head, "nothing committed");
     assert_eq!(read_cargo_version(dir), "0.1.5", "nothing bumped");
     assert!(pusher.calls().is_empty(), "nothing pushed");
-    assert_eq!(pr.list_calls(), 0, "no PR touched");
+    assert!(pr.calls().is_empty(), "no PR touched");
     drop(origin);
 
     // A branch whose only change is the version line.
@@ -287,7 +293,7 @@ fn standalone_with_empty_words_refuses() {
 }
 
 /// On a branch that already carries work the order changes nothing but the audit trail:
-/// gated quotes it in the PR body, ungated releases the commits ahead as usual.
+/// gated hands it to `/pr:create` as a body line, ungated releases the commits ahead as usual.
 #[test]
 fn standalone_on_work_carrying_branches_only_quotes_the_order() {
     let _guard = crate::ENV_LOCK.lock().unwrap();
@@ -302,7 +308,8 @@ fn standalone_on_work_carrying_branches_only_quotes_the_order() {
     assert_eq!(git::current_branch(dir).unwrap(), "feature", "no standalone branch cut");
     assert_eq!(git_ok(dir, &["rev-parse", "HEAD~1"]), feature);
     assert_eq!(pusher.calls(), vec!["feature:feature".to_string()]);
-    assert!(pr.created()[0].3.contains(ORDER));
+    assert!(report.pr_body_lines.iter().any(|l| l.contains(ORDER)));
+    assert_eq!(pr.calls(), vec!["list:feature".to_string()]);
     assert_no_tag_anywhere(dir, "v0.1.6");
     drop(origin);
 
@@ -347,7 +354,7 @@ fn standalone_on_a_pending_version_refuses_naming_bump_finish() {
     assert_eq!(git::head_sha(dir).unwrap(), head, "nothing committed");
     assert_eq!(read_cargo_version(dir), "0.1.6", "nothing bumped");
     assert!(pusher.calls().is_empty(), "nothing pushed");
-    assert_eq!(pr.list_calls(), 0, "no PR touched");
+    assert!(pr.calls().is_empty(), "no PR touched");
     assert_no_tag_anywhere(dir, "v0.1.6");
     assert_no_tag_anywhere(dir, "v0.1.7");
     drop(origin);
@@ -401,9 +408,11 @@ fn dependency_table_version_change_with_work_bumps_fresh() {
 
     assert_eq!(report.tag, "v0.1.6");
     assert_eq!(read_cargo_version(dir), "0.1.6", "the version commit happened");
-    let body = &pr.created()[0].3;
-    assert!(body.contains("Release: rides this PR (v0.1.6)"), "got: {body}");
-    assert!(!body.contains("(v0.1.5)"), "never names the released version: {body}");
+    assert_eq!(
+        report.pr_body_lines,
+        vec!["Release: rides this PR (v0.1.6)".to_string()],
+        "names the NEW version, never the released one"
+    );
     drop(origin);
 }
 

@@ -3,7 +3,8 @@
 CLI tool for bumping semantic versions (Cargo.toml, pyproject.toml, package.json),
 creating commits, and tagging releases -- plus two release verbs, `bump release` and
 `bump finish`, that drive the whole mechanical release sequence (including pushes,
-PR handling, and install) for both ungated and PR-gated repos.
+the CI wait, and install) for both ungated and PR-gated repos. bump never opens a PR:
+on a gated repo `/pr:create` does, so its body contract is enforced.
 
 ## Installation
 
@@ -14,7 +15,7 @@ cargo install --path .
 ## The release verbs (recommended)
 
 For releasing a repo, use `bump release` / `bump finish` -- they absorb every mechanical
-step (pushes, PR open, the CI wait, install) that the primitives below (bare `bump`,
+step (pushes, the open-PR probe, the CI wait, install) that the primitives below (bare `bump`,
 `--no-tag`, `--tag-only`) otherwise leave to you. Run from inside the repo, bare, no `&&`
 and no wrapper:
 
@@ -31,7 +32,7 @@ decided by `bump --gates` (never both):
 | Flow | What it does |
 |---|---|
 | UNGATED | version commit -> push origin `<default>` -> confirm on origin -> wait for green CI -> tag the verified sha -> push tag -> install |
-| GATED | version commit rides the feature branch -> push it (no tags follow) -> open a PR if none is open (title/body built from the branch and its commits) -> pause: `merge the PR, then run: bump finish` |
+| GATED | version commit rides the feature branch -> push it (no tags follow) -> probe for an open PR; if none, print the `/pr:create` hand-off and the exact `Release: rides this PR (vX.Y.Z)` line its body must carry -> pause: `merge the PR, then run: bump finish` |
 
 | Situation | `bump release` does |
 |---|---|
@@ -40,8 +41,8 @@ decided by `bump --gates` (never both):
 | Ungated RESUME (pending version, HEAD == origin) | wait for green CI, tag, push tag, install -- never reported as "already released" |
 | Ungated, manifest below the latest tag | refuses by name; bump never lowers a version |
 | Ungated, not on default / behind / diverged / nothing to release | refuses with the one exact fix (checkout, `git pull --ff-only`, `git pull --rebase`, or `--standalone`) |
-| Gated, feature branch, fresh | rides the bump, pushes, opens/ensures the PR, pauses |
-| Gated, feature branch, already bumped (version line already in the diff) | skips the re-bump, ensures branch/PR, same pause; a mismatched level refuses naming both |
+| Gated, feature branch, fresh | rides the bump, pushes, hands the PR to `/pr:create` (unless one is open), pauses |
+| Gated, feature branch, already bumped (version line already in the diff) | skips the re-bump, pushes, same hand-off and pause; a mismatched level refuses naming both |
 | Gated, feature branch, PENDING VERSION inherited from the default branch | bumps AGAIN from the manifest version; names the untagged one it is burning unless `bump finish` ships it first |
 | Gated, feature branch whose diff vs the default is empty or version-only | refuses, names `--standalone` |
 | Gated, feature branch where the title-guard slug != the branch name | refuses before any mutation, prints `git branch -m <slug>` |
@@ -52,7 +53,14 @@ decided by `bump --gates` (never both):
 `--standalone "<words>"` is Scott's words, verbatim: the one legitimate way to ship a
 release whose diff is empty or version-only. Re-asking for this order is a violation --
 an agent runs this flag only when Scott already gave the words in this session; otherwise
-it should STOP and report.
+it should STOP and report. On a gated repo the words are printed as a
+`Standalone release ordered by Scott: "<words>"` line the `/pr:create` body must carry
+(or commented on the PR when one is already open).
+
+Why bump does not open the PR: a PR opened inside the bump binary is invisible to the
+PreToolUse guards that enforce `/pr:create`'s body contract (Why / What changed / How to
+review / Validation / Risk), so a release PR could ship with a non-contract body. bump
+stops at the push and prints the line to copy.
 
 After the PR merges, `bump finish` runs from ANY worktree of the repo (its own checkout of
 the default branch, a sibling worktree found via `git worktree list`, or checks it out):

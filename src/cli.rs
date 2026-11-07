@@ -98,7 +98,8 @@ pub struct Cli {
 pub enum Commands {
     /// Release the current repo: on ungated main this lands a version commit, pushes it,
     /// then tags and pushes the tag; on a gated repo it rides the bump on a feature branch,
-    /// pushes it, opens a PR if none is open, and pauses for `bump finish` after merge.
+    /// pushes it, prints the `/pr:create` hand-off (bump never opens a PR), and pauses for
+    /// `bump finish` after merge.
     #[command(after_help = RELEASE_HELP_TEXT.as_str())]
     Release(ReleaseArgs),
 
@@ -135,7 +136,8 @@ pub struct ReleaseArgs {
 
     /// Scott's standalone order, verbatim: the one legitimate way to ship a bump-only
     /// release (a branch/default whose diff is empty or version-only otherwise refuses).
-    /// Quoted into the PR body (gated) or printed (ungated). Re-asking for this order is
+    /// Printed as a line the `/pr:create` body must carry (gated) or printed (ungated).
+    /// Re-asking for this order is
     /// a violation -- an agent runs this flag only when Scott already gave the words in
     /// this session.
     #[arg(long, value_name = "WORDS")]
@@ -190,8 +192,9 @@ fn get_release_help() -> String {
          \x20 UNGATED: version commit -> push origin <default> -> confirm on origin -> wait \
          for green CI -> tag the verified sha -> push tag -> install\n\
          \x20 GATED:   version commit rides the feature branch -> push branch \
-         (no tags follow it) -> open a PR if none is open (title/body built from the branch \
-         and its commits) -> pause: \"merge the PR, then run: bump finish\"\n\n\
+         (no tags follow it) -> probe for an open PR; if none, print the /pr:create hand-off \
+         and the exact `Release: rides this PR (vX.Y.Z)` line its body must carry (bump never \
+         opens a PR) -> pause: \"merge the PR, then run: bump finish\"\n\n\
          STATE TABLE (condensed; see the design doc's API Design section for the full table):\n\
          \x20 ungated, on default, ahead of origin, no pending version: the UNGATED flow above\n\
          \x20 ungated, PENDING VERSION (manifest untagged, not below the latest tag): that \
@@ -204,10 +207,10 @@ fn get_release_help() -> String {
          \x20 ungated, not on default / behind / diverged / nothing to release: refuse with \
          the one exact fix (checkout, `git pull --ff-only`, `git pull --rebase`, or \
          `--standalone`)\n\
-         \x20 gated, feature branch, fresh: rides the bump, pushes, opens/ensures the PR, \
-         pauses\n\
+         \x20 gated, feature branch, fresh: rides the bump, pushes, hands the PR to \
+         /pr:create (unless one is open), pauses\n\
          \x20 gated, feature branch, already bumped (version line already in the diff): skip \
-         the re-bump, ensure branch/PR, same pause; a mismatched level refuses naming both\n\
+         the re-bump, push, same hand-off and pause; a mismatched level refuses naming both\n\
          \x20 gated, feature branch, PENDING VERSION inherited from the default branch (no \
          version line of its own): bumps AGAIN from the manifest version, names the untagged \
          one it is burning unless `bump finish` ships it first\n\
@@ -223,7 +226,8 @@ fn get_release_help() -> String {
          --standalone \"<words>\": Scott's words, verbatim -- the one legitimate way to ship \
          a release whose diff is empty or version-only (an empty diff, or a tagged/clean \
          default with nothing new). On a tagged default this cuts (or reuses) a \
-         bump-vX-Y-Z branch and runs the GATED flow with the words quoted in the PR body; \
+         bump-vX-Y-Z branch and runs the GATED flow, printing the words as a line the \
+         /pr:create body must carry; \
          on an ungated tagged default the version commit itself is the release. Re-asking \
          for this order is a violation: only pass it when Scott already gave the words in \
          this session; otherwise STOP and report.\n\n\
@@ -238,7 +242,7 @@ fn get_release_help() -> String {
          else ambient `gh auth` -- so a work-org PR/CI read never goes out under the wrong \
          account.\n\n\
          REQUIRED TOOLS:\n  {} {:<10} {}\n  {} {:<10} {}\n\n\
-         gh probes branch-protection gates, opens/lists PRs, and reads CI; `bump release` \
+         gh probes branch-protection gates, lists open PRs, and reads CI; `bump release` \
          FAILS CLOSED on an unknown gate verdict or an unreadable CI read (it pushes and \
          tags, unlike plain bump).\n\n\
          Logs are written to: {}",
@@ -315,7 +319,8 @@ fn get_tool_validation_help() -> String {
     format!(
         "RELEASE FLOWS (run `bump --gates` to see which applies to this repo):\n\
          \x20 ungated:  bump release [-m|-M]   (on the default branch: commit, push, CI wait, tag, push tag)\n\
-         \x20 gated:    bump release [-m|-M]   (on the feature branch: commit, push, open the PR)\n\
+         \x20 gated:    bump release [-m|-M]   (on the feature branch: commit, push)\n\
+         \x20           /pr:create             (open the PR; body carries the printed Release: line)\n\
          \x20           <merge the PR>\n\
          \x20           bump finish            (CI wait, tag the merged commit, push the tag)\n\n\
          REQUIRED TOOLS:\n  {} {:<10} {}\n  {} {:<10} {}\n\n\

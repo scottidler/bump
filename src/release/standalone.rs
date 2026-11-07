@@ -3,7 +3,7 @@
 //! explicit order is the exception).
 
 use super::ci::Ci;
-use super::pr::{Pr, pr_title};
+use super::pr::{Pr, pr_body_lines, pr_create_handoff};
 use super::version_diff::{ManifestChange, manifest_changes};
 use super::{
     GATED_PAUSE_MESSAGE, Installer, PendingCheck, Ports, Pusher, ReleaseOpts, ReleaseReport, ReleaseState,
@@ -105,8 +105,9 @@ pub(super) fn classify_gated_standalone(dir: &Path, opts: &ReleaseOpts, default:
 /// a prior run already cut it), then classify it like any feature branch from its actual
 /// diff and run that row. Existence alone proves nothing: an empty branch is the fresh
 /// standalone (`force` on the version commit), a version line is the branch's own bump, and
-/// work commits make it a feature branch the bump rides with. Scott's words are quoted in
-/// the PR body in every case.
+/// work commits make it a feature branch the bump rides with. Scott's words are printed as
+/// a line the `/pr:create` body must carry (or commented on an already-open PR) in every
+/// case.
 pub(super) fn execute_gated_standalone<P: Pusher, I: Installer, R: Pr, C: Ci>(
     dir: &Path,
     opts: &ReleaseOpts,
@@ -134,11 +135,13 @@ pub(super) fn execute_gated_standalone<P: Pusher, I: Installer, R: Pr, C: Ci>(
             println!("[dry-run] git checkout -b {branch} --track {upstream}");
             println!("[dry-run] commit the version bump for {target_tag} on {branch} (--force, a new commit)");
         }
-        let title = pr_title(branch, &[format!("Bump version to {target_tag}")]);
         println!("[dry-run] git push --no-follow-tags -u origin {branch}");
-        println!(
-            "[dry-run] gh pr create --head {branch} --base {default} --title \"{title}\" --body \"<subjects>\\n\\nStandalone release ordered by Scott: \\\"<words>\\\"\\n\\nRelease: rides this PR ({target_tag})\"  (only if no open PR)"
-        );
+        println!("[dry-run] gh pr list --head {branch} --state open --json number  (open-PR probe)");
+        println!("[dry-run] (only if no open PR) bump opens no PR; it prints:");
+        let lines = pr_body_lines(target_tag, opts.standalone.as_deref());
+        for line in pr_create_handoff(branch, &lines).lines() {
+            println!("[dry-run]   {line}");
+        }
         println!("[dry-run] {GATED_PAUSE_MESSAGE}");
         return Ok(ReleaseReport {
             paused: true,

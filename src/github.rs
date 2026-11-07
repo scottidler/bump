@@ -484,50 +484,6 @@ pub fn open_pr_exists(path: &Path, branch: &str) -> Result<bool> {
     Ok(exists)
 }
 
-/// The `gh` argv for opening the release PR: head, base, title and body all explicit,
-/// never `--fill` (the title and body are built by `release::pr_title` / `pr_body` so the
-/// title-slug and release-intent rules hold by construction).
-fn pr_create_args(branch: &str, base: &str, title: &str, body: &str) -> Vec<String> {
-    [
-        "pr", "create", "--head", branch, "--base", base, "--title", title, "--body", body,
-    ]
-    .into_iter()
-    .map(String::from)
-    .collect()
-}
-
-/// Open a PR from `branch` into `base` with the given title and body; returns the PR URL
-/// `gh` prints. Only ever called behind `open_pr_exists` returning false -- `gh pr
-/// create` ERRORS on an existing open PR (known gh behavior, Phase 0 addendum), so this
-/// is a race backstop, not the primary guard. Wired to `release::GhPr::create_pr` in
-/// production.
-pub fn create_pr(path: &Path, branch: &str, base: &str, title: &str, body: &str) -> Result<String> {
-    debug!(
-        "create_pr: path={} branch={} base={} title={}",
-        path.display(),
-        branch,
-        base,
-        title
-    );
-    let org = remote_slug(path).map(|s| org_of(&s).to_string()).unwrap_or_default();
-    let args = pr_create_args(branch, base, title, body);
-    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let output = gh_command(&org)
-        .args(&arg_refs)
-        .current_dir(path)
-        .output()
-        .context("Failed to run gh pr create")?;
-    if !output.status.success() {
-        eyre::bail!(
-            "gh pr create failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    debug!("create_pr: url={url}");
-    Ok(url)
-}
-
 /// The `gh` argv for commenting on the open PR for `branch` (gh resolves a branch name to
 /// its PR).
 fn pr_comment_args(branch: &str, body: &str) -> Vec<String> {
@@ -703,27 +659,6 @@ pub fn check_runs(path: &Path, sha: &str) -> Result<Option<CheckRuns>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn pr_create_args_are_explicit_never_fill() {
-        let args = pr_create_args("add-thing", "main", "feat(core): add thing", "- x\n\nRelease: rides");
-        assert_eq!(
-            args,
-            vec![
-                "pr",
-                "create",
-                "--head",
-                "add-thing",
-                "--base",
-                "main",
-                "--title",
-                "feat(core): add thing",
-                "--body",
-                "- x\n\nRelease: rides"
-            ]
-        );
-        assert!(!args.iter().any(|a| a == "--fill"));
-    }
 
     #[test]
     fn pr_comment_args_name_the_branch_and_body() {

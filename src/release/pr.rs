@@ -1,6 +1,7 @@
-//! PR construction for the gated flow: the `Pr` port, its production `GhPr`, and the pure
-//! title / body / branch-slug functions that make the PR pass the title guard and Gate D by
-//! construction.
+//! The gated flow's PR seam: the `Pr` port, its production `GhPr`, the branch-slug test,
+//! and the release-intent lines handed to `/pr:create`. bump never opens a PR: a PR opened
+//! inside this binary is invisible to the PreToolUse guards that hold `/pr:create`'s body
+//! contract, which is how tatari-tv/drata-cli#18 shipped a non-contract body.
 
 use crate::github;
 use eyre::Result;
@@ -11,26 +12,20 @@ use std::path::Path;
 /// fake `gh` without a real GitHub round-trip.
 ///
 /// `open_pr_exists` is the Phase-0 open-PR probe (`gh pr list --head <branch> --state
-/// open --json number`, NOT `gh pr view`); `create_pr` is `gh pr create` with an explicit
-/// head, base, title and body, only ever called when `open_pr_exists` returns false, and
-/// returns the new PR's URL. `comment_pr` (`gh pr comment <branch> --body <body>`) records
-/// Scott's standalone order on a PR that was already open, whose body this run never built.
+/// open --json number`, NOT `gh pr view`). `comment_pr` (`gh pr comment <branch> --body
+/// <body>`) records Scott's standalone order on a PR that was already open, whose body this
+/// run never wrote. There is deliberately no create: `/pr:create` opens every PR.
 pub trait Pr {
     fn open_pr_exists(&self, dir: &Path, branch: &str) -> Result<bool>;
-    fn create_pr(&self, dir: &Path, branch: &str, base: &str, title: &str, body: &str) -> Result<String>;
     fn comment_pr(&self, dir: &Path, branch: &str, body: &str) -> Result<()>;
 }
 
-/// Production `Pr`: the real `gh` PR operations (list-probe + explicit create).
+/// Production `Pr`: the real `gh` open-PR probe and comment.
 pub struct GhPr;
 
 impl Pr for GhPr {
     fn open_pr_exists(&self, dir: &Path, branch: &str) -> Result<bool> {
         github::open_pr_exists(dir, branch)
-    }
-
-    fn create_pr(&self, dir: &Path, branch: &str, base: &str, title: &str, body: &str) -> Result<String> {
-        github::create_pr(dir, branch, base, title, body)
     }
 
     fn comment_pr(&self, dir: &Path, branch: &str, body: &str) -> Result<()> {
@@ -56,88 +51,39 @@ pub(super) fn branch_slug(branch: &str) -> String {
     slug.trim_matches('-').to_string()
 }
 
-/// The PR title: `<type>(<scope>): <branch words>`, type/scope from the first commit
-/// subject on the branch (`chore` when it has no conventional prefix). By construction it
-/// slugifies back to the branch, which `branch-pr-title-guard.sh` enforces.
-pub fn pr_title(branch: &str, subjects: &[String]) -> String {
-    let words = restore_version_dots(&branch.replace('-', " "));
-    let (kind, scope) = subjects
-        .first()
-        .and_then(|s| parse_conventional_prefix(s))
-        .unwrap_or_else(|| ("chore".to_string(), None));
-    match scope {
-        Some(scope) => format!("{kind}({scope}): {words}"),
-        None => format!("{kind}: {words}"),
-    }
+/// The release-intent line Gate D and `/pr:create`'s contract look for in the PR body.
+pub(super) fn release_intent_line(tag: &str) -> String {
+    format!("Release: rides this PR ({tag})")
 }
 
-/// Two or more consecutive numeric words (`v0 1 6`, `1 14 0`) are a version the branch slug
-/// flattened: join them with dots (`v0.1.6`, `1.14.0`). The title still slugifies back to the
-/// branch, because the guard turns `.` into `-`.
-fn restore_version_dots(words: &str) -> String {
-    let is_number = |w: &str| {
-        let digits = w.strip_prefix('v').unwrap_or(w);
-        !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
-    };
-    let mut out: Vec<String> = Vec::new();
-    let mut prev_number = false;
-    for word in words.split(' ') {
-        let number = is_number(word);
-        match out.last_mut() {
-            Some(last) if number && prev_number => {
-                last.push('.');
-                last.push_str(word);
-            }
-            _ => out.push(word.to_string()),
-        }
-        prev_number = number;
-    }
-    out.join(" ")
-}
-
-/// `feat(scope)!: subject` -> `("feat", Some("scope"))`. `None` when the subject has no
-/// conventional prefix.
-fn parse_conventional_prefix(subject: &str) -> Option<(String, Option<String>)> {
-    let (head, _) = subject.split_once(':')?;
-    let head = head.trim_end_matches('!');
-    let (kind, scope) = match head.split_once('(') {
-        Some((k, rest)) => (k, Some(rest.strip_suffix(')')?)),
-        None => (head, None),
-    };
-    if kind.is_empty() || !kind.chars().all(|c| c.is_ascii_lowercase()) {
-        return None;
-    }
-    if let Some(s) = scope
-        && (s.is_empty()
-            || !s
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_'))
-    {
-        return None;
-    }
-    Some((kind.to_string(), scope.map(str::to_string)))
-}
-
-/// The PR body: one `- <subject>` per commit on the branch, Scott's standalone order quoted
-/// verbatim when there is one, then the release-intent line Gate D looks for as the LAST
-/// line.
-pub fn pr_body(subjects: &[String], tag: &str, standalone: Option<&str>) -> String {
-    let mut body = String::new();
-    for s in subjects {
-        body.push_str(&format!("- {s}\n"));
-    }
-    if subjects.is_empty() {
-        body.push_str("- version bump\n");
-    }
+/// The lines the PR body must carry, in order, for the PR `/pr:create` opens: Scott's
+/// standalone order quoted verbatim when there is one, then the release-intent line.
+pub(super) fn pr_body_lines(tag: &str, standalone: Option<&str>) -> Vec<String> {
+    let mut lines = Vec::new();
     if let Some(words) = standalone {
-        body.push_str(&format!("\n{}\n", standalone_order_line(words)));
+        lines.push(standalone_order_line(words));
     }
-    body.push_str(&format!("\nRelease: rides this PR ({tag})"));
-    body
+    lines.push(release_intent_line(tag));
+    lines
 }
 
-/// Scott's standalone order as it is quoted on the PR: in the body of a PR this run opens,
-/// or as a comment on one that was already open.
+/// The hand-off printed when the branch has no open PR: bump never opens one, so the next
+/// step is `/pr:create`, with the exact lines its body must carry, one per line to copy.
+pub(super) fn pr_create_handoff(branch: &str, lines: &[String]) -> String {
+    let which = if lines.len() == 1 { "this line" } else { "these lines" };
+    let mut out = format!(
+        "no open PR for {branch}; bump does not open PRs.\n\
+         next: open the PR with /pr:create; its body must carry {which} verbatim:"
+    );
+    for line in lines {
+        out.push('\n');
+        out.push_str(line);
+    }
+    out
+}
+
+/// Scott's standalone order as it is quoted on the PR: a line the `/pr:create` body must
+/// carry, or a comment on a PR that was already open.
 pub(super) fn standalone_order_line(words: &str) -> String {
     format!("Standalone release ordered by Scott: \"{words}\"")
 }

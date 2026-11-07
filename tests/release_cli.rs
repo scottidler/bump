@@ -145,3 +145,81 @@ fn release_dry_run_on_a_service_prints_the_clap_skip_and_no_verify() {
         "stdout: {stdout}"
     );
 }
+
+/// A fake `gh` on PATH that appends its argv to `log` and answers the open-PR probe
+/// (`gh pr list ...`) with `answer`. Every other call (a `gh pr create` included) exits 0
+/// printing a URL, so a regression that spawns it would succeed silently: only the argv
+/// log can catch it.
+fn fake_gh(bin: &Path, log: &Path, answer: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let script = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1 $2\" = \"pr list\" ]; then echo '{answer}'; exit 0; fi\necho https://github.com/o/r/pull/1\n",
+        log.display()
+    );
+    let gh = bin.join("gh");
+    fs::write(&gh, script).unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// A released `v0.1.0` on `main` (annotated tag on origin) and a feature branch
+/// `add-thing` carrying one work commit: the gated feature-branch release row.
+fn setup_gated_feature_branch(origin_dir: &Path, work: &Path) {
+    setup_ungated_repo(origin_dir, work);
+    git(work, &["tag", "-a", "v0.1.0", "-m", "v0.1.0"]);
+    git(work, &["push", "-q", "origin", "v0.1.0"]);
+    git(work, &["checkout", "-q", "-b", "add-thing"]);
+    fs::write(work.join("thing.txt"), "thing").unwrap();
+    git(work, &["add", "-A"]);
+    git(work, &["commit", "-qm", "feat: add thing"]);
+}
+
+/// The real binary, gated, on a feature branch with no open PR: it pushes the branch, runs
+/// ONLY the open-PR probe through `gh`, never `gh pr create`, and prints the `/pr:create`
+/// hand-off with the release-intent line on a line of its own. A PR opened inside bump is
+/// invisible to the PreToolUse guards on `/pr:create`'s body contract
+/// (tatari-tv/drata-cli#18), so this is pinned at the process boundary, not just the port.
+#[test]
+fn gated_release_never_spawns_gh_pr_create() {
+    let origin = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let bin = TempDir::new().unwrap();
+    setup_gated_feature_branch(origin.path(), work.path());
+    let log = bin.path().join("gh.log");
+    fake_gh(bin.path(), &log, "[]");
+
+    let path = format!("{}:{}", bin.path().display(), std::env::var("PATH").unwrap());
+    let output = Command::new(env!("CARGO_BIN_EXE_bump"))
+        .args(["release"])
+        .current_dir(work.path())
+        .env("PATH", path)
+        .env("BUMP_GATES_PROBE", "gated:pull_request")
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "gated bump release must pause with exit 0; stdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let calls = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !calls.lines().any(|c| c.starts_with("pr create")),
+        "bump must never run gh pr create; gh calls:\n{calls}"
+    );
+    assert!(
+        calls.lines().any(|c| c.starts_with("pr list --head add-thing")),
+        "the open-PR probe ran; gh calls:\n{calls}"
+    );
+    assert!(stdout.contains("next: open the PR with /pr:create"), "stdout: {stdout}");
+    assert!(
+        stdout.lines().any(|l| l == "Release: rides this PR (v0.1.1)"),
+        "the release-intent line is printed bare, ready to copy; stdout: {stdout}"
+    );
+    let pushed = Command::new("git")
+        .args(["rev-parse", "--verify", "-q", "refs/heads/add-thing"])
+        .current_dir(origin.path())
+        .output()
+        .unwrap();
+    assert!(pushed.status.success(), "the feature branch was pushed to origin");
+}

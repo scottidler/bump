@@ -631,28 +631,6 @@ pub fn pull_ff_only(path: &Path, branch: &str) -> Result<()> {
     Ok(())
 }
 
-/// Commit subjects on `base..HEAD`, oldest first (`git log --reverse --format=%s`). Used
-/// to derive a gated PR's title (the first subject) and body (one `- <subject>` line
-/// each).
-pub fn commit_subjects(path: &Path, base: &str) -> Result<Vec<String>> {
-    debug!("commit_subjects: path={} base={}", path.display(), base);
-    let range = format!("{base}..HEAD");
-    let output = Command::new("git")
-        .args(["log", "--reverse", "--format=%s", &range])
-        .current_dir(path)
-        .output()
-        .context("Failed to run git log")?;
-    if !output.status.success() {
-        bail!("git log {} failed: {}", range, String::from_utf8_lossy(&output.stderr));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect())
-}
-
 /// Does a LOCAL branch named `branch` exist (`git rev-parse --verify --quiet refs/heads/<branch>`)?
 pub fn local_branch_exists(path: &Path, branch: &str) -> Result<bool> {
     debug!("local_branch_exists: path={} branch={}", path.display(), branch);
@@ -958,31 +936,6 @@ mod tests {
         assert!(
             !is_head_pushed(work.path()).unwrap(),
             "a local commit ahead of origin, with no upstream, must read as not pushed"
-        );
-    }
-
-    #[test]
-    fn commit_subjects_lists_oldest_first() {
-        let (_origin, work) = bare_remote_and_clone();
-        let base = head_sha(work.path()).unwrap();
-
-        std::fs::write(work.path().join("a.txt"), "a").unwrap();
-        git_in(work.path(), &["add", "-A"]);
-        git_in(work.path(), &["commit", "-m", "first commit"]);
-        std::fs::write(work.path().join("b.txt"), "b").unwrap();
-        git_in(work.path(), &["add", "-A"]);
-        git_in(work.path(), &["commit", "-m", "second commit"]);
-
-        let subjects = commit_subjects(work.path(), &base).unwrap();
-        assert_eq!(subjects, vec!["first commit", "second commit"]);
-    }
-
-    #[test]
-    fn commit_subjects_errors_on_unknown_base() {
-        let (_origin, work) = bare_remote_and_clone();
-        assert!(
-            commit_subjects(work.path(), "not-a-real-ref").is_err(),
-            "an unresolvable base must error, not return an empty list"
         );
     }
 

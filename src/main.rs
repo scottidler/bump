@@ -304,7 +304,8 @@ fn gated_refusal_message(label: &str, rules: &[String]) -> String {
         "{label} is gated ({}).\n\
          Tagging here would orphan the tag (squash-merge rewrites the SHA).\n\n\
          Gated flow:\n  \
-         bump release [-m|-M]       # on the feature branch: version commit, push, PR\n  \
+         bump release [-m|-M]       # on the feature branch: version commit, push\n  \
+         /pr:create                 # open the PR; body carries the printed Release: line\n  \
          <merge the PR>\n  \
          bump finish                # CI wait, tag the merged commit, push the tag",
         rules.join(", ")
@@ -333,7 +334,8 @@ fn report_gates(dir: &Path) -> Result<()> {
             println!("Gates:  {} (gated)", rules.join(", "));
             println!();
             println!("Gated flow:");
-            println!("  bump release [-m|-M]       # on the feature branch: version commit, push, PR");
+            println!("  bump release [-m|-M]       # on the feature branch: version commit, push");
+            println!("  /pr:create                 # open the PR; body carries the printed Release: line");
             println!("  <merge the PR>");
             println!("  bump finish                # CI wait on the merged {branch}, tag, push tag");
         }
@@ -781,9 +783,11 @@ pub(crate) fn process_directory(dir: &Path, cli: &Cli, bump_type: BumpType) -> R
         let branch = git::current_branch(dir).unwrap_or_else(|_| "<branch>".to_string());
         println!("Run: git push origin {branch} && git push origin {new_tag}");
     } else if !cli.never_amend {
-        // The release verb drives its own push/PR/tag, so this hint is only for a
-        // hand-run `bump --no-tag`.
-        println!("Next: `bump release` pushes, opens the PR and tags; after a gated merge, `bump finish`");
+        // The release verb drives its own push/tag, so this hint is only for a hand-run
+        // `bump --no-tag`.
+        println!(
+            "Next: `bump release` pushes and tags; gated, open the PR with /pr:create, then after the merge `bump finish`"
+        );
     }
 
     if !dir_name.is_empty() && dir != env::current_dir().unwrap_or_default() {

@@ -5,6 +5,8 @@
 **Status:** Implemented
 **Review Passes Completed:** 5/5
 
+> **Superseded in part (2026-11-07):** `bump release` no longer opens the PR. A PR opened inside the bump binary is invisible to the PreToolUse guards that enforce `/pr:create`'s body contract, which is how tatari-tv/drata-cli#18 (https://github.com/tatari-tv/drata-cli/pull/18) shipped a non-contract body. The gated flow now stops after the push and the open-PR probe, and when no PR is open it prints the `/pr:create` hand-off with the exact `Release: rides this PR (vX.Y.Z)` line (plus Scott's quoted standalone words, when given) for the body. `create_pr`, `pr_title` and `pr_body` are gone. Everything below about bump building the title/body and running `gh pr create` is history.
+
 ## Summary
 
 Every release, gated or ungated, becomes one command the agent runs bare: `bump release`, then `bump finish` after a gated merge. The verb opens the PR itself, waits for green CI before any tag exists, takes Scott's standalone order as a flag instead of an env prefix, and finishes from any worktree. The bash driver `~/.claude/bin/release`, the `pr-open` -> `gh pr create` -> `release --pr` hand-back, and the `BUMP_ORDERED_BY_SCOTT=1` door are retired; the hook, skills, agent and rules shrink to point at the two verbs.

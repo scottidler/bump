@@ -77,16 +77,12 @@ impl Pusher for RecordingPusher {
     }
 }
 
-/// Records the OPEN-PR probe + create calls, and models `gh`'s own behavior: once
-/// `create_pr` runs, an open PR EXISTS, so a subsequent `open_pr_exists` returns true.
-/// This is exactly what makes "create exactly once across two runs" assertable with the
-/// SAME instance across both runs -- no real `gh`.
+/// Records every PR-seam call in order (`list:<branch>`, `comment:<branch>`), so a test
+/// can assert the gated flow touched nothing but the open-PR probe (and the standalone
+/// comment). `exists` is the probe's answer; bump never opens a PR, so nothing flips it.
 struct RecordingPr {
-    exists: RefCell<bool>,
-    list_calls: RefCell<u32>,
-    create_calls: RefCell<u32>,
-    /// `(branch, base, title, body)` of every create call.
-    created: RefCell<Vec<(String, String, String, String)>>,
+    exists: bool,
+    calls: RefCell<Vec<String>>,
     /// `(branch, body)` of every comment call.
     comments: RefCell<Vec<(String, String)>>,
 }
@@ -94,48 +90,33 @@ struct RecordingPr {
 impl RecordingPr {
     fn new() -> Self {
         Self {
-            exists: RefCell::new(false),
-            list_calls: RefCell::new(0),
-            create_calls: RefCell::new(0),
-            created: RefCell::new(Vec::new()),
+            exists: false,
+            calls: RefCell::new(Vec::new()),
             comments: RefCell::new(Vec::new()),
         }
     }
-    /// A double whose branch already has an open PR (a prior run opened it).
+    /// A double whose branch already has an open PR.
     fn already_open() -> Self {
-        let pr = Self::new();
-        *pr.exists.borrow_mut() = true;
-        pr
+        Self {
+            exists: true,
+            ..Self::new()
+        }
+    }
+    fn calls(&self) -> Vec<String> {
+        self.calls.borrow().clone()
     }
     fn comments(&self) -> Vec<(String, String)> {
         self.comments.borrow().clone()
     }
-    fn created(&self) -> Vec<(String, String, String, String)> {
-        self.created.borrow().clone()
-    }
-    fn create_calls(&self) -> u32 {
-        *self.create_calls.borrow()
-    }
-    fn list_calls(&self) -> u32 {
-        *self.list_calls.borrow()
-    }
 }
 
 impl Pr for RecordingPr {
-    fn open_pr_exists(&self, _dir: &Path, _branch: &str) -> Result<bool> {
-        *self.list_calls.borrow_mut() += 1;
-        Ok(*self.exists.borrow())
-    }
-    fn create_pr(&self, _dir: &Path, branch: &str, base: &str, title: &str, body: &str) -> Result<String> {
-        *self.create_calls.borrow_mut() += 1;
-        self.created
-            .borrow_mut()
-            .push((branch.into(), base.into(), title.into(), body.into()));
-        // An open PR now exists (models gh): the next probe returns true.
-        *self.exists.borrow_mut() = true;
-        Ok(format!("https://github.com/o/r/pull/{}", self.create_calls.borrow()))
+    fn open_pr_exists(&self, _dir: &Path, branch: &str) -> Result<bool> {
+        self.calls.borrow_mut().push(format!("list:{branch}"));
+        Ok(self.exists)
     }
     fn comment_pr(&self, _dir: &Path, branch: &str, body: &str) -> Result<()> {
+        self.calls.borrow_mut().push(format!("comment:{branch}"));
         self.comments.borrow_mut().push((branch.into(), body.into()));
         Ok(())
     }
