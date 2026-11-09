@@ -35,7 +35,7 @@ pub enum Gate {
 enum ClassicResult {
     /// Protection object exists (HTTP 200) -> contributes a blocking rule.
     Gated,
-    /// No protection (HTTP 404).
+    /// No protection (HTTP 404, or the free-plan 403 under which protection cannot exist).
     Clear,
     /// Probe failed for some other reason.
     Error(String),
@@ -245,16 +245,30 @@ fn probe_classic(org: &str, slug: &str, branch: &str) -> ClassicResult {
     let endpoint = format!("repos/{slug}/branches/{branch}/protection");
     match run_gh(org, &["api", &endpoint, "--silent"]) {
         Ok(output) if output.status.success() => ClassicResult::Gated,
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if stderr.contains("HTTP 404") || stderr.contains("Not Found") {
-                ClassicResult::Clear
-            } else {
-                ClassicResult::Error(stderr.trim().to_string())
-            }
-        }
+        Ok(output) => classify_classic_failure(&String::from_utf8_lossy(&output.stderr)),
         Err(e) => ClassicResult::Error(e.to_string()),
     }
+}
+
+/// Classify the stderr of a failed classic-protection probe: provably absent is
+/// `Clear`, anything else stays an opaque `Error` so `detect` fails closed.
+fn classify_classic_failure(stderr: &str) -> ClassicResult {
+    if stderr.contains("HTTP 404") || stderr.contains("Not Found") || is_free_plan_refusal(stderr) {
+        ClassicResult::Clear
+    } else {
+        ClassicResult::Error(stderr.trim().to_string())
+    }
+}
+
+/// GitHub's free-plan refusal. On a private repo owned by a free-plan user both the
+/// classic-protection and the rulesets endpoints answer HTTP 403 with this message;
+/// neither layer can exist on such a repo at all, so the verdict is "clear", not
+/// "unknown". The status and the phrase are matched together: a bare 403 (missing
+/// token scope, "Resource not accessible by integration") still reads as Unknown.
+const FREE_PLAN_REFUSAL: &str = "Upgrade to GitHub Pro or make this repository public";
+
+fn is_free_plan_refusal(stderr: &str) -> bool {
+    stderr.contains("HTTP 403") && stderr.contains(FREE_PLAN_REFUSAL)
 }
 
 /// Probe the rulesets layer, returning the blocking rule types (with the
@@ -267,8 +281,18 @@ fn probe_rulesets(org: &str, slug: &str, branch: &str) -> Result<Vec<String>, St
             let raw = String::from_utf8_lossy(&output.stdout);
             Ok(filter_rule_types(&raw))
         }
-        Ok(output) => Err(String::from_utf8_lossy(&output.stderr).trim().to_string()),
+        Ok(output) => classify_rulesets_failure(&String::from_utf8_lossy(&output.stderr)),
         Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Classify the stderr of a failed rulesets probe: the free-plan refusal means no
+/// ruleset can exist (empty list); anything else is an opaque error.
+fn classify_rulesets_failure(stderr: &str) -> Result<Vec<String>, String> {
+    if is_free_plan_refusal(stderr) {
+        Ok(Vec::new())
+    } else {
+        Err(stderr.trim().to_string())
     }
 }
 
@@ -818,6 +842,48 @@ mod tests {
     fn filter_rule_types_empty_input() {
         assert!(filter_rule_types("").is_empty());
         assert!(filter_rule_types("\n\n").is_empty());
+    }
+
+    const FREE_PLAN_403: &str =
+        "gh: Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 403)";
+    const SCOPE_403: &str = "gh: Resource not accessible by integration (HTTP 403)";
+
+    #[test]
+    fn classic_free_plan_403_is_clear() {
+        assert!(matches!(classify_classic_failure(FREE_PLAN_403), ClassicResult::Clear));
+    }
+
+    #[test]
+    fn classic_plain_403_is_error() {
+        match classify_classic_failure(SCOPE_403) {
+            ClassicResult::Error(e) => assert!(e.contains("HTTP 403")),
+            _ => panic!("a 403 without the free-plan message must stay an error"),
+        }
+    }
+
+    #[test]
+    fn classic_404_is_clear() {
+        assert!(matches!(
+            classify_classic_failure("gh: Branch not protected (HTTP 404)"),
+            ClassicResult::Clear
+        ));
+    }
+
+    #[test]
+    fn classic_free_plan_message_without_403_is_error() {
+        let msg = "gh: Upgrade to GitHub Pro or make this repository public to enable this feature.";
+        assert!(matches!(classify_classic_failure(msg), ClassicResult::Error(_)));
+    }
+
+    #[test]
+    fn rulesets_free_plan_403_is_no_rules() {
+        assert_eq!(classify_rulesets_failure(FREE_PLAN_403), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn rulesets_plain_403_is_error() {
+        let err = classify_rulesets_failure(SCOPE_403).unwrap_err();
+        assert!(err.contains("HTTP 403"));
     }
 
     #[test]
