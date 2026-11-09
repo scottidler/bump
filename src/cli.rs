@@ -19,7 +19,7 @@ static FINISH_HELP_TEXT: LazyLock<String> = LazyLock::new(get_finish_help);
 #[command(
     name = "bump",
     about = "bump semantic versions, commit, and tag (Rust, Python, or any git repo)",
-    version = env!("GIT_DESCRIBE"),
+    version = env!("BUILD_VERSION"),
     after_help = HELP_TEXT.as_str()
 )]
 pub struct Cli {
