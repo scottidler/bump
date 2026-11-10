@@ -12,6 +12,55 @@ pub fn is_git_repo(path: &Path) -> bool {
         .is_ok_and(|output| output.status.success())
 }
 
+/// Where a directory sits in its work tree: git's top-level and the directory's path
+/// below it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoRoot {
+    /// `git rev-parse --show-toplevel`: absolute, symlinks resolved.
+    pub root: PathBuf,
+    /// `git rev-parse --show-prefix` with its trailing `/` dropped; `""` at the root.
+    /// The empty prefix, not a path comparison, decides "already at the root": a path
+    /// comparison breaks on a symlinked spelling of the same directory.
+    pub prefix: String,
+}
+
+/// Resolve `dir` to its work tree's root. Err outside any work tree (no repo, a bare
+/// repo, inside `.git`), and when `dir` does not exist or git cannot run.
+pub fn repo_root(dir: &Path) -> Result<RepoRoot> {
+    debug!("repo_root: dir={}", dir.display());
+    let output = Command::new("git")
+        .args(["rev-parse", "--show-toplevel", "--show-prefix"])
+        .current_dir(dir)
+        .output()
+        .with_context(|| format!("Failed to run git rev-parse in {}", dir.display()))?;
+
+    if !output.status.success() {
+        bail!(
+            "not inside a git work tree: {}: {}",
+            dir.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut lines = stdout.lines();
+    let root = lines
+        .next()
+        .filter(|l| !l.is_empty())
+        .ok_or_else(|| eyre::eyre!("git rev-parse --show-toplevel printed nothing in {}", dir.display()))?;
+    let prefix = lines.next().unwrap_or("").trim_end_matches('/').to_string();
+    let resolved = RepoRoot {
+        root: PathBuf::from(root),
+        prefix,
+    };
+    debug!(
+        "repo_root: root={} prefix={:?}",
+        resolved.root.display(),
+        resolved.prefix
+    );
+    Ok(resolved)
+}
+
 /// Get the latest semver tag (tags starting with 'v')
 pub fn get_latest_tag(path: &Path) -> Result<Option<String>> {
     let output = Command::new("git")
@@ -1162,6 +1211,41 @@ mod tests {
     fn test_is_git_repo_not_repo() {
         // /tmp is unlikely to be a git repo
         assert!(!is_git_repo(Path::new("/tmp")));
+    }
+
+    #[test]
+    fn repo_root_at_the_root_has_an_empty_prefix() {
+        let work = TempDir::new().unwrap();
+        git_in(work.path(), &["init", "-q"]);
+        let rr = repo_root(work.path()).unwrap();
+        assert_eq!(rr.root, work.path().canonicalize().unwrap());
+        assert_eq!(rr.prefix, "");
+    }
+
+    #[test]
+    fn repo_root_in_a_subdirectory_names_the_prefix_without_a_trailing_slash() {
+        let work = TempDir::new().unwrap();
+        git_in(work.path(), &["init", "-q"]);
+        let deep = work.path().join("a/b");
+        std::fs::create_dir_all(&deep).unwrap();
+        let rr = repo_root(&deep).unwrap();
+        assert_eq!(rr.root, work.path().canonicalize().unwrap());
+        assert_eq!(rr.prefix, "a/b");
+    }
+
+    #[test]
+    fn repo_root_errs_outside_a_work_tree() {
+        let plain = TempDir::new().unwrap();
+        assert!(repo_root(plain.path()).is_err(), "no repo");
+        assert!(repo_root(&plain.path().join("missing")).is_err(), "no such dir");
+
+        let work = TempDir::new().unwrap();
+        git_in(work.path(), &["init", "-q"]);
+        assert!(repo_root(&work.path().join(".git")).is_err(), "inside .git");
+
+        let bare = TempDir::new().unwrap();
+        git_in(bare.path(), &["init", "-q", "--bare"]);
+        assert!(repo_root(bare.path()).is_err(), "bare repo");
     }
 
     #[test]

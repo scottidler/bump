@@ -31,3 +31,24 @@
 - Cherry-pick plus amend vs. a rebase: the orchestrator asked for no branch ref to move, and this yields one commit.
 ### Open questions
 - Deleting the merged `release-verbs-take-dir` branch (local and origin) is in the doc's Rollout Plan but was not done: this run was told not to touch branch refs. The parent should do it after the phases land.
+
+## Phase 4: Repo-root resolver (bug 1)
+### Design decisions
+- `git::repo_root` (`src/git.rs`) runs `git rev-parse --show-toplevel --show-prefix` and drops the prefix's trailing `/`. The empty prefix decides "already at the root", per the Architecture section.
+- One resolver, `resolve_run_dir` (`src/main.rs`), returns data (`RunDir { path, key, notice }`). The plain-bump loop and `resolve_verb_dir` print the notice. Every entry point goes through one of those two callers: plain bump, `--gates`, `--tag-only`, `release`, `finish`, and a verb's `[DIR]`.
+- Outside a work tree (no repo, a bare repo, inside `.git`, a missing dir), `resolve_run_dir` passes the argument through unchanged, so each entry point's existing "not a git repository" error fires word for word. The doc requires this ("a non-repo dir keeps today's error").
+- At the root (empty prefix), bump runs on the argument as given, not on git's resolved top-level. A symlinked spelling of a root keeps that spelling in every message and `[name] Done` line.
+- Below the root, `spelled_root` strips the prefix's components off the argument and uses that as the root when it canonicalizes to git's top-level. Otherwise it uses git's top-level, for example when the argument is itself a symlink into the tree or carries `..`. This keeps a symlinked TMPDIR's spelling in the notice.
+- Dedup key: git's canonical top-level. `bump <root> <root>/src` and `bump <link-to-root> <root>` each run once. A non-repo argument keys on itself.
+- The plain-bump loop resolves every argument first, then runs them. Notices go out before any `[name]` header. A refusal is held and reported in its slot as a per-directory error, so the batch still exits 1 and its siblings still run. `runs.len()` (after dedup) drives the header and the batch summary.
+- The generic-root refusal and the "(ignoring ...)" suffix both use `nearest_nested_manifest`. It walks from `root/prefix` up to, but not including, the root, and returns the first `lang::detect` hit as a path relative to the root. The refusal names that relative path (`plugin/Cargo.toml`). The suffix splits it into file and directory (`(ignoring Cargo.toml in tools)`).
+### Deviations
+- The Phase 4 binary tests live in a new `tests/subdir.rs`, not in `tests/release_cli.rs` (Testing Strategy). Three of them cover entry points that are not `release` (plain bump, `--gates`, `--tag-only`), and the fixture helpers differ. Same coverage, clearer home.
+- The doc says "<dir> or any directory between it and the root has one" for the refusal but only "<dir> has its own too" for the suffix. Both now use the same walk, including intermediate directories, so a manifest between the argument and the root is never ignored silently.
+- The refusal reaches the operator through the normal error path, so it prints as `Error: bump: <dir> is ...`. The doc's text follows `Error: ` word for word.
+### Tradeoffs
+- Dropping a duplicate argument without a notice (it goes to the `info!` log) vs. printing the notice for each duplicate. The doc says "once per resolved directory", and the kept run already prints the notice when there is one.
+- Passing a non-repo through vs. failing in the resolver. Passing through keeps each entry point's existing error text and the existing git-missing path, which the doc defers as unchanged.
+- Rewrote the three eba0468 `resolve_verb_dir` tests against real repos (round 1 Q3). `test_finish_verb_honors_dir_positional_and_walks_up_from_a_subdir` now also proves the walk-up, and `test_verb_dir_defaults_to_cwd_and_absolutizes_relative` resolves the relative `src` against this repo's root, which is the cwd under `cargo test`.
+### Open questions
+- None.

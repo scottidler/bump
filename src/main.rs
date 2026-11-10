@@ -820,13 +820,39 @@ fn main() -> Result<()> {
         cli.directories.clone()
     };
 
+    // Resolve every argument to its repo root FIRST (notices before any other output),
+    // then dedup by root: two arguments naming one repo run once, first wins, order kept.
+    // A refusal is held and reported in its slot, like any per-directory error.
+    let mut keys: Vec<PathBuf> = Vec::new();
+    let mut runs: Vec<(PathBuf, Option<eyre::Report>)> = Vec::new();
+    for dir in &directories {
+        let given = if dir.is_absolute() { dir.clone() } else { env::current_dir()?.join(dir) };
+        match resolve_run_dir(&given) {
+            Ok(run) => {
+                if keys.contains(&run.key) {
+                    info!(
+                        "{} resolves to {}, already in this run; skipping",
+                        given.display(),
+                        run.key.display()
+                    );
+                    continue;
+                }
+                if let Some(notice) = &run.notice {
+                    eprintln!("{notice}");
+                }
+                keys.push(run.key);
+                runs.push((run.path, None));
+            }
+            Err(refusal) => runs.push((given, Some(refusal))),
+        }
+    }
+
+    let multi = runs.len() > 1;
     let mut successes = 0;
     let mut failures = 0;
 
-    for dir in &directories {
-        let dir = if dir.is_absolute() { dir.clone() } else { env::current_dir()?.join(dir) };
-
-        if directories.len() > 1 {
+    for (dir, refusal) in runs {
+        if multi {
             let dir_name = dir
                 .file_name()
                 .map(|s| s.to_string_lossy().to_string())
@@ -834,7 +860,11 @@ fn main() -> Result<()> {
             println!("\n[{}]", dir_name);
         }
 
-        match process_directory(&dir, &cli, bump_type) {
+        let result = match refusal {
+            None => process_directory(&dir, &cli, bump_type),
+            Some(refusal) => Err(refusal),
+        };
+        match result {
             Ok(()) => successes += 1,
             Err(e) => {
                 eprintln!("Error: {:#}", e);
@@ -843,7 +873,7 @@ fn main() -> Result<()> {
         }
     }
 
-    if directories.len() > 1 {
+    if multi {
         println!();
         if failures == 0 {
             println!("All done! Don't forget to push your changes.");
@@ -873,16 +903,133 @@ fn dispatch_command(command: &cli::Commands) -> Result<()> {
 }
 
 /// The repo a release verb operates on: the explicit `[DIR]` (made absolute against the
-/// cwd), else the cwd. A pure path decision; whether it is a git repo is the verb's call.
+/// cwd), else the cwd, walked up to its repo root by `resolve_run_dir`. Prints the
+/// subdirectory notice to stderr; the generic-root refusal is the Err.
 fn resolve_verb_dir(dir: Option<&Path>) -> Result<PathBuf> {
     let cwd = env::current_dir().context("Failed to get current directory")?;
-    let resolved = match dir {
+    let given = match dir {
         Some(d) if d.is_absolute() => d.to_path_buf(),
         Some(d) => cwd.join(d),
         None => cwd,
     };
-    debug!("resolve_verb_dir: explicit={:?} resolved={}", dir, resolved.display());
-    Ok(resolved)
+    let run = resolve_run_dir(&given)?;
+    if let Some(notice) = &run.notice {
+        eprintln!("{notice}");
+    }
+    debug!(
+        "resolve_verb_dir: explicit={:?} given={} resolved={}",
+        dir,
+        given.display(),
+        run.path.display()
+    );
+    Ok(run.path)
+}
+
+/// Where bump runs for one directory argument.
+#[derive(Debug, PartialEq, Eq)]
+struct RunDir {
+    /// The directory bump acts on: the repo root when the argument is below it, else the
+    /// argument unchanged (already the root, or not in a work tree at all, so the entry
+    /// point's own "not a git repository" error fires exactly as before).
+    path: PathBuf,
+    /// Dedup key: git's top-level (symlinks resolved), or the argument outside a work tree.
+    key: PathBuf,
+    /// The subdirectory notice, `Some` only when the argument was below the root.
+    notice: Option<String>,
+}
+
+/// Resolve a directory argument to the repo root bump runs on, like git, cargo and otto
+/// walk up. Every entry point calls this before anything else.
+///
+/// Refuses (Err) when the root has no version manifest but the argument, or a directory
+/// between it and the root, has one: walking up there would tag a version no root file
+/// holds. When both have one, it walks up and the notice names the ignored manifest.
+fn resolve_run_dir(dir: &Path) -> Result<RunDir> {
+    debug!("resolve_run_dir: dir={}", dir.display());
+    let rr = match git::repo_root(dir) {
+        Ok(rr) => rr,
+        Err(e) => {
+            debug!("resolve_run_dir: not resolving {}: {e:#}", dir.display());
+            return Ok(RunDir {
+                path: dir.to_path_buf(),
+                key: dir.to_path_buf(),
+                notice: None,
+            });
+        }
+    };
+    if rr.prefix.is_empty() {
+        debug!("resolve_run_dir: {} is the repo root", dir.display());
+        return Ok(RunDir {
+            path: dir.to_path_buf(),
+            key: rr.root,
+            notice: None,
+        });
+    }
+
+    let root = spelled_root(dir, &rr);
+    let prefix = &rr.prefix;
+    let nested = nearest_nested_manifest(&root, prefix)?;
+    let root_has_manifest = !lang::detect(&root)?.is_empty();
+    let base = format!("bump: {} is {prefix} inside {}", dir.display(), root.display());
+    let notice = match (root_has_manifest, nested) {
+        (false, Some(manifest)) => bail!(
+            "{base}, which has no version manifest, but {} does;\n\
+             bump runs on a repo root and will not tag a version no root file holds",
+            manifest.display()
+        ),
+        (true, Some(manifest)) => {
+            let file = manifest
+                .file_name()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| manifest.clone());
+            let holder = manifest.parent().map(Path::to_path_buf).unwrap_or_default();
+            format!(
+                "{base}; running on {} (ignoring {} in {})",
+                root.display(),
+                file.display(),
+                holder.display()
+            )
+        }
+        (_, None) => format!("{base}; running on {}", root.display()),
+    };
+    debug!("resolve_run_dir: {} -> {}", dir.display(), root.display());
+    Ok(RunDir {
+        path: root,
+        key: rr.root,
+        notice: Some(notice),
+    })
+}
+
+/// The root as the caller spelled it: `dir` with `prefix`'s components stripped, when
+/// that names the same directory git reported (keeps a symlinked TMPDIR's spelling in
+/// every message), else git's resolved top-level (`dir` was itself a symlink into the
+/// tree, or carried `..`).
+fn spelled_root(dir: &Path, rr: &git::RepoRoot) -> PathBuf {
+    let depth = Path::new(&rr.prefix).components().count();
+    let candidate = dir.ancestors().nth(depth);
+    match candidate {
+        Some(c) if c.canonicalize().ok().as_deref() == Some(rr.root.as_path()) => c.to_path_buf(),
+        _ => rr.root.clone(),
+    }
+}
+
+/// The version manifest nearest the argument, walking from `root/prefix` up to (not
+/// including) `root`, as a path relative to `root` (e.g. `plugin/Cargo.toml`). `None`
+/// when no directory on the way holds one.
+fn nearest_nested_manifest(root: &Path, prefix: &str) -> Result<Option<PathBuf>> {
+    let mut here = PathBuf::from(prefix);
+    while !here.as_os_str().is_empty() {
+        if let Some(m) = lang::detect(&root.join(&here))?.first() {
+            let path = m.path();
+            let rel = path.strip_prefix(root).map(Path::to_path_buf).unwrap_or(path);
+            debug!("nearest_nested_manifest: found {}", rel.display());
+            return Ok(Some(rel));
+        }
+        if !here.pop() {
+            break;
+        }
+    }
+    Ok(None)
 }
 
 /// The shared `--install`/`--no-install` -> `InstallChoice` mapping for both verbs.
@@ -2383,35 +2530,165 @@ name = "test-pkg"
     }
 
     // =========================================================================
+    /// A git repo at `<tmp>/repo` with an empty `src/`. No commits: git resolves the work
+    /// tree from the directory alone.
+    fn repo_with_src(tmp: &Path) -> PathBuf {
+        let repo = tmp.join("repo");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        setup_git_repo(&repo);
+        repo
+    }
+
     #[test]
     fn test_release_verb_honors_dir_positional() {
-        let cli = Cli::try_parse_from(["bump", "release", "-n", "/some/repo"]).unwrap();
+        let tmp = TempDir::new().unwrap();
+        let repo = repo_with_src(tmp.path());
+        let cli = Cli::try_parse_from(["bump", "release", "-n", repo.to_str().unwrap()]).unwrap();
         let Some(cli::Commands::Release(args)) = cli.command else {
             panic!("not release")
         };
-        assert_eq!(
-            resolve_verb_dir(args.dir.as_deref()).unwrap(),
-            PathBuf::from("/some/repo")
-        );
+        assert_eq!(resolve_verb_dir(args.dir.as_deref()).unwrap(), repo);
     }
 
     #[test]
-    fn test_finish_verb_honors_dir_positional() {
-        let cli = Cli::try_parse_from(["bump", "finish", "-n", "/some/repo"]).unwrap();
+    fn test_finish_verb_honors_dir_positional_and_walks_up_from_a_subdir() {
+        let tmp = TempDir::new().unwrap();
+        let repo = repo_with_src(tmp.path());
+        let src = repo.join("src");
+        let cli = Cli::try_parse_from(["bump", "finish", "-n", src.to_str().unwrap()]).unwrap();
         let Some(cli::Commands::Finish(args)) = cli.command else {
             panic!("not finish")
         };
-        assert_eq!(
-            resolve_verb_dir(args.dir.as_deref()).unwrap(),
-            PathBuf::from("/some/repo")
-        );
+        assert_eq!(resolve_verb_dir(args.dir.as_deref()).unwrap(), repo);
     }
 
+    /// `cargo test` runs unit tests from the package root, which is this repo's root.
     #[test]
     fn test_verb_dir_defaults_to_cwd_and_absolutizes_relative() {
         let cwd = env::current_dir().unwrap();
         assert_eq!(resolve_verb_dir(None).unwrap(), cwd);
-        assert_eq!(resolve_verb_dir(Some(Path::new("rel"))).unwrap(), cwd.join("rel"));
+        assert_eq!(
+            resolve_verb_dir(Some(Path::new("src"))).unwrap(),
+            cwd,
+            "a relative subdir is made absolute against the cwd, then walked up"
+        );
+    }
+
+    #[test]
+    fn resolve_run_dir_at_the_root_is_unchanged_with_no_notice() {
+        let tmp = TempDir::new().unwrap();
+        let repo = repo_with_src(tmp.path());
+        let run = resolve_run_dir(&repo).unwrap();
+        assert_eq!(run.path, repo);
+        assert_eq!(run.key, repo.canonicalize().unwrap());
+        assert_eq!(run.notice, None);
+    }
+
+    #[test]
+    fn resolve_run_dir_walks_a_subdir_up_with_the_notice() {
+        let tmp = TempDir::new().unwrap();
+        let repo = repo_with_src(tmp.path());
+        let deep = repo.join("src/a");
+        fs::create_dir_all(&deep).unwrap();
+        let run = resolve_run_dir(&deep).unwrap();
+        assert_eq!(run.path, repo, "the root keeps the caller's spelling");
+        assert_eq!(run.key, repo.canonicalize().unwrap());
+        assert_eq!(
+            run.notice.unwrap(),
+            format!(
+                "bump: {} is src/a inside {}; running on {}",
+                deep.display(),
+                repo.display(),
+                repo.display()
+            )
+        );
+    }
+
+    #[test]
+    fn resolve_run_dir_names_a_manifest_it_ignores() {
+        let tmp = TempDir::new().unwrap();
+        let repo = repo_with_src(tmp.path());
+        create_cargo_toml(&repo, Some("1.0.0"));
+        create_cargo_toml(&repo.join("src"), Some("2.0.0"));
+        let deep = repo.join("src/a");
+        fs::create_dir_all(&deep).unwrap();
+        let notice = resolve_run_dir(&deep).unwrap().notice.unwrap();
+        assert!(
+            notice.ends_with(&format!("; running on {} (ignoring Cargo.toml in src)", repo.display())),
+            "{notice}"
+        );
+    }
+
+    #[test]
+    fn resolve_run_dir_refuses_a_generic_root_under_a_nested_manifest() {
+        let tmp = TempDir::new().unwrap();
+        let repo = repo_with_src(tmp.path());
+        let plugin = repo.join("plugin");
+        fs::create_dir_all(plugin.join("src")).unwrap();
+        create_cargo_toml(&plugin, Some("0.2.0"));
+        // From the manifest's own dir, and from below it.
+        for dir in [plugin.clone(), plugin.join("src")] {
+            let err = resolve_run_dir(&dir).unwrap_err().to_string();
+            let prefix = dir.strip_prefix(&repo).unwrap().display().to_string();
+            assert_eq!(
+                err,
+                format!(
+                    "bump: {} is {prefix} inside {}, which has no version manifest, but \
+                     plugin/Cargo.toml does;\nbump runs on a repo root and will not tag a \
+                     version no root file holds",
+                    dir.display(),
+                    repo.display()
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_run_dir_through_a_symlinked_root_has_no_notice() {
+        let tmp = TempDir::new().unwrap();
+        let repo = repo_with_src(tmp.path());
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&repo, &link).unwrap();
+        let run = resolve_run_dir(&link).unwrap();
+        assert_eq!(run.path, link, "at the root: run where the caller pointed");
+        assert_eq!(run.key, repo.canonicalize().unwrap(), "dedups with the real path");
+        assert_eq!(run.notice, None);
+    }
+
+    #[test]
+    fn resolve_run_dir_through_a_symlink_into_a_subdir_reports_the_real_root() {
+        let tmp = TempDir::new().unwrap();
+        let repo = repo_with_src(tmp.path());
+        let link = tmp.path().join("srclink");
+        std::os::unix::fs::symlink(repo.join("src"), &link).unwrap();
+        let run = resolve_run_dir(&link).unwrap();
+        assert_eq!(
+            run.path,
+            repo.canonicalize().unwrap(),
+            "stripping `src` off `srclink` is not the root"
+        );
+        assert!(run.notice.is_some());
+    }
+
+    #[test]
+    fn resolve_run_dir_passes_a_non_repo_through_for_the_usual_error() {
+        let tmp = TempDir::new().unwrap();
+        for dir in [tmp.path().to_path_buf(), tmp.path().join("missing")] {
+            let run = resolve_run_dir(&dir).unwrap();
+            assert_eq!(
+                run,
+                RunDir {
+                    path: dir.clone(),
+                    key: dir.clone(),
+                    notice: None
+                }
+            );
+        }
+        let cli = Cli::try_parse_from(["bump", "-n"]).unwrap();
+        let err = process_directory(tmp.path(), &cli, BumpType::Patch)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, format!("Not a git repository: {}", tmp.path().display()));
     }
 
     // PHASE 8: --install / --no-install -> InstallChoice mapping (dispatch_release /
