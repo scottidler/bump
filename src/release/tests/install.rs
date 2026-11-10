@@ -269,15 +269,23 @@ fn installed_bin_path_prefers_install_root_then_path() {
 }
 
 /// A private install root holding a fake `tool` whose body is `script`.
+///
+/// The binary is written by a short-lived child (`install`), never by this process: a
+/// parallel test that forks while this process holds a write handle inherits it until its
+/// exec, and the later exec of the script fails `Text file busy`.
 fn fake_install_root(script: &str) -> TempDir {
     let root = TempDir::new().unwrap();
     let bin_dir = root.path().join("bin");
     fs::create_dir_all(&bin_dir).unwrap();
-    let path = bin_dir.join("tool");
-    fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
-    let mut perms = fs::metadata(&path).unwrap().permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
-    fs::set_permissions(&path, perms).unwrap();
+    let staged = root.path().join("tool.src");
+    fs::write(&staged, format!("#!/bin/sh\n{script}\n")).unwrap();
+    let status = std::process::Command::new("install")
+        .args(["-m", "755"])
+        .arg(&staged)
+        .arg(bin_dir.join("tool"))
+        .status()
+        .unwrap();
+    assert!(status.success(), "install -m 755 failed: {status}");
     root
 }
 
