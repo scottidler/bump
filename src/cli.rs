@@ -76,7 +76,7 @@ pub struct Cli {
     /// package name (e.g. claude-pricing, not the member path). Repeatable and
     /// space-separated. For a member whose version is a deliberate contract, not
     /// workspace-inherited; a name matching no independent member is an error.
-    #[arg(long = "skip-member", value_name = "NAME", num_args = 1.., action = clap::ArgAction::Append)]
+    #[arg(long = "skip-member", value_name = "NAME", num_args = 1.., action = clap::ArgAction::Append, conflicts_with_all = ["tag_only", "gates"])]
     pub skip_member: Vec<String>,
 
     /// Paths to git repository roots
@@ -580,7 +580,8 @@ mod tests {
     /// Documented footgun: `--skip-member` uses num_args=1.. (space-separated, per the
     /// house CLI rule), so a trailing DIRECTORIES positional is greedily swallowed into
     /// the skip list. This is a KNOWN contract, not a surprise -- and it fails closed
-    /// downstream (the swallowed path is a stale skip name that aborts validation). The
+    /// downstream in every mode the `--tag-only` / `--gates` conflicts leave (the
+    /// swallowed path is a stale skip name that aborts `validate_project`). The
     /// realistic invocation runs bump in the repo (no positional) or puts the directory
     /// before the flag.
     #[test]
@@ -599,6 +600,27 @@ mod tests {
         let cli = Cli::try_parse_from(["bump", "./some-dir", "--skip-member", "claude-pricing"]).unwrap();
         assert_eq!(cli.skip_member, vec!["claude-pricing".to_string()]);
         assert_eq!(cli.directories.len(), 1);
+    }
+
+    /// `--tag-only` and `--gates` never read the skip list, so a swallowed directory
+    /// would not fail closed there: clap refuses the combination outright.
+    #[test]
+    fn skip_member_conflicts_with_tag_only_and_gates() {
+        for mode in ["--tag-only", "--gates"] {
+            let Err(err) = Cli::try_parse_from(["bump", mode, "--skip-member", "claude-pricing", "./some-dir"]) else {
+                panic!("{mode} with --skip-member must be a clap error");
+            };
+            assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict, "{mode}: {err}");
+        }
+    }
+
+    /// A member name can also be a sibling directory (`cd ~/repos/tatari-tv && bump clyde
+    /// --skip-member claude-pricing`): no parse-time directory check refuses it.
+    #[test]
+    fn skip_member_accepts_sibling_directory_member_name() {
+        let cli = Cli::try_parse_from(["bump", "clyde", "--skip-member", "claude-pricing"]).unwrap();
+        assert_eq!(cli.directories, vec![PathBuf::from("clyde")]);
+        assert_eq!(cli.skip_member, vec!["claude-pricing".to_string()]);
     }
 
     // =========================================================================

@@ -52,3 +52,16 @@
 - Rewrote the three eba0468 `resolve_verb_dir` tests against real repos (round 1 Q3). `test_finish_verb_honors_dir_positional_and_walks_up_from_a_subdir` now also proves the walk-up, and `test_verb_dir_defaults_to_cwd_and_absolutizes_relative` resolves the relative `src` against this repo's root, which is the cwd under `cargo test`.
 ### Open questions
 - None.
+
+## Phase 5: --skip-member fails closed (bug 2)
+### Design decisions
+- `conflicts_with_all = ["tag_only", "gates"]` on `--skip-member` (`src/cli.rs`, `Cli::skip_member`): neither mode reads the skip list, so a swallowed directory could not fail closed there.
+- Hint appended to the unknown-member error (`src/lang.rs`, `validate_project`): "If a value is a directory, put directories before --skip-member." No parse-time directory check, per the Resolved Decisions (a member name can be a sibling directory).
+- `test_cli_skip_member_swallows_trailing_positional` kept as is (the parse is unchanged); only its comment now says it fails closed in every mode the conflicts leave.
+- New tests: `skip_member_conflicts_with_tag_only_and_gates` and `skip_member_accepts_sibling_directory_member_name` (`src/cli.rs`); the hint is asserted in `validate_stale_skip_member_aborts` (`src/main.rs`).
+### Deviations
+- No `tests/release_cli.rs` binary test: the parse-level clap test pins the conflict directly, and the criterion was run against the real binary on the t4/t5 fixtures. Same coverage, correct seam.
+### Tradeoffs
+- Asserting the hint in the existing stale-skip test vs. a new test: same call, same error, one fewer fixture.
+### Open questions
+- None.

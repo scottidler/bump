@@ -364,7 +364,9 @@ pub fn validate_project(dir: &Path, project_type: ProjectType, skip_members: &[S
         eyre::bail!(
             "--skip-member named member(s) that are not independently versioned: {}\n\
              (wrong package name, or that member already inherits version.workspace = true). \
-             --skip-member matches the package name, not the member path.",
+             --skip-member matches the package name, not the member path.\n\
+             If {} is a directory, put directories before --skip-member.",
+            names.join(", "),
             names.join(", ")
         );
     }

@@ -2358,6 +2358,10 @@ name = "test-pkg"
         .unwrap_err()
         .to_string();
         assert!(err.contains("nonexistent"), "must name the unmatched skip: {err}");
+        assert!(
+            err.contains("If nonexistent is a directory, put directories before --skip-member"),
+            "must hint at a swallowed directory: {err}"
+        );
     }
 
     /// Normal (tag-creating) flow with --skip-member on an ungated repo: workspace
