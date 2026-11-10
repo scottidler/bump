@@ -178,3 +178,17 @@
 - The dry-run fetch moves `origin/<default>` (the only ref it touches) vs `--dry-run` fetch or no fetch - the doc's contract is "fetches (still changes nothing)"; measured that `git fetch origin <branch>` does not auto-follow tags, so no local tag appears.
 ### Open questions
 - None.
+
+## Phase 12: Help text and README (C5, C7)
+### Design decisions
+- Root help renders the log path through `log_path_for_help()` - `src/cli.rs:get_tool_validation_help` - the same call the release and finish after-help already use, so all three print the resolved path.
+- `--message` help reads "Commit message to use (when a clean tree amends an unpushed commit, it replaces that commit's subject)" - `src/cli.rs:Cli::message` - names the amend behavior pinned by `amend_path_honors_explicit_message`.
+- New unit tests `test_every_after_help_prints_the_resolved_log_path` and `test_message_help_names_the_amend_behavior` - `src/cli.rs` - pin both help changes.
+- README describes what Phases 1-11 shipped: the subdirectory walk-up, its stderr notice, the `(ignoring ...)` suffix and the generic-root refusal; `[DIR]`; the gated hand-off to `/pr:create` (already present, kept); the seven verify skip reasons in check order; `--gates` exit codes and the `--gates` / `--no-verify` and `--skip-member` conflicts; empty-install refusal; the S2/S3/S4 messages; Phase 7's dirty-tree file list and the finish generic-repo refusal; Phase 11's `finish -n` including the `would run: nothing` variant; Phase 6's dry-run refusal and lockfile listing.
+### Deviations
+- Doc amendment: Phase 12's bullet said "six verify skip reasons"; amended to "seven" in the design doc. The doc's own Data Model lists seven (shell syntax, not cargo install, custom root, not this repo, outside repo, no binary name, no clap dependency), and Phase 8 shipped seven (Phase 8's open question flagged it). README documents seven.
+- README does not change the scenario-3 example output ("Committed and tagged"): that example stages files, so the line is still true.
+### Tradeoffs
+- Documenting the shell-syntax character set in the README vs. only naming the reason: the set is the contract a caller needs to predict a skip, and it names no counts or versions that drift.
+### Open questions
+- None.

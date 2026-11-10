@@ -16,14 +16,31 @@ cargo install --path .
 
 For releasing a repo, use `bump release` / `bump finish` -- they absorb every mechanical
 step (pushes, the open-PR probe, the CI wait, install) that the primitives below (bare `bump`,
-`--no-tag`, `--tag-only`) otherwise leave to you. Run from inside the repo, or pass `[DIR]` to name it (default: the cwd), bare, no `&&`
-and no wrapper:
+`--no-tag`, `--tag-only`) otherwise leave to you. Run from inside the repo, or pass `[DIR]` to
+name it (default: the cwd), bare, no `&&` and no wrapper:
 
 ```bash
 bump release [-m|-M] [-n] [--install "<cmd>"|--no-install] [--standalone "<words>"] \
              [--no-ci-gate] [--ci-timeout SECS] [DIR]
 bump finish  [-n] [--install "<cmd>"|--no-install] [--no-ci-gate] [--ci-timeout SECS] [DIR]
 ```
+
+Run from a subdirectory, every entry point (plain `bump`, `--gates`, `--tag-only`,
+`release`, `finish`, and a verb's `[DIR]`) walks up to the repo root, the way git, cargo and
+otto do, and says so on stderr before any other output:
+
+```
+bump: <dir> is <prefix> inside <root>; running on <root>
+```
+
+When the subdirectory has its own version manifest under a root that also has one, the
+notice gains `(ignoring <manifest> in <prefix>)`: the root's manifest is the one bumped.
+One shape refuses instead of walking up (exit 1, before any git work): the root has no
+version manifest but the subdirectory, or a directory between it and the root, does. bump
+will not tag a version no root file holds, so `cd plugin && bump` in a generic-root repo
+whose `plugin/Cargo.toml` carries the version fails with `<dir> is <prefix> inside <root>,
+which has no version manifest, but <manifest> does`. Two directory arguments that resolve
+to one root run once. A symlinked spelling of a root gets no notice.
 
 `bump release` inspects the repo's git + gate state and either executes the ONE correct
 sequence or refuses with the exact next command. Which of the two flows applies is
@@ -48,7 +65,7 @@ decided by `bump --gates` (never both):
 | Gated, feature branch where the title-guard slug != the branch name | refuses before any mutation, prints `git branch -m <slug>` |
 | Gated, on default with commits not on origin (stranded) | refuses with the literal rescue commands, never auto-rescued |
 | Gated, on default, clean, tagged | refuses "bump rides a feature PR", names `--standalone` |
-| Gate unknown, dirty tree, detached HEAD | refuses with the one exact fix |
+| Gate unknown, dirty tree, detached HEAD | refuses with the one exact fix; a dirty tree lists each `git status --porcelain` line and offers: commit them, `git stash -u`, remove them, or gitignore them |
 
 `--standalone "<words>"` is Scott's words, verbatim: the one legitimate way to ship a
 release whose diff is empty or version-only. Re-asking for this order is a violation --
@@ -74,6 +91,18 @@ the default branch, a sibling worktree found via `git worktree list`, or checks 
 | Local default ahead of origin (commits that never landed) | refuses before any pull, with the literal rescue commands |
 | Local default diverged from origin | refuses before any pull, names `git pull --rebase origin <default>` |
 | Tracked changes in the current OR the resolved worktree | refuses before anything moves |
+| Generic repo (no manifest) | refuses: `bump finish does not support generic repos` (finish cannot derive a version) |
+
+`bump finish -n` fetches `origin/<default>` (the one ref it moves; `--no-tags`, so no tag
+arrives even under `remote.origin.tagOpt=--tags`) and classifies the merged tip without
+checking it out, then prints only the steps that would run. When the checkout is not at
+the tip, the install command comes from the `bump.yml` committed there (an untracked one
+stands, as it does after the real run's fast-forward), and a `ci: none` committed there
+prints the CI skip instead of the wait. On an
+already-released version that is `[dry-run] already released v<X>; would run: install,
+verify` (or `would run: nothing` when no install command resolves), with no `git tag -a`
+line. It refuses, exit 1, wherever the real run would (a missed bump, a local default ahead
+of or diverged from origin).
 
 Full state tables: `bump release --help` / `bump finish --help`, or the design doc
 (`docs/design/2026-09-26-one-release-command.md`).
@@ -84,37 +113,56 @@ truncated, or errored CI refuses with NO tag created; a re-run reuses the same v
 never bumping past it. `--no-ci-gate` skips the wait -- for a human at a terminal who
 already knows the repo's CI story, not for an agent to get unstuck.
 
-`--install <cmd>` / `--no-install` control the post-release install step (precedence:
-flag override > repo-root `bump.yml`'s `install:` key > `cargo install --path .` iff the
+`--install <cmd>` / `--no-install` control the post-release install step. An empty
+`--install ""` or `install: ""` in `bump.yml` is refused (`install command is empty; pass
+--no-install to skip the install`); `--no-install` beats an empty `install:`, and a
+non-empty `--install` beats one. Precedence: flag override > repo-root `bump.yml`'s `install:` key > `cargo install --path .` iff the
 root `Cargo.toml` declares its own `[package]` table, a binary target AND a `clap`
 dependency > skip). The default installs CLIs only: three cases print their own
 `install: skipped (...; pass --install or set install: in bump.yml)` reason, checked in
 this order: a virtual workspace root (`[workspace]` with no `[package]`), a library crate
-(no binary target), and a package with no `clap` dependency (a web server, not a CLI).
-An explicit `--install` or `bump.yml` `install:` is the owner's call and always runs.
+(no binary target), and a package with no `clap` dependency (a web server, not a CLI). A
+repo with no Cargo manifest at all prints `install: skipped (no Cargo manifest; pass
+--install or set install: in bump.yml)`. An explicit `--install` or `bump.yml` `install:` is the owner's call and always runs.
 
 After a `cargo install` of this repo, bump proves it. The verify target is the directory
 that command installs from: `--path <dir>` or `--path=<dir>`, else the repo root. The
 command is split with shell quoting, so a quoted value (`--features "a b"`, `--path
-"my cli"`) stays one word, and `cargo +<toolchain> install` counts as `cargo install`. The
+"my cli"`) stays one word, and `cargo +<toolchain> install` counts as `cargo install`. Leading `NAME=value` words and a
+bare `env` are skipped over (`RUSTFLAGS=-g cargo install --path .` verifies). The
 binary named by that directory's `Cargo.toml` (the first `[[bin]]`, else the package name
 when `src/main.rs` exists) is run from the cargo install root (`$CARGO_INSTALL_ROOT`,
 `$CARGO_HOME`, `~/.cargo`), else from PATH, and `<bin> --version` must contain the tag as
-a whole token (`bump v0.4.6`). The process gets 10 seconds, then it is killed and verify
+a whole token (`bump v0.4.6`); the fact line names the absolute path it ran, including
+when it was found on PATH. The process gets 10 seconds, then it is killed and verify
 fails. That is the `build-version` contract: `BUILD_VERSION` is the bare `vX.Y.Z` on the
 tagged commit, and also outside CI or when no tag is reachable. A `vX.Y.Z-N-g<sha>`
 (built past the tag), a bare `X.Y.Z` (still on `CARGO_PKG_VERSION`), or an older version
 (a stale copy earlier on PATH) fails the verb. The error says which path ran, names a
 shape only when the output proves it, and ends by saying the tag is pushed and stands: a
-source fix is a new `bump release`; to only reinstall, re-run `bump finish` (repeat any
-`--install` override), whose already-released row re-runs the install.
+source fix is a new `bump release`; to only reinstall, re-run `bump finish <root>` (repeat any
+`--install` override), whose already-released row re-runs the install. An install or verify
+failure prints the exit status and that same dir-qualified re-run line.
 
-Verify prints `verify: skipped (<reason>)` instead when, checked in this order: the
-install command is not `cargo install` (`make install`, a script); the install command
-does not install this repo (a positional crate name, `--git`, `--registry`); there is no
-binary name in `<dir>/Cargo.toml`; or there is no clap dependency in `<dir>/Cargo.toml`.
-`-n` previews every command the verb would run, the verify included, and executes
-nothing.
+Verify prints `verify: skipped (<reason>)` instead when, checked in this order:
+
+1. the install command uses shell syntax (`install command uses shell syntax; verify reads
+   one plain cargo install`): any unquoted, unescaped `$`, backtick, `;`, `&`, `|`, `<`,
+   `>`, `(`, `)`, `*`, `?`, `[` or newline, or a `#` or `~` at the start of a word, so
+   `&&`, `||`, a trailing `&`, `2>&1`, `$(...)`, a glob, `~/x` and a `# comment` all skip
+   (a quoted `--features "a&&b"`, `"~/x"` or `'*'`, or an escaped `\;`, does not);
+2. the install command is not `cargo install` (`make install`, a script);
+3. the install command sets its own install root (`--root`, or a `CARGO_INSTALL_ROOT=` /
+   `CARGO_HOME=` prefix): verify would read the default root and run a stale binary;
+4. the install command does not install this repo (a positional crate name, `--git`,
+   `--registry`);
+5. the install target is outside this repo (`--path` resolves, symlinks followed, outside
+   the repo root; the reason prints the canonical target);
+6. there is no binary name in `<dir>/Cargo.toml`;
+7. there is no clap dependency in `<dir>/Cargo.toml`.
+
+A skip is visible and true, never a wrong verify. `-n` previews every command the verb
+would run, the verify included, and changes nothing (`finish -n` fetches origin; see above).
 
 `gh` calls are authed per-org: a token file, then `GITHUB_PAT_<ORG>`, then
 `GITHUB_PAT_WORK` for `tatari-tv` / `GITHUB_PAT_HOME` otherwise, else ambient `gh auth` --
@@ -139,12 +187,17 @@ bump [OPTIONS] [DIRECTORIES...]
 | (default) | Bump patch version (x.y.Z) |
 | `-n`, `--dry-run` | Preview changes without applying |
 | `-a`, `--automatic` | Generate automatic commit message |
-| `--message <MSG>` | Use custom commit message |
+| `--message <MSG>` | Use custom commit message; when bump amends an unpushed commit it replaces that commit's subject |
 | `-f`, `--force` | Bump even if HEAD already has a tag |
 | `--no-tag` | Bump + commit, but create no tag (for PR-gated repos) |
 | `--tag-only` | Tag the merged commit (post-merge step for PR-gated repos) |
-| `--gates` | Report branch-protection gate status and the recommended flow |
-| `--no-verify` | Skip the remote gate probe (treat the repo as ungated) |
+| `--gates` | Report branch-protection gate status and the recommended flow; exits 1 on an UNKNOWN verdict, 0 on any known one |
+| `--no-verify` | Skip the remote gate probe (treat the repo as ungated); a clap error with `--gates` |
+| `--skip-member <NAME>...` | Skip workspace members; a clap error with `--tag-only` or `--gates`. Put directories before it: it takes every following value |
+
+`--gates` exit codes: `0` for a known verdict (UNGATED or GATED), `1` for UNKNOWN (the
+report still prints first, and a multi-directory run reports every repo before failing).
+`--no-tag` skips the gate probe on purpose: it is the gated flow's own version-commit step.
 
 > `bump` requires `git` and `gh`. `gh` is used to probe branch-protection gates; if it
 > is missing or unauthenticated, `bump` warns and proceeds as if the repo were ungated.
@@ -263,12 +316,18 @@ Process multiple Rust projects at once:
 bump ./proj1 ./proj2 ./proj3
 ```
 
+Each directory is resolved to its repo root first (see the subdirectory walk-up above);
+directories that resolve to one root run once.
+
 ## Dry Run
 
 Preview what bump would do:
 
 ```bash
 bump -n
-# [dry-run] Would update: Cargo.toml
+# [dry-run] Would update: Cargo.toml, Cargo.lock
 # [dry-run] Would amend previous commit and tag: v0.4.3
 ```
+
+A dry run runs the real run's refusals first, so `bump -n` on a HEAD that already has a tag
+fails with `HEAD already has a tag` (exit 1), exactly as `bump` does.

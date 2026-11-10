@@ -43,7 +43,7 @@ pub struct Cli {
     #[arg(short = 'n', long)]
     pub dry_run: bool,
 
-    /// Commit message to use
+    /// Commit message to use (when a clean tree amends an unpushed commit, it replaces that commit's subject)
     #[arg(long, conflicts_with = "automatic")]
     pub message: Option<String>,
 
@@ -336,8 +336,14 @@ fn get_tool_validation_help() -> String {
          REQUIRED TOOLS:\n  {} {:<10} {}\n  {} {:<10} {}\n\n\
          gh is used to probe branch-protection gates; without it gated repos cannot be\n\
          detected and bump warns and proceeds as if ungated.\n\n\
-         Logs are written to: ~/.local/share/bump/logs/bump.log",
-        git_status.status_icon, "git", git_status.version, gh_status.status_icon, "gh", gh_status.version
+         Logs are written to: {}",
+        git_status.status_icon,
+        "git",
+        git_status.version,
+        gh_status.status_icon,
+        "gh",
+        gh_status.version,
+        log_path_for_help(),
     )
 }
 
@@ -797,6 +803,27 @@ mod tests {
         for flag in ["--standalone", "--no-ci-gate", "--ci-timeout"] {
             assert!(help.contains(flag), "after-help must name {flag} literally:\n{help}");
         }
+    }
+
+    /// C5: root help rendered a hardcoded `~/.local/...` while the subcommands printed the
+    /// resolved path. All three after-help texts now end with the same resolved path.
+    #[test]
+    fn test_every_after_help_prints_the_resolved_log_path() {
+        let line = format!("Logs are written to: {}", log_path_for_help());
+        assert!(!log_path_for_help().starts_with('~'));
+        for help in [get_tool_validation_help(), get_release_help(), get_finish_help()] {
+            assert!(help.contains(&line), "after-help must end with {line:?}:\n{help}");
+        }
+    }
+
+    /// C7: `--message` help names the amend behavior.
+    #[test]
+    fn test_message_help_names_the_amend_behavior() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let arg = cmd.get_arguments().find(|a| a.get_id() == "message").unwrap();
+        let help = arg.get_help().unwrap().to_string();
+        assert!(help.contains("amend"), "{help}");
     }
 
     #[test]
