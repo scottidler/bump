@@ -99,9 +99,9 @@ fn install_skip_reason_names_the_virtual_workspace_root() {
 }
 
 #[test]
-fn install_skip_reason_is_plain_with_no_cargo_manifest() {
+fn install_skip_reason_names_the_missing_cargo_manifest_not_a_bare_skip() {
     let tmp = TempDir::new().unwrap();
-    assert_eq!(install_skip_reason(tmp.path(), &InstallChoice::Auto), "skipped");
+    assert_ne!(install_skip_reason(tmp.path(), &InstallChoice::Auto), "skipped");
 }
 
 #[test]
@@ -243,7 +243,10 @@ fn version_mismatch_message_states_the_fact_line() {
     );
     assert!(message.contains("verify ran tool (from PATH)"), "{message}");
     assert!(!message.contains("older binary"), "no guessing: {message}");
-    assert!(message.ends_with(VERIFY_RERUN), "{message}");
+    assert!(
+        !message.contains("bump finish"),
+        "the re-run line is run_install's: {message}"
+    );
 }
 
 /// `installed_bin_path` prefers the install root's `bin/` when the file is there and falls
@@ -316,7 +319,6 @@ fn shell_installer_verify_runs_the_installed_binary() {
         .to_string();
     assert!(err.contains("past the tag"), "{err}");
     assert!(err.contains("(from the install root)"), "fact line: {err}");
-    assert!(err.ends_with(VERIFY_RERUN), "{err}");
 
     let root = fake_install_root("echo 'tool 1.2.3'");
     let err = shell_installer(&root, TEN_SECONDS)
@@ -324,8 +326,6 @@ fn shell_installer_verify_runs_the_installed_binary() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("CARGO_PKG_VERSION"), "{err}");
-    assert!(err.contains("bump finish"), "names the reinstall: {err}");
-    assert!(err.contains("bump release"), "names the new release: {err}");
 
     let root = fake_install_root("echo 'tool v1.2.2'");
     let err = shell_installer(&root, TEN_SECONDS)
@@ -337,7 +337,6 @@ fn shell_installer_verify_runs_the_installed_binary() {
         !err.contains("past the tag") && !err.contains("CARGO_PKG_VERSION"),
         "{err}"
     );
-    assert!(err.ends_with(VERIFY_RERUN), "{err}");
 }
 
 /// A binary that ignores `--version` (a server) is killed at the timeout and verify fails;
@@ -358,7 +357,6 @@ fn kills_a_binary_that_does_not_exit() {
     );
     assert!(err.contains("did not exit within 200ms"), "{err}");
     assert!(err.contains("starting server"), "carries the output: {err}");
-    assert!(err.ends_with(VERIFY_RERUN), "{err}");
 }
 
 /// A non-zero exit fails verify with the status and the stderr text.
@@ -369,10 +367,8 @@ fn shell_installer_verify_reports_a_non_zero_exit() {
         .verify(Path::new("/repo"), "tool", "v1.2.3")
         .unwrap_err()
         .to_string();
-    assert!(err.contains("exited"), "{err}");
-    assert!(err.contains("3"), "{err}");
+    assert!(err.contains("exited with exit status: 3"), "{err}");
     assert!(err.contains("missing VALET_STATE_SIGNING_KEY"), "{err}");
-    assert!(err.ends_with(VERIFY_RERUN), "{err}");
 }
 
 /// A binary that cannot be spawned fails verify with the same closing line.
@@ -384,7 +380,6 @@ fn shell_installer_verify_reports_a_spawn_failure() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("could not run"), "{err}");
-    assert!(err.ends_with(VERIFY_RERUN), "{err}");
 }
 
 // ---- the verify target ---------------------------------------------------------------
@@ -571,4 +566,88 @@ fn verify_target_new_skip_reasons_and_env_prefix() {
             bin: "test-pkg".to_string()
         }
     );
+}
+
+// ---- install and verify messages (C3, S2, S3, S4) ------------------------------------
+
+/// S3: a failing install names its exit status and ends with the re-run line that names the
+/// repo root, so the caller can run it from anywhere.
+#[test]
+fn install_failure_prints_the_status_and_a_dir_qualified_rerun() {
+    let tmp = TempDir::new().unwrap();
+    let choice = InstallChoice::Command("exit 7".to_string());
+    let err = run_install(
+        tmp.path(),
+        &choice,
+        &Config::default(),
+        "v1.0.0",
+        &ShellInstaller::default(),
+    )
+    .unwrap_err()
+    .to_string();
+    let root = tmp.path().canonicalize().unwrap();
+    assert!(err.contains("install command failed: exit 7 (exit status: 7)"), "{err}");
+    assert!(
+        err.ends_with(&format!(
+            "re-run `bump finish {}` (repeat any --install override).",
+            root.display()
+        )),
+        "{err}"
+    );
+}
+
+/// A verify failure through `run_install` gets the same dir-qualified closing line, naming
+/// the repo root and not the verify target.
+#[test]
+fn verify_failure_gets_the_rerun_line_for_the_repo_root() {
+    let tmp = TempDir::new().unwrap();
+    write_clyde_shaped(tmp.path(), "1.2.3");
+    let installer = RecordingInstaller::failing_verify_once();
+    let config = config_install("cargo install --path clyde");
+    let err = run_install(tmp.path(), &InstallChoice::Auto, &config, "v1.2.3", &installer)
+        .unwrap_err()
+        .to_string();
+    let root = tmp.path().canonicalize().unwrap();
+    assert!(err.contains("printed a stale version"), "{err}");
+    assert!(err.contains(&format!("`bump finish {}`", root.display())), "{err}");
+}
+
+#[test]
+fn verify_rerun_names_the_directory() {
+    let tmp = TempDir::new().unwrap();
+    let line = verify_rerun(tmp.path());
+    assert!(line.contains(&format!(
+        "`bump finish {}`",
+        tmp.path().canonicalize().unwrap().display()
+    )));
+    assert!(line.contains("`bump release`"), "{line}");
+    // an unresolvable path is named as given rather than failing the message
+    assert!(verify_rerun(Path::new("/no/such/dir/anywhere")).contains("`bump finish /no/such/dir/anywhere`"));
+}
+
+/// S2: no Cargo manifest says so and names both ways out; `--no-install` stays plain.
+#[test]
+fn install_skip_reason_names_the_missing_manifest() {
+    let tmp = TempDir::new().unwrap();
+    assert_eq!(
+        install_skip_reason(tmp.path(), &InstallChoice::Auto),
+        "skipped (no Cargo manifest; pass --install or set install: in bump.yml)"
+    );
+    assert_eq!(install_skip_reason(tmp.path(), &InstallChoice::Skip), "skipped");
+    write_cargo(tmp.path(), "1.0.0");
+    assert_eq!(install_skip_reason(tmp.path(), &InstallChoice::Skip), "skipped");
+}
+
+/// S4: a bin found on PATH resolves to an absolute path; one that is not stays the bare name.
+#[test]
+fn which_on_path_resolves_an_absolute_path() {
+    let found = which_on_path("sh").expect("sh is on PATH");
+    assert!(found.is_absolute(), "{}", found.display());
+    assert!(found.is_file());
+    assert_eq!(which_on_path("bump-no-such-binary-anywhere"), None);
+    let (path, source) = installed_bin_path(None, "sh");
+    assert_eq!(source, BinSource::Path);
+    assert!(path.is_absolute(), "{}", path.display());
+    let (path, _) = installed_bin_path(None, "bump-no-such-binary-anywhere");
+    assert_eq!(path, PathBuf::from("bump-no-such-binary-anywhere"));
 }

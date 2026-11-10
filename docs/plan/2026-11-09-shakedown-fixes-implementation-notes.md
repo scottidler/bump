@@ -117,3 +117,18 @@
 ### Open questions
 - `~` (tilde expansion), glob characters and a `#` comment are not in the doc's shell-syntax set. `--path ~/x` joins to `<repo>/~/x`, which does not exist, so it skips on "no binary name" (a skip, never a wrong verify, but not the true reason). Add them to the set?
 - Phase 12's README bullet says "six verify skip reasons"; the Data Model now lists seven. Phase 12 should document seven.
+
+## Phase 9: Install and verify messages (C3, S2, S3, S4)
+### Design decisions
+- The re-run line is now `verify_rerun(root)`, not a const, and `run_install` appends it to any install or verify error via `with_rerun` - `src/release.rs` - one place owns the closing line and the repo root (the `Installer::verify` dir is the install target, which can be a member, so only `run_install` knows the root). `ShellInstaller` errors no longer carry it.
+- The root in the re-run line is canonicalized (falls back to the path as given) - `verify_rerun` - the caller may have passed a relative dir or run from anywhere, and the line must be runnable as is.
+- Install failure text is `install command failed: <cmd> (<status>)`, which prints `exit status: 7` - `ShellInstaller::install` - wording chosen; the doc gave none beyond "the exit status".
+- C3 reads `exited with exit status: 3` - `ShellInstaller::verify` - the doc's `exited with {status}` applied literally; `ExitStatus` Display supplies the "exit status:" prefix.
+- S4: `which_on_path` walks PATH for the first executable file and `installed_bin_path` returns it absolute; falls back to the bare name when nothing resolves - `src/release.rs` - the fact line `verify ran <path> (from PATH)` and the executed path now agree.
+- Old test `install_skip_reason_is_plain_with_no_cargo_manifest` inverted (renamed `..._names_the_missing_cargo_manifest_not_a_bare_skip`) because it pinned the bare "skipped" S2 removes.
+### Deviations
+- None.
+### Tradeoffs
+- Appending the re-run line in `run_install` vs passing the root into the `Installer` trait methods - keeps the trait signature unchanged and the doubles untouched.
+### Open questions
+- None.

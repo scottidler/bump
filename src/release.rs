@@ -346,10 +346,17 @@ const DEFAULT_VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often the verify loop polls the `--version` child for exit.
 const VERIFY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// The closing line of every verify failure: the tag already stands on origin, so a source
-/// fix moves HEAD past it (a new release), while a plain reinstall is `bump finish`.
-const VERIFY_RERUN: &str = "The tag is pushed and stands. A source fix is a new release: commit it and run \
-     `bump release`. To only reinstall, re-run `bump finish` (repeat any --install override).";
+/// The closing line of every install or verify failure: the tag already stands on origin,
+/// so a source fix moves HEAD past it (a new release), while a plain reinstall is
+/// `bump finish`. It names the repo root, since `[DIR]` lets the caller be anywhere.
+fn verify_rerun(root: &Path) -> String {
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    format!(
+        "The tag is pushed and stands. A source fix is a new release: commit it and run \
+         `bump release`. To only reinstall, re-run `bump finish {}` (repeat any --install override).",
+        root.display()
+    )
+}
 
 impl Default for ShellInstaller {
     fn default() -> Self {
@@ -373,7 +380,7 @@ impl Installer for ShellInstaller {
             .status()
             .with_context(|| format!("failed to run install command: {command}"))?;
         if !status.success() {
-            bail!("install command failed: {command}");
+            bail!("install command failed: {command} ({status})");
         }
         Ok(())
     }
@@ -390,7 +397,7 @@ impl Installer for ShellInstaller {
         );
         let run = run_version(&path, self.verify_timeout).map_err(|e| {
             eyre::eyre!(
-                "install verification failed: could not run `{} --version`: {e:#}\n{VERIFY_RERUN}",
+                "install verification failed: could not run `{} --version`: {e:#}",
                 path.display()
             )
         })?;
@@ -398,7 +405,7 @@ impl Installer for ShellInstaller {
         match run {
             VersionRun::TimedOut { stdout, stderr } => bail!(
                 "install verification failed: `{} --version` did not exit within {}; a CLI answers \
-                 --version at once.{}\n{VERIFY_RERUN}",
+                 --version at once.{}",
                 path.display(),
                 format_timeout(self.verify_timeout),
                 captured(&stdout, &stderr)
@@ -409,7 +416,7 @@ impl Installer for ShellInstaller {
                 stdout,
                 stderr,
             } => bail!(
-                "install verification failed: `{} --version` exited {status}.{}\n{VERIFY_RERUN}",
+                "install verification failed: `{} --version` exited with {status}.{}",
                 path.display(),
                 captured(&stdout, &stderr)
             ),
@@ -448,8 +455,26 @@ impl BinSource {
 fn installed_bin_path(install_root: Option<&Path>, bin: &str) -> (PathBuf, BinSource) {
     match install_root {
         Some(root) if root.join("bin").join(bin).is_file() => (root.join("bin").join(bin), BinSource::InstallRoot),
-        _ => (PathBuf::from(bin), BinSource::Path),
+        _ => (
+            which_on_path(bin).unwrap_or_else(|| PathBuf::from(bin)),
+            BinSource::Path,
+        ),
     }
+}
+
+/// The absolute path `bin` resolves to on PATH (first executable regular file), or `None`
+/// when PATH has no such file. Resolved here so the fact line names the binary that ran,
+/// not the bare name the shell would look up.
+fn which_on_path(bin: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|entry| entry.join(bin))
+        .find(|candidate| {
+            candidate
+                .metadata()
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })
+        .and_then(|found| std::path::absolute(found).ok())
 }
 
 /// How a `<bin> --version` run ended.
@@ -541,7 +566,7 @@ fn version_matches(printed: &str, tag: &str) -> bool {
 }
 
 /// The mismatch error: what ran and what it printed, one line of fact saying where the
-/// binary came from, at most one shape hint, and the shared re-run line.
+/// binary came from, and at most one shape hint. `run_install` appends the shared re-run line.
 fn version_mismatch_message(path: &Path, source: BinSource, printed: &str, tag: &str) -> String {
     let mut message = format!(
         "install verification failed: `{} --version` printed \"{printed}\", expected {tag}.\n\
@@ -554,8 +579,6 @@ fn version_mismatch_message(path: &Path, source: BinSource, printed: &str, tag: 
         message.push('\n');
         message.push_str(hint);
     }
-    message.push('\n');
-    message.push_str(VERIFY_RERUN);
     message
 }
 
@@ -1523,11 +1546,13 @@ pub(crate) fn resolve_install(dir: &Path, choice: &InstallChoice, config: &Confi
 /// case on a Cargo manifest with nothing installable gets a specific reason: a virtual
 /// workspace root (a tracked `[workspace]` `Cargo.toml` with no `[package]`), a
 /// library crate (`[package]`, no binary target), or a binary with no `clap` dependency
-/// (a service, not a CLI). Every other skip (`--no-install`, or
-/// no Cargo manifest at all) prints the plain "skipped".
+/// (a service, not a CLI). No Cargo manifest at all says so and names the two ways to
+/// supply an install; `--no-install` prints the plain "skipped".
 fn install_skip_reason(dir: &Path, choice: &InstallChoice) -> &'static str {
-    if !matches!(choice, InstallChoice::Auto) || !lang::cargo::cargo_toml_exists(dir) {
+    if !matches!(choice, InstallChoice::Auto) {
         "skipped"
+    } else if !lang::cargo::cargo_toml_exists(dir) {
+        "skipped (no Cargo manifest; pass --install or set install: in bump.yml)"
     } else if !lang::cargo::has_package_table(dir) {
         "skipped (virtual workspace root; pass --install or set install: in bump.yml)"
     } else if !lang::cargo::has_bin_target(dir) {
@@ -1593,6 +1618,11 @@ fn verify_target(dir: &Path, command: &str) -> VerifyTarget {
     resolved
 }
 
+/// Close an install or verify failure with the shared re-run line naming `root`.
+fn with_rerun(error: eyre::Report, root: &Path) -> eyre::Report {
+    eyre::eyre!("{error:#}\n{}", verify_rerun(root))
+}
+
 /// Resolve and run the install step, then verify the installed binary reports `tag` (or
 /// say why verify is skipped); return the command that ran (`None` = install skipped).
 fn run_install<I: Installer>(
@@ -1605,9 +1635,11 @@ fn run_install<I: Installer>(
     match resolve_install(dir, choice, config) {
         Some(cmd) => {
             println!("install: {cmd}");
-            installer.install(dir, &cmd)?;
+            installer.install(dir, &cmd).map_err(|e| with_rerun(e, dir))?;
             match verify_target(dir, &cmd) {
-                VerifyTarget::Verify { dir: target, bin } => installer.verify(&target, &bin, tag)?,
+                VerifyTarget::Verify { dir: target, bin } => {
+                    installer.verify(&target, &bin, tag).map_err(|e| with_rerun(e, dir))?
+                }
                 VerifyTarget::Skip(reason) => println!("verify: skipped ({reason})"),
             }
             Ok(Some(cmd))
