@@ -279,6 +279,27 @@ pub fn has_tracked_changes(path: &Path) -> Result<bool> {
     Ok(!status.trim().is_empty())
 }
 
+/// The raw `git status --porcelain` lines (`XY <path>`), untracked files included. Empty
+/// means a clean tree.
+pub fn porcelain_lines(path: &Path) -> Result<Vec<String>> {
+    debug!("porcelain_lines: path={}", path.display());
+    let output = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(path)
+        .output()
+        .context("Failed to run git status")?;
+
+    if !output.status.success() {
+        bail!("git status failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
 /// List the paths git considers dirty (staged, modified, or untracked) via
 /// `git status --porcelain`. Captured BEFORE bump mutates anything so the lockfile
 /// guard can tell a bump-synced lockfile from one the user had already changed.

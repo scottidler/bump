@@ -199,8 +199,8 @@ enum ReleaseState {
     /// Ungated, nothing ahead, the version already tagged, WITH Scott's standalone order:
     /// the version commit is the release (made with `force`, the tip carries the old tag).
     UngatedStandalone { target_tag: String, default: String },
-    /// Dirty working tree.
-    DirtyTree,
+    /// Dirty working tree; `files` are the `git status --porcelain` lines.
+    DirtyTree { files: Vec<String> },
     /// Detached HEAD.
     DetachedHead,
     /// Gated, on a feature branch, no pending version, no version line in the diff:
@@ -606,6 +606,7 @@ pub fn release<P: Pusher, I: Installer, R: Pr, C: Ci>(
         );
     }
     let config = config::load(dir)?;
+    check_install_not_empty(&opts.install, &config)?;
     let state = classify(dir, opts)?;
     debug!("release: classified state={:?}", state);
     let ports = Ports {
@@ -625,8 +626,9 @@ fn classify(dir: &Path, opts: &ReleaseOpts) -> Result<ReleaseState> {
     if !git::is_git_repo(dir) {
         bail!("not a git repository: {}", dir.display());
     }
-    if git::has_uncommitted_changes(dir)? {
-        return Ok(ReleaseState::DirtyTree);
+    let files = git::porcelain_lines(dir)?;
+    if !files.is_empty() {
+        return Ok(ReleaseState::DirtyTree { files });
     }
 
     let current = git::current_branch(dir)?;
@@ -1017,9 +1019,11 @@ fn execute<P: Pusher, I: Installer, R: Pr, C: Ci>(
             "nothing to release: nothing ahead of origin/{default} and the version is already tagged.\n\
              {STANDALONE_DOOR}"
         ),
-        ReleaseState::DirtyTree => bail!(
+        ReleaseState::DirtyTree { files } => bail!(
             "the working tree is dirty; bump release only performs the mechanical release on a CLEAN tree.\n\
-             Commit or stash your changes first, then bump release"
+             {}\n\
+             Commit them, `git stash -u`, remove them, or gitignore them, then bump release",
+            files.join("\n")
         ),
         ReleaseState::DetachedHead => bail!(
             "HEAD is detached; bump release runs on the default branch.\n\
@@ -1131,6 +1135,22 @@ fn execute<P: Pusher, I: Installer, R: Pr, C: Ci>(
              Gated generic repos are unsupported: bump finish cannot derive a version without a manifest."
         ),
     }
+}
+
+/// Refuse an empty install command before any work: `sh -c ""` exits 0 and would count as
+/// an install. Precedence first, emptiness second: `--no-install` beats an empty `install:`,
+/// and a non-empty `--install` beats it too; only the command that would actually run is
+/// checked.
+pub(crate) fn check_install_not_empty(choice: &InstallChoice, config: &Config) -> Result<()> {
+    let effective = match choice {
+        InstallChoice::Skip => return Ok(()),
+        InstallChoice::Command(cmd) => Some(cmd),
+        InstallChoice::Auto => config.install.as_ref(),
+    };
+    if effective.is_some_and(|cmd| cmd.trim().is_empty()) {
+        bail!("install command is empty; pass --no-install to skip the install");
+    }
+    Ok(())
 }
 
 /// Fresh ungated release: version commit -> push branch -> confirm on origin -> CI gate

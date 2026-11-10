@@ -177,7 +177,8 @@ fn finish_reinstalls_after_a_failed_verify() {
 }
 
 /// Row 5: a generic (no-manifest) repo -- finish cannot derive a version, so it refuses with
-/// the gated-generic-unsupported message before any checkout.
+/// `bump finish does not support generic repos` before any checkout. The old wording said
+/// "Gated generic repos are unsupported" without ever checking the gate (C6).
 #[test]
 fn finish_gated_generic_repo_refuses() {
     let (origin, work) = setup_generic_gated_feature();
@@ -188,8 +189,8 @@ fn finish_gated_generic_repo_refuses() {
     let err = finish(dir, &finish_opts(false), &pusher, &installer, &NoCi)
         .expect_err("gated generic must refuse")
         .to_string();
-    assert!(err.contains("generic"), "got: {err}");
-    assert!(err.contains("unsupported"), "got: {err}");
+    assert!(err.contains("bump finish does not support generic repos"), "got: {err}");
+    assert!(!err.contains("Gated"), "must not claim a gate it never checked: {err}");
     assert!(err.contains("manifest"), "must explain the missing manifest: {err}");
     assert!(pusher.calls().is_empty());
     drop(origin);
@@ -512,4 +513,81 @@ fn finish_creates_a_missing_default_branch_from_origin() {
     assert_eq!(read_cargo_version(dir), "0.1.6");
     assert_eq!(pusher.calls(), vec!["tag:v0.1.6".to_string()]);
     drop(origin);
+}
+
+// ---- empty install (bug 6): precedence first, emptiness second -----------------------
+
+const EMPTY_INSTALL: &str = "install command is empty; pass --no-install to skip the install";
+
+/// finish's `[DIR]` repo with `install: ""` in its tracked-free `bump.yml`.
+fn finish_repo_with_empty_config_install() -> (TempDir, TempDir) {
+    let (origin, work) = setup_released("0.1.6");
+    fs::write(work.path().join("bump.yml"), "install: \"\"\n").unwrap();
+    fs::write(work.path().join(".git/info/exclude"), "bump.yml\n").unwrap();
+    (origin, work)
+}
+
+fn finish_with(dir: &Path, install: InstallChoice) -> (Result<ReleaseReport>, Vec<String>) {
+    let pusher = RecordingPusher::new(false);
+    let installer = RecordingInstaller::new();
+    let opts = FinishOpts {
+        install,
+        ..finish_opts(true)
+    };
+    let result = finish(dir, &opts, &pusher, &installer, &NoCi);
+    (result, installer.calls())
+}
+
+#[test]
+fn finish_refuses_empty_config_install() {
+    let (origin, work) = finish_repo_with_empty_config_install();
+    let (result, calls) = finish_with(work.path(), InstallChoice::Auto);
+    assert_eq!(
+        result.expect_err("empty install: must refuse").to_string(),
+        EMPTY_INSTALL
+    );
+    assert!(calls.is_empty());
+    drop(origin);
+}
+
+#[test]
+fn finish_refuses_empty_install_flag() {
+    let (origin, work) = setup_released("0.1.6");
+    for empty in ["", "   "] {
+        let (result, calls) = finish_with(work.path(), InstallChoice::Command(empty.to_string()));
+        assert_eq!(
+            result.expect_err("empty --install must refuse").to_string(),
+            EMPTY_INSTALL
+        );
+        assert!(calls.is_empty());
+    }
+    drop(origin);
+}
+
+#[test]
+fn finish_no_install_beats_empty_config_install() {
+    let (origin, work) = finish_repo_with_empty_config_install();
+    let (result, _) = finish_with(work.path(), InstallChoice::Skip);
+    result.expect("--no-install beats an empty install:");
+    drop(origin);
+}
+
+#[test]
+fn finish_non_empty_install_flag_beats_empty_config_install() {
+    let (origin, work) = finish_repo_with_empty_config_install();
+    let (result, _) = finish_with(work.path(), InstallChoice::Command("make install".to_string()));
+    result.expect("a non-empty --install beats an empty install:");
+    drop(origin);
+}
+
+/// finish checks the config of the worktree it picked: run from a feature worktree whose
+/// own config is fine, the default-branch worktree's empty `install:` still refuses.
+#[test]
+fn finish_checks_the_config_of_the_worktree_it_picked() {
+    let wt = setup_finish_worktrees("0.1.5", "0.1.6");
+    fs::write(wt.main.path().join("bump.yml"), "install: \"\"\n").unwrap();
+    fs::write(wt.main.path().join(".git/info/exclude"), "bump.yml\n").unwrap();
+    let (result, _) = finish_with(wt.feature.path(), InstallChoice::Auto);
+    assert_eq!(result.expect_err("must refuse").to_string(), EMPTY_INSTALL);
+    drop(wt.origin);
 }

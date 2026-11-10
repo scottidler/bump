@@ -328,6 +328,106 @@ fn refuses_dirty_tree() {
     drop(origin);
 }
 
+/// Bug 5: the refusal names the files (porcelain lines, untracked included) and offers
+/// advice that works on untracked-only trees, where `git stash` alone says "No local
+/// changes to save".
+#[test]
+fn dirty_tree_refusal_lists_the_files_and_working_advice() {
+    let _guard = crate::ENV_LOCK.lock().unwrap();
+    let (origin, work) = setup_released("0.1.5");
+    let dir = work.path();
+    fs::write(dir.join("scratch.txt"), "x").unwrap();
+    fs::write(dir.join("Cargo.toml"), "# edited\n").unwrap();
+
+    let prev = set_probe("ungated");
+    let err = release(
+        dir,
+        &auto_opts(None, false),
+        &RecordingPusher::new(false),
+        &RecordingInstaller::new(),
+        &no_pr(),
+        &NoCi,
+    )
+    .expect_err("dirty tree must refuse")
+    .to_string();
+    restore_probe(prev);
+    assert!(err.contains("?? scratch.txt"), "lists the untracked file: {err}");
+    assert!(err.contains(" M Cargo.toml"), "lists the modified file: {err}");
+    assert!(
+        err.contains("Commit them, `git stash -u`, remove them, or gitignore them"),
+        "got: {err}"
+    );
+    assert!(!err.contains("Commit or stash"), "the old advice is gone: {err}");
+    drop(origin);
+}
+
+// ---- empty install (bug 6): precedence first, emptiness second -----------------------
+
+const EMPTY_INSTALL: &str = "install command is empty; pass --no-install to skip the install";
+
+fn release_with_install(dir: &Path, install: InstallChoice) -> (Result<ReleaseReport>, Vec<String>) {
+    let installer = RecordingInstaller::new();
+    let opts = ReleaseOpts {
+        install,
+        ..auto_opts(None, true)
+    };
+    let prev = set_probe("ungated");
+    let result = release(dir, &opts, &RecordingPusher::new(false), &installer, &no_pr(), &NoCi);
+    restore_probe(prev);
+    (result, installer.calls())
+}
+
+fn released_repo_with_empty_config_install() -> (TempDir, TempDir) {
+    let (origin, work) = setup_released("0.1.5");
+    fs::write(work.path().join("bump.yml"), "install: \"\"\n").unwrap();
+    fs::write(work.path().join(".git/info/exclude"), "bump.yml\n").unwrap();
+    (origin, work)
+}
+
+#[test]
+fn release_refuses_empty_config_install() {
+    let _guard = crate::ENV_LOCK.lock().unwrap();
+    let (origin, work) = released_repo_with_empty_config_install();
+    let (result, calls) = release_with_install(work.path(), InstallChoice::Auto);
+    assert_eq!(result.expect_err("must refuse").to_string(), EMPTY_INSTALL);
+    assert!(calls.is_empty());
+    drop(origin);
+}
+
+#[test]
+fn release_refuses_empty_install_flag() {
+    let _guard = crate::ENV_LOCK.lock().unwrap();
+    let (origin, work) = setup_released("0.1.5");
+    for empty in ["", "  "] {
+        let (result, calls) = release_with_install(work.path(), InstallChoice::Command(empty.to_string()));
+        assert_eq!(result.expect_err("must refuse").to_string(), EMPTY_INSTALL);
+        assert!(calls.is_empty());
+    }
+    drop(origin);
+}
+
+/// Past the empty-install check the repo is `Nothing`, which refuses with its own message:
+/// reaching it proves the empty `install:` was overridden.
+#[test]
+fn release_no_install_beats_empty_config_install() {
+    let _guard = crate::ENV_LOCK.lock().unwrap();
+    let (origin, work) = released_repo_with_empty_config_install();
+    let (result, _) = release_with_install(work.path(), InstallChoice::Skip);
+    let err = result.expect_err("nothing to release").to_string();
+    assert!(err.contains("nothing to release"), "got: {err}");
+    drop(origin);
+}
+
+#[test]
+fn release_non_empty_install_flag_beats_empty_config_install() {
+    let _guard = crate::ENV_LOCK.lock().unwrap();
+    let (origin, work) = released_repo_with_empty_config_install();
+    let (result, _) = release_with_install(work.path(), InstallChoice::Command("make install".to_string()));
+    let err = result.expect_err("nothing to release").to_string();
+    assert!(err.contains("nothing to release"), "got: {err}");
+    drop(origin);
+}
+
 /// bash: `die "ungated release runs from the default branch..."`.
 #[test]
 fn refuses_when_not_on_default() {

@@ -83,3 +83,19 @@
 - Showing `Would tag:` for the nothing-to-stage case vs. leaving it under "Would commit and tag": the latter is the same false claim C1 fixes in the real run.
 ### Open questions
 - None.
+
+## Phase 7: Release and finish refusals (bug 5, bug 6, C6)
+### Design decisions
+- `ReleaseState::DirtyTree { files }` holds raw `git status --porcelain` lines (`?? scratch.txt`, ` M Cargo.toml`) - `src/release.rs:classify`, new `git::porcelain_lines` in `src/git.rs` - the doc says "porcelain lines"; the existing `dirty_files` strips the status columns, so a new fn returns them whole.
+- Dirty refusal wording (doc gave only the advice list): "the working tree is dirty; bump release only performs the mechanical release on a CLEAN tree.", the file lines, then "Commit them, `git stash -u`, remove them, or gitignore them, then bump release" - `src/release.rs:execute` - "Commit" capitalized as a sentence start.
+- C6 wording: "bump finish does not support generic repos: it cannot derive a version without a manifest." - `src/release/finish.rs:finish`.
+- Empty-install check is one shared `check_install_not_empty(choice, config)` - `src/release.rs` - precedence by construction: `Skip` returns Ok, `Command` checks only the flag value, `Auto` checks only `config.install`. The value is trimmed, so whitespace-only counts as empty.
+- `release()` runs the check right after `config::load`, before `classify`, so an empty install refuses regardless of repo state.
+- `finish()` checks `config::load(work)` (the worktree it picked) before any mutation and in the dry run, and checks again after `reach_merged_tip` with the merged tip's config, since that is the config the install actually uses.
+### Deviations
+- `finish_gated_generic_repo_refuses` was updated to assert the new message and that it no longer says "Gated" (the old wording pinned by name, inverted).
+- The release `GatedGeneric` refusal keeps "Gated generic repos are unsupported": that path did check the gate, so C6 (finish-only) does not apply.
+### Tradeoffs
+- A second post-merge check in `finish` vs one early check: a tracked `bump.yml` could change in the merge; the extra check costs one comparison.
+### Open questions
+- None.

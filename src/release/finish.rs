@@ -3,7 +3,8 @@
 use super::ci::{Ci, ci_gate};
 use super::tag::{TagTarget, echo_tag_steps, gate_tag_and_push};
 use super::{
-    FinishOpts, Installer, Pusher, ReleaseReport, agreed_file_version, echo_install, resolve_install, run_install,
+    FinishOpts, Installer, Pusher, ReleaseReport, agreed_file_version, check_install_not_empty, echo_install,
+    resolve_install, run_install,
 };
 use crate::config::{self, Config};
 use crate::git::{self, HeadRemote};
@@ -108,15 +109,19 @@ pub fn finish<P: Pusher, I: Installer, C: Ci>(
         );
     }
 
-    // Generic repo (no version-bearing manifest): finish cannot derive a version to tag.
-    // Gated generic is unsupported per the design's Resolved Decisions -- fail closed.
+    // Generic repo (no version-bearing manifest): finish cannot derive a version to tag,
+    // gated or not, so it refuses without probing the gate.
     let manifests = lang::detect(work)?;
     if manifests.is_empty() {
         bail!(
             "this repo has no version-bearing manifest (generic).\n\
-             Gated generic repos are unsupported: bump finish cannot derive a version without a manifest."
+             bump finish does not support generic repos: it cannot derive a version without a manifest."
         );
     }
+
+    // The config of the worktree finish picked, not the caller's cwd, and before any
+    // mutation (the merged tip's config is checked again once it is reached).
+    check_install_not_empty(&opts.install, &config::load(work)?)?;
 
     if opts.dry_run {
         let config = config::load(work)?;
@@ -128,6 +133,7 @@ pub fn finish<P: Pusher, I: Installer, C: Ci>(
     }
     reach_merged_tip(work, &place, &default)?;
     let config = config::load(work)?;
+    check_install_not_empty(&opts.install, &config)?;
 
     // Reuse the --tag-only verification ladder (clean-tree, on-default, HEAD==origin,
     // manifest-version -> tag, remote-then-local existence). The consumer decides the
