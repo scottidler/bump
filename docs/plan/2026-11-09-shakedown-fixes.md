@@ -18,9 +18,20 @@ Contract changes a caller can observe:
 - verify skips (true reason) on shell syntax, an out-of-repo `--path`, or a custom
   install root; env-prefixed `cargo install` now verifies.
 - `--gates` exits 1 on UNKNOWN; `--gates --no-verify` and `--skip-member` with
-  `--tag-only` / `--gates` are clap errors.
+  `--tag-only` / `--gates` are clap errors. Its `Branch:` label reads `Default:`; the
+  `Repo:` and `Gates:` lines stay byte-identical to v0.4.7 (`/plan:release` matches
+  `Gates:  none (ungated)` whole).
 - an empty install command is refused.
 - `finish -n` fetches (still changes nothing) and prints only the steps that would run.
+- plain `bump -n` refuses on an already-tagged HEAD (`HEAD already has a tag`, exit 1),
+  as the real run does.
+- gated `bump release` no longer opens the PR: it stops after the push and prints the
+  `/pr:create` hand-off and the `Release: rides this PR (vX.Y.Z)` line.
+- `bump release` and `bump finish` take an optional `[DIR]` (default: the cwd).
+- install and verify messages: an install failure prints its exit status and `re-run bump
+  finish <root>`; a verify failure reads `exited with exit status: N`; the no-Cargo-manifest
+  install skip names `--install` / `install:`; the verify fact line prints the binary's
+  resolved path.
 
 ## Problem Statement
 
@@ -516,6 +527,31 @@ argument '<dir>' found`, exit 2.
   child-process permissions (unquantified).
 - 2026-11-09, author: `--gates` UNKNOWN exits 1. No script reads its exit code (hooks
   only pattern-match the command); `/plan:release` already routes non-zero to Branch 5.
+- 2026-11-09, implementation audit round 1. Folded into the phase commits:
+  - Phase 10: the `Repo:` / `Gates:` re-pad is reverted. `/plan:release` matches
+    `Gates:  none (ungated)` byte for byte, and the doc asked only for `Branch:` ->
+    `Default:`. A test pins the exact line.
+  - Phase 8: `#` and `~` at the start of a word and unquoted `*`, `?`, `[` join the
+    shell-syntax set (Data Model amended), so `--path ~/x`, `--path ./sr*` and `--path . #
+    c` skip for the true reason.
+  - Phase 11: `finish -n` fetches with `--no-tags` (it imported tags under
+    `remote.origin.tagOpt=--tags`); when the checkout is not at the merged tip it reads
+    the `bump.yml` committed at the tip, falling back to the worktree file when the tip
+    has none and the file is untracked; a `ci: none` committed at the tip prints the CI
+    skip, not the wait.
+  - Phase 7: the stale "Gated generic repos" comment in `src/release/finish.rs` now says
+    finish refuses a generic repo without probing the gate (C6).
+- 2026-11-09, implementation audit round 1, deferred:
+  - Real and dry `finish` should both refuse when manifests disagree. The real run tags
+    the primary manifest's version in v0.4.7 and now; v0.4.7's dry-run refusal there was
+    false. Predates this work: a follow-up doc makes both paths fail closed.
+  - The re-run line does not shell-quote a root with spaces. Paths here carry no spaces
+    (`rules/general.md`); quote it when the line is next touched.
+  - Delete the cherry-picked branches `leave-pr-to-pr-create` and `release-verbs-take-dir`
+    (local `git branch -D`, and origin) after main is pushed. `-d` refuses: they were
+    cherry-picked, not merged.
+  - Staff's claim that `finish -n` picks the manifest filename from the old checkout
+    after an ecosystem swap is unverified: not probed, edge case.
 
 ## Alternatives Considered
 

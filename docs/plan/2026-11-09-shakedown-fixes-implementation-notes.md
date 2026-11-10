@@ -192,3 +192,23 @@
 - Documenting the shell-syntax character set in the README vs. only naming the reason: the set is the contract a caller needs to predict a skip, and it names no counts or versions that drift.
 ### Open questions
 - None.
+
+## Implementation audit fixes (round 1)
+### Design decisions
+- `--gates` report: `Repo:   ` and `Gates:  ` back at their v0.4.7 padding, `Default: ` kept - `src/main.rs:report_gates`, `tests/gates.rs`, `tests/subdir.rs`, README - `/plan:release` matches `Gates:  none (ungated)` whole; new test `ungated_line_is_byte_identical_to_v0_4_7` pins the line. This reverts the "Phase 10 (superseding note)" re-pad; the original Phase 10 tradeoff stands.
+- Shell-syntax set gains unquoted `*`, `?`, `[` anywhere and `#`, `~` at the start of a word - `src/lang/cargo.rs:SHELL_SYNTAX_CHARS`, `WORD_START_SYNTAX_CHARS`, `split_command_words` - "start of a word" is the splitter's own `!in_word`, so `a#b` and `a~b` stay literal as in `sh`, and a quoted or escaped `"~/x"`, `'*'`, `\*` never reaches the check.
+- `finish -n` fetches with `git::fetch_branch_no_tags` (`git fetch --no-tags origin <default>`) - `src/git.rs`, `src/release/finish.rs:finish_dry_run` - the fetch moved out of `classify_default` into its two callers, so the real run keeps `fetch_branch` and only the preview changes.
+- `config_at_merged_tip` - `src/release/finish.rs` - the `bump.yml` the real run reads after its move: at the tip already -> worktree file; committed at the tip -> `config::load_at(tip)`; tracked at HEAD but absent at the tip -> defaults (the move deletes it); else the worktree file (untracked or absent). Phase 7's empty-install check also runs on that config in the dry-run, as the real run re-checks after its fast-forward.
+- CI line: new `CiPreview` (`Wait`, `SkippedByFlag`, `DeclaredNone(sha)`) - `src/release/tag.rs:echo_tag_steps` - `finish -n` reads `config::load_at(tip).ci`, the same committed-only read `wait_for_green` makes, and prints `[dry-run] CI gate: skipped, bump.yml at <sha8> declares `ci: none`` instead of the wait. The release dry-runs pass `CiPreview::from_gate`, unchanged output.
+- C6 comment in `finish` reworded: finish refuses a generic repo without probing the gate.
+### Deviations
+- The doc's shell-syntax amendment and the README updates ride a fixup of the Phase 12 commit, not Phase 8: the design doc and README sections were first committed in Phase 12, so a Phase 8 fixup touching them could not apply.
+- The `bump.yml` read at the tip applies whenever the checkout is not at the merged tip (behind, and the check-it-out-here case), not only "behind": the real run moves the worktree to the tip in both, so the same rule holds. Same effect, correct seam.
+- `finish -n` under `ci: none` prints a one-line CI skip rather than nothing, mirroring the real run's skip notice and the existing `--no-ci-gate` preview line. No wait line prints.
+### Tradeoffs
+- `--no-tags` only on the preview fetch vs on every `fetch_branch`: the real run's tag import under `tagOpt=--tags` is outside the audit finding and the doc; changing it would widen the fix.
+- The CI skip reads `bump.yml` committed at the tip (as the real run) vs the effective install config (which can be an untracked file): an untracked `ci: none` does not skip the real run's gate, so the preview must not either.
+- Install/verify still read `Cargo.toml` from the worktree (verify target, bin name); only `bump.yml` is read at the tip. The audit scoped the fix to `bump.yml`; the ecosystem-swap case stays deferred.
+### Open questions
+- The ungated `bump release -n` resume path (pending version, HEAD known) still prints the CI wait under a committed `ci: none`; the same `CiPreview::DeclaredNone` read would fix it. Fold into a follow-up?
+- Branch deletion (`leave-pr-to-pr-create`, `release-verbs-take-dir`, local `-D` and origin) is still outstanding, for after main is pushed.
