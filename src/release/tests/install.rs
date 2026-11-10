@@ -538,3 +538,37 @@ fn verify_default_install_targets_the_repo_root() {
         vec![verified_entry(tmp.path(), "test-pkg", "v1.0.0")]
     );
 }
+
+/// The three skip reasons the shakedown-fixes doc added, each printed verbatim, and an
+/// env-prefixed `cargo install` of this repo verifies.
+#[test]
+fn verify_target_new_skip_reasons_and_env_prefix() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    let other_dir = tmp.path().join("other");
+    fs::create_dir_all(&repo).unwrap();
+    fs::create_dir_all(&other_dir).unwrap();
+    write_cargo(&repo, "1.0.0");
+    write_cargo(&other_dir, "9.9.9");
+    let skip = |reason: &str| VerifyTarget::Skip(reason.to_string());
+    assert_eq!(
+        verify_target(&repo, "cargo install --path . && echo done"),
+        skip("install command uses shell syntax; verify reads one plain cargo install")
+    );
+    assert_eq!(
+        verify_target(&repo, "CARGO_INSTALL_ROOT=/x cargo install --path ."),
+        skip("install command sets its own install root")
+    );
+    let other = other_dir.canonicalize().unwrap();
+    assert_eq!(
+        verify_target(&repo, "cargo install --path ../other"),
+        skip(&format!("install target {} is outside this repo", other.display()))
+    );
+    assert_eq!(
+        verify_target(&repo, "RUSTFLAGS=-g cargo install --path ."),
+        VerifyTarget::Verify {
+            dir: repo.clone(),
+            bin: "test-pkg".to_string()
+        }
+    );
+}

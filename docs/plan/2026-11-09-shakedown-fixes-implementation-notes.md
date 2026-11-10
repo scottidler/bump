@@ -99,3 +99,21 @@
 - A second post-merge check in `finish` vs one early check: a tracked `bump.yml` could change in the merge; the extra check costs one comparison.
 ### Open questions
 - None.
+
+## Phase 8: True verify verdicts (bug 7)
+### Design decisions
+- `split_command_words` returns a `CommandWords { words, shell_syntax }` struct - `src/lang/cargo.rs:split_command_words` - the doc says it "also reports" shell syntax; a named field reads better at the one call site than a tuple. Syntax characters are reported, not interpreted: `a;b` stays one word and the caller skips on the flag.
+- The recognizer consumes leading `NAME=value` words (`assignment_name`, `[A-Za-z_][A-Za-z0-9_]*`), an optional bare `env`, more `NAME=value` words, then `cargo [+toolchain] install` - `src/lang/cargo.rs:cargo_install_target`. `env -i ...` or any other `env` flag is outside the shape and skips as "not cargo install".
+- The arg loop no longer returns `NotThisRepo` on the first positional: it records it and keeps scanning, so a later `--root` still yields `CustomRoot` (reason 3 before reason 4, the doc's order).
+- Containment runs only when `--path` is given: `dir.join(p)` and `dir` both canonicalized; either failing (the target does not exist) falls through to `Dir`, which the binary-name check then skips, as the doc says. `Dir` keeps the as-written path (components-collected), so the existing `/repo` table tests and the printed manifest path are unchanged.
+- `InstallTarget` variants are declared in check order, with `ShellSyntax` first.
+### Deviations
+- `$` and backtick inside double quotes count as shell syntax, and `\$` / `` \` `` inside double quotes are now escapes (literal `$` / backtick). The doc says "unquoted, unescaped"; `sh` expands `$X` and backticks inside double quotes, so `--path "$X"` would otherwise read a literal `$X` path and skip for the wrong reason. Single quotes stay fully literal.
+- The outside-repo reason prints the canonical target (`install target /.../other is outside this repo`), since the doc leaves `<p>` unspecified and the canonical path is the one that was checked (it names the real target of an in-repo symlink).
+- Binary tests live in a new `tests/verify.rs`, not `tests/release_cli.rs` (own `t4` + sibling fixture, same reason as Phase 4's `tests/subdir.rs`).
+### Tradeoffs
+- Flagging `$` inside double quotes vs. the doc's literal "unquoted": the doc's goal is a true reason, and the extra case only turns a misleading binary-name skip into the shell-syntax skip; nothing that verified before stops verifying.
+- Printing the canonical path vs. the `--path` value as written: the written `../other` is shorter, but for a symlink it would hide where the install actually reads from.
+### Open questions
+- `~` (tilde expansion), glob characters and a `#` comment are not in the doc's shell-syntax set. `--path ~/x` joins to `<repo>/~/x`, which does not exist, so it skips on "no binary name" (a skip, never a wrong verify, but not the true reason). Add them to the set?
+- Phase 12's README bullet says "six verify skip reasons"; the Data Model now lists seven. Phase 12 should document seven.

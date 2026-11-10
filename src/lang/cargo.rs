@@ -264,14 +264,27 @@ pub fn has_clap_dependency(dir: &Path) -> bool {
 }
 
 /// What a post-release install command installs, as far as the verify step can tell.
+/// Variants are in the verify step's check order: each one is the first true reason.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallTarget {
-    /// Not a `cargo install` at all (`make install`, a script): nothing says what it
+    /// Shell syntax outside quotes (`&&`, `;`, `|`, a redirect, `$X`, `$(...)`, a
+    /// backtick, a trailing `&`): verify reads one plain `cargo install`, never a
+    /// compound or an expansion.
+    ShellSyntax,
+    /// Not the one recognized shape, `[NAME=value ...] [env [NAME=value ...]] cargo
+    /// [+toolchain] install <args>` (`make install`, a script): nothing says what it
     /// installs.
     NotCargoInstall,
+    /// A `cargo install` into a root other than the default (`--root`, or a
+    /// `CARGO_INSTALL_ROOT=` / `CARGO_HOME=` prefix): verify would read the default root
+    /// and run a stale binary.
+    CustomRoot,
     /// A `cargo install` of something other than this checkout: a positional crate name
     /// (crates.io), `--git`, or `--registry`.
     NotThisRepo,
+    /// A `--path` that resolves (symlinks followed) outside the repo: the canonical
+    /// target.
+    OutsideRepo(PathBuf),
     /// A `cargo install` of this checkout: the directory it installs from (`--path <dir>`
     /// or `--path=<dir>` joined onto the repo, else the repo itself).
     Dir(PathBuf),
@@ -305,16 +318,39 @@ const CARGO_INSTALL_VALUE_FLAGS: &[&str] = &[
     "--message-format",
 ];
 
+/// Characters that make `sh` do more than run one command with literal words when they
+/// appear outside quotes and unescaped.
+const SHELL_SYNTAX_CHARS: &[char] = &['$', '`', ';', '&', '|', '<', '>', '(', ')', '\n', '*', '?', '['];
+
+/// Characters `sh` treats specially only at the start of a word: `#` opens a comment
+/// (`cargo install --path . # --root /x` drops the `--root`), `~` expands to `$HOME`.
+const WORD_START_SYNTAX_CHARS: &[char] = &['#', '~'];
+
+/// Environment prefixes that move where `cargo install` puts the binary.
+const CARGO_ROOT_VARS: &[&str] = &["CARGO_INSTALL_ROOT", "CARGO_HOME"];
+
+/// An install command split into words, plus whether it met any shell syntax.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CommandWords {
+    words: Vec<String>,
+    /// Any unquoted, unescaped `SHELL_SYNTAX_CHARS` or word-initial
+    /// `WORD_START_SYNTAX_CHARS`, or a `$` / backtick inside double quotes (where `sh`
+    /// still expands them).
+    shell_syntax: bool,
+}
+
 /// Split `command` into words the way `sh` would for the cases an install line uses:
 /// whitespace separates, single quotes are literal, double quotes group (a backslash
-/// escapes `"` or `\` inside them), and a backslash outside quotes escapes the next
-/// character. Quoted pieces join the word they touch, so `--path="my dir"` is one word.
-/// An unterminated quote runs to the end of the command; `sh` itself rejects that line
-/// before verify is reached.
-fn split_command_words(command: &str) -> Vec<String> {
+/// escapes `"`, `\`, `$` or a backtick inside them), and a backslash outside quotes
+/// escapes the next character. Quoted pieces join the word they touch, so
+/// `--path="my dir"` is one word. An unterminated quote runs to the end of the command;
+/// `sh` itself rejects that line before verify is reached. Shell syntax is reported, not
+/// interpreted: `a;b` is still one word, and the caller skips on the flag.
+fn split_command_words(command: &str) -> CommandWords {
     let mut words = Vec::new();
     let mut word = String::new();
     let mut in_word = false;
+    let mut shell_syntax = false;
     let mut chars = command.chars();
     while let Some(c) = chars.next() {
         match c {
@@ -328,13 +364,17 @@ fn split_command_words(command: &str) -> Vec<String> {
                     match q {
                         '"' => break,
                         '\\' => match chars.next() {
-                            Some(e @ ('"' | '\\')) => word.push(e),
+                            Some(e @ ('"' | '\\' | '$' | '`')) => word.push(e),
                             Some(e) => {
                                 word.push('\\');
                                 word.push(e);
                             }
                             None => word.push('\\'),
                         },
+                        '$' | '`' => {
+                            shell_syntax = true;
+                            word.push(q);
+                        }
                         _ => word.push(q),
                     }
                 }
@@ -344,6 +384,11 @@ fn split_command_words(command: &str) -> Vec<String> {
                 if let Some(e) = chars.next() {
                     word.push(e);
                 }
+            }
+            c if SHELL_SYNTAX_CHARS.contains(&c) || (!in_word && WORD_START_SYNTAX_CHARS.contains(&c)) => {
+                shell_syntax = true;
+                in_word = true;
+                word.push(c);
             }
             c if c.is_whitespace() => {
                 if in_word {
@@ -360,15 +405,47 @@ fn split_command_words(command: &str) -> Vec<String> {
     if in_word {
         words.push(word);
     }
-    words
+    CommandWords { words, shell_syntax }
 }
 
-/// Resolve what `command` installs, relative to the repo at `dir`. Words are split with
-/// shell quoting (`split_command_words`), and a `cargo +<toolchain> install` is still a
-/// `cargo install`.
+/// The `NAME` of a `NAME=value` environment prefix word, `NAME` matching
+/// `[A-Za-z_][A-Za-z0-9_]*`; `None` for any other word.
+fn assignment_name(word: &str) -> Option<&str> {
+    let (name, _) = word.split_once('=')?;
+    let mut name_chars = name.chars();
+    let first = name_chars.next()?;
+    let valid =
+        (first.is_ascii_alphabetic() || first == '_') && name_chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+    valid.then_some(name)
+}
+
+/// Consume leading `NAME=value` words; true when one of them moves the install root.
+fn skip_assignments<'a, I: Iterator<Item = &'a str>>(words: &mut std::iter::Peekable<I>) -> bool {
+    let mut sets_root = false;
+    while let Some(name) = words.peek().and_then(|word| assignment_name(word)) {
+        sets_root |= CARGO_ROOT_VARS.contains(&name);
+        words.next();
+    }
+    sets_root
+}
+
+/// Resolve what `command` installs, relative to the repo at `dir`, returning the first
+/// true reason in `InstallTarget`'s order. Words are split with shell quoting
+/// (`split_command_words`); the one recognized shape is `[NAME=value ...] [env
+/// [NAME=value ...]] cargo [+toolchain] install <args>`, and anything outside it skips.
+/// A `--path` is joined onto `dir`, then both are canonicalized (symlinks followed) for
+/// the containment check; a path that does not exist is returned as is, and the binary
+/// name check skips it.
 pub fn cargo_install_target(dir: &Path, command: &str) -> InstallTarget {
-    let words = split_command_words(command);
-    let mut words = words.iter().map(String::as_str).peekable();
+    let split = split_command_words(command);
+    if split.shell_syntax {
+        return InstallTarget::ShellSyntax;
+    }
+    let mut words = split.words.iter().map(String::as_str).peekable();
+    let mut custom_root = skip_assignments(&mut words);
+    if words.next_if_eq(&"env").is_some() {
+        custom_root |= skip_assignments(&mut words);
+    }
     if words.next() != Some("cargo") {
         return InstallTarget::NotCargoInstall;
     }
@@ -376,17 +453,18 @@ pub fn cargo_install_target(dir: &Path, command: &str) -> InstallTarget {
     if words.next() != Some("install") {
         return InstallTarget::NotCargoInstall;
     }
+    let mut not_this_repo = false;
     let mut path = None;
     while let Some(word) = words.next() {
         let (flag, inline_value) = match word.split_once('=') {
             Some((flag, value)) if flag.starts_with('-') => (flag, Some(value)),
             _ => (word, None),
         };
-        if !flag.starts_with('-') {
-            return InstallTarget::NotThisRepo;
+        if !flag.starts_with('-') || flag == "--git" || flag == "--registry" {
+            not_this_repo = true;
         }
-        if flag == "--git" || flag == "--registry" {
-            return InstallTarget::NotThisRepo;
+        if flag == "--root" {
+            custom_root = true;
         }
         if !CARGO_INSTALL_VALUE_FLAGS.contains(&flag) {
             continue;
@@ -396,10 +474,21 @@ pub fn cargo_install_target(dir: &Path, command: &str) -> InstallTarget {
             path = value;
         }
     }
+    if custom_root {
+        return InstallTarget::CustomRoot;
+    }
+    if not_this_repo {
+        return InstallTarget::NotThisRepo;
+    }
     let target = match path {
         Some(p) => dir.join(p),
-        None => dir.to_path_buf(),
+        None => return InstallTarget::Dir(dir.components().collect()),
     };
+    if let (Ok(canonical_target), Ok(canonical_root)) = (target.canonicalize(), dir.canonicalize())
+        && !canonical_target.starts_with(&canonical_root)
+    {
+        return InstallTarget::OutsideRepo(canonical_target);
+    }
     // `components()` drops interior `.`: `--path .` names the repo itself, not `<repo>/.`.
     InstallTarget::Dir(target.components().collect())
 }
@@ -799,7 +888,7 @@ name = "test"
 
     #[test]
     fn test_split_command_words_honors_quotes() {
-        let split = |s: &str| split_command_words(s);
+        let split = |s: &str| split_command_words(s).words;
         assert_eq!(split("a  b\tc"), vec!["a", "b", "c"]);
         assert_eq!(split("--config \"build.jobs = 2\""), vec!["--config", "build.jobs = 2"]);
         assert_eq!(split("--features 'a b'"), vec!["--features", "a b"]);
@@ -843,6 +932,144 @@ name = "test"
                 "{command}"
             );
         }
+    }
+
+    /// One row per shape the shakedown-fixes doc's Phase 8 names (plus the three
+    /// shakedown commands), against a real repo dir with a sibling `other` crate and an
+    /// in-repo symlink pointing at it, so containment is checked on canonical paths.
+    #[test]
+    fn test_cargo_install_target_shape_table() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        let other = tmp.path().join("other");
+        fs::create_dir_all(repo.join("cli")).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        std::os::unix::fs::symlink(&other, repo.join("elsewhere")).unwrap();
+        let other_canonical = other.canonicalize().unwrap();
+        let root = || InstallTarget::Dir(repo.clone());
+        let abs_cli = format!("cargo install --path {}", repo.join("cli").display());
+        let rows: Vec<(&str, InstallTarget)> = vec![
+            (r"cargo install --path . --features a\;b", root()),
+            ("cargo install --path . --features \"a&&b\"", root()),
+            ("cargo install --path . 2>&1", InstallTarget::ShellSyntax),
+            ("cargo install --path $(pwd)", InstallTarget::ShellSyntax),
+            ("cargo install --path $X", InstallTarget::ShellSyntax),
+            ("cargo install --path \"$X\"", InstallTarget::ShellSyntax),
+            ("cargo install --path `pwd`", InstallTarget::ShellSyntax),
+            ("cargo install --path . &", InstallTarget::ShellSyntax),
+            ("cargo install --path . && echo done", InstallTarget::ShellSyntax),
+            ("cargo install --path .;", InstallTarget::ShellSyntax),
+            ("cargo install --path . | tee log", InstallTarget::ShellSyntax),
+            ("(cargo install --path .)", InstallTarget::ShellSyntax),
+            ("cargo install --path . > log", InstallTarget::ShellSyntax),
+            ("cargo install --path ~/x", InstallTarget::ShellSyntax),
+            ("cargo install --path ./sr*", InstallTarget::ShellSyntax),
+            ("cargo install --path . # c", InstallTarget::ShellSyntax),
+            ("cargo install --path . # --root /x", InstallTarget::ShellSyntax),
+            ("cargo install --path \"~/x\"", InstallTarget::Dir(repo.join("~/x"))),
+            ("cargo install --path '*'", InstallTarget::Dir(repo.join("*"))),
+            (
+                "cargo install --path .\ncargo install ripgrep",
+                InstallTarget::ShellSyntax,
+            ),
+            ("env A=1 cargo install --path .", root()),
+            ("env cargo install --path .", root()),
+            ("RUSTFLAGS=-g cargo install --path .", root()),
+            ("A=1 env B=2 cargo +nightly install", root()),
+            ("RUSTFLAGS=\"-C debuginfo=2\" cargo install", root()),
+            (
+                "CARGO_INSTALL_ROOT=/x cargo install --path .",
+                InstallTarget::CustomRoot,
+            ),
+            ("env CARGO_HOME=/x cargo install --path .", InstallTarget::CustomRoot),
+            ("cargo install --path . --root /x", InstallTarget::CustomRoot),
+            ("cargo install --root=/x", InstallTarget::CustomRoot),
+            (
+                "cargo install --path ../other",
+                InstallTarget::OutsideRepo(other_canonical.clone()),
+            ),
+            (
+                "cargo install --path elsewhere",
+                InstallTarget::OutsideRepo(other_canonical.clone()),
+            ),
+            (&abs_cli, InstallTarget::Dir(repo.join("cli"))),
+            ("cargo install --path missing", InstallTarget::Dir(repo.join("missing"))),
+            ("1A=1 cargo install --path .", InstallTarget::NotCargoInstall),
+            ("env -i cargo install --path .", InstallTarget::NotCargoInstall),
+            ("env", InstallTarget::NotCargoInstall),
+        ];
+        for (command, expected) in rows {
+            assert_eq!(cargo_install_target(&repo, command), expected, "{command:?}");
+        }
+    }
+
+    /// The skip reasons are checked in the doc's order: each row would also match a later
+    /// reason, and the earlier one wins.
+    #[test]
+    fn test_cargo_install_target_check_order() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(tmp.path().join("other")).unwrap();
+        for (command, expected) in [
+            ("make install; true", InstallTarget::ShellSyntax),
+            ("CARGO_HOME=/x make install", InstallTarget::NotCargoInstall),
+            ("CARGO_HOME=/x cargo install ripgrep", InstallTarget::CustomRoot),
+            ("cargo install --root /x --path ../other", InstallTarget::CustomRoot),
+            (
+                "cargo install --git https://x/y --path ../other",
+                InstallTarget::NotThisRepo,
+            ),
+            ("cargo install ripgrep --path ../other", InstallTarget::NotThisRepo),
+        ] {
+            assert_eq!(cargo_install_target(&repo, command), expected, "{command:?}");
+        }
+    }
+
+    #[test]
+    fn test_split_command_words_reports_shell_syntax() {
+        let syntax = |s: &str| split_command_words(s).shell_syntax;
+        for command in [
+            "a && b", "a;", "a | b", "a 2>&1", "$X", "\"$X\"", "`a`", "\"`a`\"", "a &", "(a)", "a\nb", "a # c", "#c",
+            "~/x", "a ~", "a*", "a?", "[ab]",
+        ] {
+            assert!(syntax(command), "{command:?}");
+        }
+        for command in [
+            r"a\;b",
+            "'a && b'",
+            "\"a&&b\"",
+            "\"a;b|c\"",
+            "'$X'",
+            "\"\\$X\"",
+            "a\\$b",
+            "a b",
+            "a#b",
+            "a~b",
+            "\"~/x\"",
+            "'~/x'",
+            "\\~/x",
+            "'*'",
+            "\"a*?[\"",
+            "\\*",
+            "\"#\"",
+        ] {
+            assert!(!syntax(command), "{command:?}");
+        }
+        assert_eq!(split_command_words("\"\\$X\"").words, vec!["$X"]);
+        assert_eq!(split_command_words("a;b").words, vec!["a;b"], "reported, not split");
+    }
+
+    #[test]
+    fn test_assignment_name() {
+        assert_eq!(assignment_name("RUSTFLAGS=-g"), Some("RUSTFLAGS"));
+        assert_eq!(assignment_name("_A1="), Some("_A1"));
+        assert_eq!(assignment_name("A=b=c"), Some("A"));
+        assert_eq!(assignment_name("1A=b"), None);
+        assert_eq!(assignment_name("=b"), None);
+        assert_eq!(assignment_name("A-B=c"), None);
+        assert_eq!(assignment_name("--path=."), None);
+        assert_eq!(assignment_name("cargo"), None);
     }
 
     #[test]

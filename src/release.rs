@@ -1550,18 +1550,31 @@ enum VerifyTarget {
 }
 
 /// Resolve the verify target from the install command that ran in `dir`. Reasons in order:
-/// not a `cargo install`; a `cargo install` of something else; no binary name in the
-/// target's manifest; no `clap` dependency there. Binary name before clap, because a
-/// virtual root has neither and "no binary name" is the truth about it.
+/// shell syntax; not a `cargo install`; its own install root; a `cargo install` of
+/// something else; a `--path` outside the repo; no binary name in the target's manifest;
+/// no `clap` dependency there. Binary name before clap, because a virtual root has
+/// neither and "no binary name" is the truth about it.
 fn verify_target(dir: &Path, command: &str) -> VerifyTarget {
+    use lang::cargo::InstallTarget;
     let target = match lang::cargo::cargo_install_target(dir, command) {
-        lang::cargo::InstallTarget::NotCargoInstall => {
+        InstallTarget::ShellSyntax => {
+            return VerifyTarget::Skip(
+                "install command uses shell syntax; verify reads one plain cargo install".to_string(),
+            );
+        }
+        InstallTarget::NotCargoInstall => {
             return VerifyTarget::Skip("install command is not cargo install".to_string());
         }
-        lang::cargo::InstallTarget::NotThisRepo => {
+        InstallTarget::CustomRoot => {
+            return VerifyTarget::Skip("install command sets its own install root".to_string());
+        }
+        InstallTarget::NotThisRepo => {
             return VerifyTarget::Skip("install command does not install this repo".to_string());
         }
-        lang::cargo::InstallTarget::Dir(target) => target,
+        InstallTarget::OutsideRepo(path) => {
+            return VerifyTarget::Skip(format!("install target {} is outside this repo", path.display()));
+        }
+        InstallTarget::Dir(target) => target,
     };
     let manifest = target.join("Cargo.toml");
     let resolved = match lang::cargo::install_bin_name(&target) {
