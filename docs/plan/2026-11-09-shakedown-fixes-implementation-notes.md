@@ -132,3 +132,28 @@
 - Appending the re-run line in `run_install` vs passing the root into the `Installer` trait methods - keeps the trait signature unchanged and the doubles untouched.
 ### Open questions
 - None.
+
+## Phase 10: --gates (C2, S5)
+### Design decisions
+- UNKNOWN is an `Err` from `report_gates` after the report prints - `src/main.rs:report_gates` - the existing per-directory error path prints `Error: gate verdict UNKNOWN: <reason>` and the run exits 1, so a multi-repo run still reports every repo before failing.
+- Under `--gates` the batch footer prints only `Completed: N succeeded, M failed` on failure and nothing on success - `src/main.rs` main loop - `--gates` changes nothing, so "push your changes" is never true.
+- `conflicts_with = "no_verify"` on `--gates`, and the `--gates` help says it exits 1 on UNKNOWN - `src/cli.rs`.
+- `Branch:` -> `Default:` in the report and the README example.
+- Binary tests in a new `tests/gates.rs` (UNKNOWN exit 1 with report, known verdicts exit 0, no "All done!" in multi-repo, `--gates --no-verify` clap error exit 2); unit `gates_conflicts_with_no_verify` in `src/cli.rs`. `report_gates_runs_for_each_verdict` renamed `report_gates_errors_only_on_unknown` because it pinned UNKNOWN succeeding.
+- `--no-tag` still skips the gate probe; `no_tag_skips_gate_probe_even_when_gated` untouched and passing.
+### Deviations
+- None.
+### Tradeoffs
+- Leaving `Repo:` and `Gates:` at their old padding, so `Default: ` is one column wider than its siblings, vs re-padding every label - the re-pad touches several tests and the README for a cosmetic gain.
+### Open questions
+- None.
+
+## Phase 10 (superseding note): report column alignment
+### Design decisions
+- `Repo:` and `Gates:` re-padded so `Repo:`, `Default:` and `Gates:` values share one column - `src/main.rs:report_gates`, README example, `tests/gates.rs`, `tests/subdir.rs` - a cosmetic phase must not add a misalignment.
+### Deviations
+- None.
+### Tradeoffs
+- Supersedes the earlier Phase 10 Tradeoffs entry (left unaligned to avoid touching tests and README); the re-pad was done after all.
+### Open questions
+- None.

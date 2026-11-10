@@ -64,8 +64,8 @@ pub struct Cli {
     #[arg(long, conflicts_with_all = ["no_tag", "major", "minor", "force", "message", "automatic"])]
     pub tag_only: bool,
 
-    /// Report gate status (classic protection + rulesets) and the recommended flow
-    #[arg(long)]
+    /// Report gate status (classic protection + rulesets) and the recommended flow; exits 1 on UNKNOWN
+    #[arg(long, conflicts_with = "no_verify")]
     pub gates: bool,
 
     /// Skip the remote gate probe (treat the repo as ungated)
@@ -523,6 +523,12 @@ mod tests {
         assert!(cli.tag_only);
         let cli = Cli::try_parse_from(["bump"]).unwrap();
         assert!(!cli.tag_only);
+    }
+
+    #[test]
+    fn gates_conflicts_with_no_verify() {
+        assert!(Cli::try_parse_from(["bump", "--gates", "--no-verify"]).is_err());
+        assert!(Cli::try_parse_from(["bump", "--gates"]).is_ok());
     }
 
     #[test]

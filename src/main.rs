@@ -367,7 +367,8 @@ fn gated_refusal_message(label: &str, rules: &[String]) -> String {
 }
 
 /// --gates: probe and report the branch-protection verdict and the recommended
-/// release flow for this repo, then exit 0. Purely informational.
+/// release flow for this repo. Informational, but an UNKNOWN verdict is an error
+/// (printed report first) so a caller sees exit 1 when the gates could not be read.
 fn report_gates(dir: &Path) -> Result<()> {
     info!("report_gates: dir={}", dir.display());
 
@@ -375,7 +376,7 @@ fn report_gates(dir: &Path) -> Result<()> {
     let branch = github::local_default_branch(dir).unwrap_or_else(|| "(unknown)".to_string());
 
     println!("Repo:   {slug}");
-    println!("Branch: {branch}");
+    println!("Default: {branch}");
 
     match github::detect(dir) {
         github::Gate::Ungated => {
@@ -397,6 +398,7 @@ fn report_gates(dir: &Path) -> Result<()> {
             println!("Gates:  UNKNOWN (could not verify: {reason})");
             println!();
             println!("Re-run `bump --gates` once online / authenticated for a verdict.");
+            bail!("gate verdict UNKNOWN: {reason}");
         }
     }
 
@@ -571,7 +573,7 @@ pub(crate) fn process_directory(dir: &Path, cli: &Cli, bump_type: BumpType) -> R
         bail!("Not a git repository: {}", dir.display());
     }
 
-    // --gates is informational: report the verdict and recommended flow, then exit 0.
+    // --gates reports the verdict and recommended flow; exit 1 only when the verdict is UNKNOWN.
     if cli.gates {
         return report_gates(dir);
     }
@@ -946,7 +948,12 @@ fn main() -> Result<()> {
 
     if multi {
         println!();
-        if failures == 0 {
+        if cli.gates {
+            // --gates changes nothing: no "push your changes" reminder.
+            if failures > 0 {
+                println!("Completed: {} succeeded, {} failed", successes, failures);
+            }
+        } else if failures == 0 {
             println!("All done! Don't forget to push your changes.");
         } else {
             println!("Completed: {} succeeded, {} failed", successes, failures);
@@ -2324,9 +2331,9 @@ name = "test-pkg"
     // --gates report (Phase 5)
     // =========================================================================
 
-    /// report_gates renders (and succeeds) for every verdict.
+    /// report_gates renders for every verdict; only UNKNOWN is an error.
     #[test]
-    fn report_gates_runs_for_each_verdict() {
+    fn report_gates_errors_only_on_unknown() {
         let _guard = ENV_LOCK.lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
@@ -2334,12 +2341,17 @@ name = "test-pkg"
         create_cargo_toml(dir, Some("0.1.0"));
         create_initial_commit(dir);
 
-        for probe in ["ungated", "gated:pull_request,workflows", "unknown:offline"] {
+        for probe in ["ungated", "gated:pull_request,workflows"] {
             let prev = set_probe(probe);
             let result = report_gates(dir);
             restore_probe(prev);
             assert!(result.is_ok(), "report_gates must succeed for {probe}: {result:?}");
         }
+        let prev = set_probe("unknown:offline");
+        let result = report_gates(dir);
+        restore_probe(prev);
+        let err = format!("{:#}", result.expect_err("UNKNOWN must be an error"));
+        assert!(err.contains("UNKNOWN") && err.contains("offline"), "got: {err}");
     }
 
     // =========================================================================

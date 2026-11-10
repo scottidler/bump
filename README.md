@@ -209,7 +209,7 @@ file or git change) and prints the gated flow instead. Check any repo with:
 ```bash
 bump --gates
 # Repo:   tatari-tv/example
-# Branch: main
+# Default: main
 # Gates:  pull_request, workflows (gated)
 #
 # Gated flow:
