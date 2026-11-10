@@ -387,12 +387,24 @@ fn git_ok(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
-/// A binary crate at `version`: `[package]` plus `src/main.rs`, so the default install
-/// (`cargo install --path .`) and its `--version` verification both apply.
+/// A CLI crate at `version`: `[package]`, `src/main.rs` and a `clap` dependency, so the
+/// default install (`cargo install --path .`) and its `--version` verification both apply.
 fn write_cargo(dir: &Path, version: &str) {
     fs::write(
         dir.join("Cargo.toml"),
-        format!("[package]\nname = \"test-pkg\"\nversion = \"{version}\"\n"),
+        format!("[package]\nname = \"test-pkg\"\nversion = \"{version}\"\n\n[dependencies]\nclap = \"4\"\n"),
+    )
+    .unwrap();
+    fs::create_dir_all(dir.join("src")).unwrap();
+    fs::write(dir.join("src/main.rs"), "fn main() {}\n").unwrap();
+}
+
+/// A web-service crate at `version`: `[package]`, `src/main.rs` and `axum`, no `clap`.
+/// The default install withholds it.
+fn write_service_cargo(dir: &Path, version: &str) {
+    fs::write(
+        dir.join("Cargo.toml"),
+        format!("[package]\nname = \"svc-pkg\"\nversion = \"{version}\"\n\n[dependencies]\naxum = \"0.8\"\n"),
     )
     .unwrap();
     fs::create_dir_all(dir.join("src")).unwrap();

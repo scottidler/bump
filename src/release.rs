@@ -1310,11 +1310,12 @@ fn confirm_on_origin(dir: &Path, default: &str) -> Result<()> {
 
 /// Resolve the install command (precedence: explicit override > config > default-if-an-
 /// installable-package > skip) WITHOUT running it. `None` = the install step is skipped.
-/// The default only fires for a Cargo manifest with its OWN `[package]` table AND a
-/// binary target. A virtual workspace root (`[workspace]`, no `[package]`, e.g.
+/// The default only fires for a Cargo manifest with its OWN `[package]` table, a
+/// binary target, AND a `clap` dependency (a CLI, not a web server). A virtual workspace root (`[workspace]`, no `[package]`, e.g.
 /// `tatari-tv/marquee`) and a library crate (`src/lib.rs` only, e.g. `tatari-tv/renew`)
 /// have no default: `cargo install --path .` fails on both, after the tag is already
-/// pushed, if this ran unchecked.
+/// pushed, if this ran unchecked. A binary crate without `clap` (valet, catalog-api) is a
+/// service: installing it is pointless, so it has no default either.
 pub(crate) fn resolve_install(dir: &Path, choice: &InstallChoice, config: &Config) -> Option<String> {
     debug!(
         "resolve_install: dir={} choice={:?} config.install={:?}",
@@ -1326,7 +1327,10 @@ pub(crate) fn resolve_install(dir: &Path, choice: &InstallChoice, config: &Confi
         InstallChoice::Command(cmd) => Some(cmd.clone()),
         InstallChoice::Skip => None,
         InstallChoice::Auto => config.install.clone().or_else(|| {
-            if lang::cargo::has_package_table(dir) && lang::cargo::has_bin_target(dir) {
+            if lang::cargo::has_package_table(dir)
+                && lang::cargo::has_bin_target(dir)
+                && lang::cargo::has_clap_dependency(dir)
+            {
                 Some(DEFAULT_INSTALL_COMMAND.to_string())
             } else {
                 None
@@ -1337,8 +1341,9 @@ pub(crate) fn resolve_install(dir: &Path, choice: &InstallChoice, config: &Confi
 
 /// Why the install step was skipped, for the `install: <reason>` line. Only the `Auto`
 /// case on a Cargo manifest with nothing installable gets a specific reason: a virtual
-/// workspace root (a tracked `[workspace]` `Cargo.toml` with no `[package]`) or a
-/// library crate (`[package]`, no binary target). Every other skip (`--no-install`, or
+/// workspace root (a tracked `[workspace]` `Cargo.toml` with no `[package]`), a
+/// library crate (`[package]`, no binary target), or a binary with no `clap` dependency
+/// (a service, not a CLI). Every other skip (`--no-install`, or
 /// no Cargo manifest at all) prints the plain "skipped".
 fn install_skip_reason(dir: &Path, choice: &InstallChoice) -> &'static str {
     if !matches!(choice, InstallChoice::Auto) || !lang::cargo::cargo_toml_exists(dir) {
@@ -1347,6 +1352,8 @@ fn install_skip_reason(dir: &Path, choice: &InstallChoice) -> &'static str {
         "skipped (virtual workspace root; pass --install or set install: in bump.yml)"
     } else if !lang::cargo::has_bin_target(dir) {
         "skipped (library crate, no binary target; pass --install or set install: in bump.yml)"
+    } else if !lang::cargo::has_clap_dependency(dir) {
+        "skipped (no clap dependency: not a CLI; pass --install or set install: in bump.yml)"
     } else {
         "skipped"
     }

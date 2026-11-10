@@ -25,16 +25,32 @@ fn git(dir: &Path, args: &[&str]) {
 /// `remote_default_branch` and `compare_head_to_remote` to resolve locally, no network.
 /// `BUMP_GATES_PROBE=ungated` stands in for `gh`'s branch-protection probe.
 fn setup_ungated_repo(origin_dir: &Path, work: &Path) {
-    Command::new("git")
-        .args(["init", "--bare", "-q", origin_dir.to_str().unwrap()])
-        .output()
-        .unwrap();
-
     fs::write(
         work.join("Cargo.toml"),
         "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n",
     )
     .unwrap();
+    commit_and_push(origin_dir, work);
+}
+
+/// A web service: `[package]`, `src/main.rs` and `axum`, no `clap` (valet's shape).
+fn setup_ungated_service_repo(origin_dir: &Path, work: &Path) {
+    fs::write(
+        work.join("Cargo.toml"),
+        "[package]\nname = \"svc\"\nversion = \"0.1.0\"\n\n[dependencies]\naxum = \"0.8\"\n",
+    )
+    .unwrap();
+    fs::create_dir_all(work.join("src")).unwrap();
+    fs::write(work.join("src/main.rs"), "fn main() {}\n").unwrap();
+    commit_and_push(origin_dir, work);
+}
+
+/// Commit everything in `work` on `main` and push it to a fresh bare `origin_dir`.
+fn commit_and_push(origin_dir: &Path, work: &Path) {
+    Command::new("git")
+        .args(["init", "--bare", "-q", origin_dir.to_str().unwrap()])
+        .output()
+        .unwrap();
 
     git(work, &["init", "-q"]);
     git(work, &["config", "user.email", "test@test.com"]);
@@ -95,5 +111,37 @@ fn release_dry_run_no_ci_gate_prints_ci_gate_skipped() {
     assert!(
         stdout.contains("CI gate: SKIPPED"),
         "--no-ci-gate must reach wait_for_green's dry-run echo; stdout: {stdout}"
+    );
+}
+
+/// A service fixture's dry run prints the clap skip reason as its install line, and no
+/// `verify:` line follows: nothing is installed, so nothing is run with `--version`.
+#[test]
+fn release_dry_run_on_a_service_prints_the_clap_skip_and_no_verify() {
+    let origin = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    setup_ungated_service_repo(origin.path(), work.path());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bump"))
+        .args(["release", "-n", "--no-ci-gate"])
+        .current_dir(work.path())
+        .env("BUMP_GATES_PROBE", "ungated")
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "bump release -n must succeed; stdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let install_lines: Vec<&str> = stdout
+        .lines()
+        .filter(|line| line.starts_with("[dry-run] install:") || line.starts_with("[dry-run] verify:"))
+        .collect();
+    assert_eq!(
+        install_lines,
+        vec!["[dry-run] install: skipped (no clap dependency: not a CLI; pass --install or set install: in bump.yml)"],
+        "stdout: {stdout}"
     );
 }

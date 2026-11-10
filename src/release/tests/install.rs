@@ -132,6 +132,49 @@ fn resolve_install_auto_skips_on_library_crate() {
     );
 }
 
+/// A service (`[package]`, `src/main.rs`, no clap, e.g. `tatari-tv/valet`) has no default
+/// install and says why; `--install` and config `install:` still fire on it.
+#[test]
+fn resolve_install_auto_skips_on_service_without_clap() {
+    let tmp = TempDir::new().unwrap();
+    write_service_cargo(tmp.path(), "1.0.0");
+    let config = Config::default();
+    assert_eq!(resolve_install(tmp.path(), &InstallChoice::Auto, &config), None);
+    assert_eq!(
+        install_skip_reason(tmp.path(), &InstallChoice::Auto),
+        "skipped (no clap dependency: not a CLI; pass --install or set install: in bump.yml)"
+    );
+}
+
+#[test]
+fn resolve_install_auto_still_defaults_on_clap_cli() {
+    let tmp = TempDir::new().unwrap();
+    write_cargo(tmp.path(), "1.0.0");
+    assert_eq!(
+        resolve_install(tmp.path(), &InstallChoice::Auto, &Config::default()).as_deref(),
+        Some("cargo install --path .")
+    );
+}
+
+#[test]
+fn resolve_install_explicit_and_config_still_fire_on_service() {
+    let tmp = TempDir::new().unwrap();
+    write_service_cargo(tmp.path(), "1.0.0");
+    let choice = InstallChoice::Command("cargo install --path .".to_string());
+    assert_eq!(
+        resolve_install(tmp.path(), &choice, &Config::default()).as_deref(),
+        Some("cargo install --path .")
+    );
+    let config = Config {
+        install: Some("make install".to_string()),
+        ..Config::default()
+    };
+    assert_eq!(
+        resolve_install(tmp.path(), &InstallChoice::Auto, &config).as_deref(),
+        Some("make install")
+    );
+}
+
 /// Config `install:` still fires on a library crate -- only the bare default is withheld.
 #[test]
 fn resolve_install_config_works_on_library_crate() {

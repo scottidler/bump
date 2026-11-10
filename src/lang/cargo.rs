@@ -248,6 +248,21 @@ pub fn has_bin_target(dir: &Path) -> bool {
     fs::read_dir(dir.join("src/bin")).is_ok_and(|mut entries| entries.next().is_some())
 }
 
+/// True when the root package depends on `clap`: the fleet's one unambiguous CLI signal.
+/// Every CLI (sdv, persona, slack-cli, ...) lists it; no web server (valet, catalog-api,
+/// rust-axum-svc, rust-catalog) does. A server has a `src/main.rs` too, but installing it
+/// into `~/.cargo/bin` is pointless and `<server> --version` starts the server, so the
+/// default install and its verify are for clap binaries only.
+pub fn has_clap_dependency(dir: &Path) -> bool {
+    root_manifest(dir).is_some_and(|doc| {
+        doc.get("package").is_some()
+            && doc
+                .get("dependencies")
+                .and_then(Item::as_table_like)
+                .is_some_and(|deps| deps.contains_key("clap"))
+    })
+}
+
 /// The binary the default install produces, for the post-install `--version` check: the
 /// first `[[bin]]`'s `name` (falling back to the package name, as cargo does), else the
 /// package name when `src/main.rs` exists. `None` for a library crate, a crate whose
@@ -560,6 +575,35 @@ name = "test"
         fs::create_dir_all(dir.path().join("src")).unwrap();
         fs::write(dir.path().join("src/main.rs"), "fn main() {}").unwrap();
         assert!(!has_bin_target(dir.path()));
+    }
+
+    #[test]
+    fn test_has_clap_dependency() {
+        let dir = TempDir::new().unwrap();
+        create_cargo_toml(
+            dir.path(),
+            "[package]\nname = \"cli\"\nversion = \"0.1.0\"\n\n[dependencies]\nclap = { version = \"4\", features = [\"derive\"] }\n",
+        );
+        assert!(has_clap_dependency(dir.path()));
+
+        create_cargo_toml(
+            dir.path(),
+            "[package]\nname = \"cli\"\nversion = \"0.1.0\"\n\n[dependencies]\nclap = { workspace = true }\n",
+        );
+        assert!(has_clap_dependency(dir.path()), "workspace-inherited clap");
+
+        create_cargo_toml(
+            dir.path(),
+            "[package]\nname = \"svc\"\nversion = \"0.1.0\"\n\n[dependencies]\naxum = \"0.8\"\n",
+        );
+        assert!(!has_clap_dependency(dir.path()), "a web server");
+
+        create_cargo_toml(
+            dir.path(),
+            "[workspace]\nmembers = [\"cli\"]\n\n[workspace.dependencies]\nclap = \"4\"\n",
+        );
+        assert!(!has_clap_dependency(dir.path()), "virtual root: the member decides");
+        assert!(!has_clap_dependency(TempDir::new().unwrap().path()));
     }
 
     #[test]
