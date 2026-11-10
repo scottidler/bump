@@ -157,6 +157,30 @@ pub fn create_tag(path: &Path, tag: &str, message: &str, sha: &str) -> Result<()
     Ok(())
 }
 
+/// The local tags pointing at commit `sha` (`git tag --points-at <sha>`), annotated tags
+/// dereferenced. Reads refs only; `sha` need not be checked out.
+pub fn tags_at(path: &Path, sha: &str) -> Result<Vec<String>> {
+    debug!("tags_at: path={} sha={}", path.display(), sha);
+    let output = Command::new("git")
+        .args(["tag", "--points-at", sha])
+        .current_dir(path)
+        .output()
+        .context("Failed to run git tag --points-at")?;
+    if !output.status.success() {
+        bail!(
+            "git tag --points-at {} failed: {}",
+            sha,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
 /// Check if HEAD has an annotated tag pointing directly at it
 pub fn head_has_tag(path: &Path) -> Result<bool> {
     let output = Command::new("git")
@@ -428,6 +452,28 @@ pub fn fetch_branch(path: &Path, branch: &str) -> Result<()> {
     if !output.status.success() {
         bail!(
             "git fetch origin {} failed: {}",
+            branch,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    Ok(())
+}
+
+/// `git fetch --no-tags origin <branch>`: moves `origin/<branch>` and imports no tag,
+/// even under `remote.origin.tagOpt=--tags`. For read-only previews (`finish -n`), which
+/// must leave every local tag as it found it.
+pub fn fetch_branch_no_tags(path: &Path, branch: &str) -> Result<()> {
+    debug!("fetch_branch_no_tags: path={} branch={}", path.display(), branch);
+    let output = Command::new("git")
+        .args(["fetch", "--no-tags", "origin", branch])
+        .current_dir(path)
+        .output()
+        .context("Failed to run git fetch --no-tags")?;
+
+    if !output.status.success() {
+        bail!(
+            "git fetch --no-tags origin {} failed: {}",
             branch,
             String::from_utf8_lossy(&output.stderr)
         );
@@ -1024,6 +1070,37 @@ mod tests {
         assert_eq!(files, vec!["a.txt", "b.txt"]);
     }
 
+    /// A tag on origin that is absent locally stays absent after the fetch, even with
+    /// `remote.origin.tagOpt=--tags` (which makes a plain `git fetch origin <branch>`
+    /// import every tag), while `origin/main` still moves.
+    #[test]
+    fn fetch_branch_no_tags_imports_no_tag_under_tagopt_tags() {
+        let (origin, work) = bare_remote_and_clone();
+        let w = work.path();
+        push_branch(w, "main").unwrap();
+        git_in(w, &["commit", "--allow-empty", "-m", "extra"]);
+        git_in(w, &["tag", "-a", "vEXTRA", "-m", "vEXTRA"]);
+        git_in(w, &["push", "-q", "origin", "main", "vEXTRA"]);
+        let tip = head_sha(w).unwrap();
+        git_in(w, &["tag", "-d", "vEXTRA"]);
+        git_in(w, &["reset", "-q", "--hard", "HEAD~1"]);
+        git_in(w, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git_in(w, &["config", "remote.origin.tagOpt", "--tags"]);
+
+        fetch_branch_no_tags(w, "main").unwrap();
+        assert!(!tag_exists(w, "vEXTRA").unwrap(), "no tag imported");
+        assert_eq!(rev_parse(w, "origin/main").unwrap(), tip, "origin/main moved");
+        drop(origin);
+    }
+
+    #[test]
+    fn fetch_branch_no_tags_fails_on_an_unknown_branch() {
+        let (_origin, work) = bare_remote_and_clone();
+        let w = work.path();
+        push_branch(w, "main").unwrap();
+        assert!(fetch_branch_no_tags(w, "no-such-branch").is_err());
+    }
+
     #[test]
     fn local_branch_exists_sees_only_local_heads() {
         let (_origin, work) = bare_remote_and_clone();
@@ -1301,6 +1378,30 @@ mod tests {
         let result = is_head_pushed(&cwd);
         assert!(result.is_ok());
         // The actual value depends on remote state
+    }
+
+    #[test]
+    fn tags_at_lists_tags_on_a_commit_that_is_not_checked_out() {
+        let (origin, work) = bare_remote_and_clone();
+        let dir = work.path();
+        let first = head_sha(dir).unwrap();
+        create_tag(dir, "v1.0.0", "v1.0.0", &first).unwrap();
+        std::fs::write(dir.join("README.md"), "# test\nmore").unwrap();
+        Command::new("git")
+            .args(["commit", "-qam", "more"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert_eq!(tags_at(dir, &first).unwrap(), vec!["v1.0.0".to_string()]);
+        assert!(tags_at(dir, "HEAD").unwrap().is_empty(), "the new tip carries no tag");
+        drop(origin);
+    }
+
+    #[test]
+    fn tags_at_an_unknown_rev_is_an_error() {
+        let (origin, work) = bare_remote_and_clone();
+        assert!(tags_at(work.path(), "no-such-rev").is_err());
+        drop(origin);
     }
 
     #[test]

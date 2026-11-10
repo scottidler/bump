@@ -1,14 +1,13 @@
 //! `bump finish`: the gated post-merge tag step.
 
 use super::ci::{Ci, ci_gate};
-use super::tag::{TagTarget, echo_tag_steps, gate_tag_and_push};
+use super::tag::{CiPreview, TagTarget, echo_tag_steps, gate_tag_and_push};
 use super::{
-    FinishOpts, Installer, Pusher, ReleaseReport, agreed_file_version, check_install_not_empty, echo_install,
-    resolve_install, run_install,
+    FinishOpts, Installer, Pusher, ReleaseReport, check_install_not_empty, echo_install, resolve_install, run_install,
 };
-use crate::config::{self, Config};
+use crate::config::{self, CONFIG_FILE_NAME, CiDeclaration, Config};
 use crate::git::{self, HeadRemote};
-use crate::lang::{self, Manifest};
+use crate::lang;
 use crate::version;
 use crate::{TagState, tag_ladder};
 use eyre::{Result, bail};
@@ -124,8 +123,7 @@ pub fn finish<P: Pusher, I: Installer, C: Ci>(
     check_install_not_empty(&opts.install, &config::load(work)?)?;
 
     if opts.dry_run {
-        let config = config::load(work)?;
-        return finish_dry_run(work, &place, opts, &config, &manifests, &default);
+        return finish_dry_run(work, &place, opts, &default);
     }
 
     if let FinishDir::Sibling(wt) = &place {
@@ -193,23 +191,23 @@ pub fn finish<P: Pusher, I: Installer, C: Ci>(
     }
 }
 
-/// Bring the resolved worktree's default branch to origin's merged tip. The local default
-/// is classified against a fresh fetch BEFORE any checkout or pull: behind fast-forwards,
-/// equal does nothing, ahead or diverged refuse with the worktree untouched (a pull would
-/// otherwise die in git's own error, or merge local-only commits into the release). A
-/// missing local default is created from origin by the checkout.
-fn reach_merged_tip(work: &Path, place: &FinishDir, default: &str) -> Result<()> {
+/// Classify the resolved worktree's local default against a freshly fetched
+/// `origin/<default>` (the caller fetches), BEFORE any checkout or pull: behind and equal
+/// (and a missing local default) pass, ahead or diverged refuse with the worktree untouched
+/// (a pull would otherwise die in git's own error, or merge local-only commits into the
+/// release). Shared by the real run (`reach_merged_tip`) and `finish -n`, so the dry-run
+/// refuses exactly where the real run does.
+fn classify_default(work: &Path, place: &FinishDir, default: &str) -> Result<Option<HeadRemote>> {
     debug!(
-        "reach_merged_tip: work={} place={:?} default={}",
+        "classify_default: work={} place={:?} default={}",
         work.display(),
         place,
         default
     );
-    git::fetch_branch(work, default)?;
     let relation = git::compare_branch_to_remote(work, default)?;
-    debug!("reach_merged_tip: relation={:?}", relation);
+    debug!("classify_default: relation={:?}", relation);
     match relation {
-        None | Some(HeadRemote::Equal) | Some(HeadRemote::Behind) => {}
+        None | Some(HeadRemote::Equal) | Some(HeadRemote::Behind) => Ok(relation),
         Some(HeadRemote::Ahead) => {
             let rescue = format!(
                 "stranded-{}",
@@ -243,6 +241,21 @@ fn reach_merged_tip(work: &Path, place: &FinishDir, default: &str) -> Result<()>
             );
         }
     }
+}
+
+/// Bring the resolved worktree's default branch to origin's merged tip: classify it
+/// (`classify_default`, which refuses ahead or diverged untouched), then check out the
+/// default when no worktree holds it and fast-forward when it is behind. A missing local
+/// default is created from origin by the checkout.
+fn reach_merged_tip(work: &Path, place: &FinishDir, default: &str) -> Result<()> {
+    debug!(
+        "reach_merged_tip: work={} place={:?} default={}",
+        work.display(),
+        place,
+        default
+    );
+    git::fetch_branch(work, default)?;
+    let relation = classify_default(work, place, default)?;
     if *place == FinishDir::CheckoutHere {
         git::checkout(work, default)?;
     }
@@ -267,24 +280,85 @@ fn missed_bump(default: &str) -> Result<ReleaseReport> {
     )
 }
 
-/// `-n` dry run for `bump finish`: echo every command it would run and mutate NOTHING (no
-/// checkout, no pull, no fetch). `dir` is the resolved worktree. The reported tag is read
-/// from its CURRENT manifest version (a best-effort preview; the real run tags the merged
-/// version after the fast-forward).
-fn finish_dry_run(
-    dir: &Path,
-    place: &FinishDir,
-    opts: &FinishOpts,
-    config: &Config,
-    manifests: &[Box<dyn Manifest>],
-    default: &str,
-) -> Result<ReleaseReport> {
-    debug!("finish_dry_run: dir={} default={}", dir.display(), default);
-    let install_command = resolve_install(dir, &opts.install, config);
-    let tag = match agreed_file_version(manifests)? {
-        Some(v) => version::format_tag(&v),
-        None => "vX.Y.Z".to_string(),
+/// What `origin/<default>`'s tip is, release-wise: the same remote-then-local tag ladder
+/// the real run applies to the merged tip (`crate::tag_ladder`), read without checking the
+/// tip out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MergedTip {
+    /// The tag is on origin at the tip: the real run only installs.
+    Released,
+    /// The tag is local-only at the tip (a prior run died before the push): resume.
+    LocalTag,
+    /// No tag for the tip's version anywhere: gate, tag, push, install.
+    Untagged,
+    /// The tag exists at another commit: the version was not bumped for this merge.
+    MissedBump,
+}
+
+/// Classify `tag` (the tip's manifest version) against `tip`: remote first
+/// (`git ls-remote`, read-only), then local (`git tag --points-at <tip>`, then any local
+/// tag of that name elsewhere). Same order and outcomes as the real run's ladder arms.
+fn classify_merged_tip(dir: &Path, tip: &str, tag: &str) -> Result<MergedTip> {
+    debug!("classify_merged_tip: dir={} tip={} tag={}", dir.display(), tip, tag);
+    let state = match git::remote_tag_commit(dir, tag)? {
+        Some(commit) if commit == tip => MergedTip::Released,
+        Some(_) => MergedTip::MissedBump,
+        None if git::tags_at(dir, tip)?.iter().any(|t| t == tag) => MergedTip::LocalTag,
+        None if git::tag_exists(dir, tag)? => MergedTip::MissedBump,
+        None => MergedTip::Untagged,
     };
+    debug!("classify_merged_tip: state={:?}", state);
+    Ok(state)
+}
+
+/// The `bump.yml` the real run reads once it has moved `dir` to `tip` (checkout and/or
+/// fast-forward). Already at the tip: the worktree file. Otherwise a `bump.yml` committed
+/// at the tip wins (the move brings it in); one tracked here but absent at the tip is
+/// deleted by the move (defaults); an untracked or absent one is left alone, so the
+/// worktree file (or defaults) stands, as the real run's `config::load` sees it.
+fn config_at_merged_tip(dir: &Path, tip: &str) -> Result<Config> {
+    debug!("config_at_merged_tip: dir={} tip={}", dir.display(), tip);
+    if git::head_sha(dir)? == tip {
+        return config::load(dir);
+    }
+    if git::file_at(dir, tip, CONFIG_FILE_NAME)?.is_some() {
+        return config::load_at(dir, tip);
+    }
+    if git::file_at(dir, "HEAD", CONFIG_FILE_NAME)?.is_some() {
+        return Ok(Config::default());
+    }
+    config::load(dir)
+}
+
+/// `-n` dry run for `bump finish`: fetch `origin/<default>` (the only thing it moves),
+/// classify the merged tip WITHOUT checking it out -- `git rev-parse origin/<default>`, the
+/// manifest version committed there (`git show <sha>:<manifest>`), and the tag ladder on
+/// that sha -- then print only the steps the real run would take from that state. The fetch
+/// is `--no-tags`, so no local tag appears. The install command comes from the `bump.yml`
+/// the real run would read at the tip (`config_at_merged_tip`); the CI gate line honors a
+/// `ci: none` committed at the tip, as `wait_for_green` does. Every
+/// refusal the real run makes on the same state (ahead/diverged default, missed bump, no
+/// version at the tip) is made here too. No checkout, no pull, no tag, no push, no install.
+/// `dir` is the resolved worktree.
+fn finish_dry_run(dir: &Path, place: &FinishDir, opts: &FinishOpts, default: &str) -> Result<ReleaseReport> {
+    debug!("finish_dry_run: dir={} default={}", dir.display(), default);
+    git::fetch_branch_no_tags(dir, default)?;
+    let relation = classify_default(dir, place, default)?;
+    let tip = git::rev_parse(dir, &format!("origin/{default}"))?;
+    let version = git::manifest_version_at(dir, &tip)?
+        .and_then(|v| version::parse_version(&v).ok())
+        .ok_or_else(|| {
+            eyre::eyre!(
+                "origin/{default} ({}) carries no manifest version; bump finish has nothing to tag",
+                short_sha(&tip)
+            )
+        })?;
+    let tag = version::format_tag(&version);
+    let merged = classify_merged_tip(dir, &tip, &tag)?;
+    if merged == MergedTip::MissedBump {
+        return missed_bump(default);
+    }
+
     match place {
         FinishDir::Own => println!("[dry-run] finishing in this checkout ({default})"),
         FinishDir::Sibling(wt) => println!(
@@ -293,13 +367,38 @@ fn finish_dry_run(
         ),
         FinishDir::CheckoutHere => println!("[dry-run] git checkout {default}"),
     }
-    println!("[dry-run] git fetch origin {default}  (refuse if local {default} is ahead of or diverged from origin)");
-    println!("[dry-run] git pull --ff-only origin {default}  (only if local {default} is behind)");
-    println!("[dry-run] (tag-only ladder: require HEAD == origin/{default} before tagging)");
-    println!("[dry-run] (only if the merged version is untagged; already released runs only the install:)");
-    echo_tag_steps(&tag, default, &ci_gate(opts.ci_gate, opts.ci_timeout), false);
+    println!("[dry-run] fetched origin/{default}: {} carries {tag}", short_sha(&tip));
+    if relation == Some(HeadRemote::Behind) {
+        println!("[dry-run] git pull --ff-only origin {default}");
+    }
+
+    let config = config_at_merged_tip(dir, &tip)?;
+    check_install_not_empty(&opts.install, &config)?;
+    let install_command = resolve_install(dir, &opts.install, &config);
+    let gate = ci_gate(opts.ci_gate, opts.ci_timeout);
+    let ci = if gate.enabled && config::load_at(dir, &tip)?.ci == Some(CiDeclaration::None) {
+        CiPreview::DeclaredNone(tip.clone())
+    } else {
+        CiPreview::from_gate(gate)
+    };
+    match merged {
+        MergedTip::Released => match install_command {
+            Some(_) => println!("[dry-run] already released {tag}; would run: install, verify"),
+            None => println!("[dry-run] already released {tag}; would run: nothing"),
+        },
+        MergedTip::LocalTag => {
+            println!("[dry-run] local tag {tag} at origin/{default} was never pushed; resuming");
+            echo_tag_steps(&tag, default, &ci, true);
+        }
+        MergedTip::Untagged => {
+            println!("[dry-run] {tag} is untagged on origin/{default}");
+            echo_tag_steps(&tag, default, &ci, false);
+        }
+        MergedTip::MissedBump => unreachable!("refused above"),
+    }
     echo_install(dir, &opts.install, &install_command, &tag);
     Ok(ReleaseReport {
+        resumed: merged == MergedTip::LocalTag,
         install_command,
         dry_run: true,
         ..ReleaseReport::new(&tag)

@@ -192,12 +192,20 @@ fn release_from_a_subdir_runs_on_the_root() {
     assert!(stderr(&out).contains("nothing to release"), "stderr: {}", stderr(&out));
 }
 
+/// `released_repo` is the missed-bump shape (origin/main one commit past v0.1.1, version
+/// unchanged): the state-aware `finish -n` refuses exactly as the real run does, from the
+/// subdir and the root alike.
 #[test]
 fn finish_from_a_subdir_runs_on_the_root() {
     let tmp = TempDir::new().unwrap();
     let root = released_repo(tmp.path());
     let out = assert_subdir_matches_root(&root, &["finish", "-n", "--no-ci-gate", "--no-install"]);
-    assert!(stdout(&out).contains("v0.1.1"), "stdout: {}", stdout(&out));
+    assert_eq!(out.status.code(), Some(1), "stdout: {}", stdout(&out));
+    assert!(
+        stderr(&out).contains("no untagged version on main"),
+        "stderr: {}",
+        stderr(&out)
+    );
 }
 
 /// `release <subdir>` from outside the repo resolves the `[DIR]` the same way.

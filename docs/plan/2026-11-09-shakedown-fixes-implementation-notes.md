@@ -157,3 +157,24 @@
 - Supersedes the earlier Phase 10 Tradeoffs entry (left unaligned to avoid touching tests and README); the re-pad was done after all.
 ### Open questions
 - None.
+
+## Phase 11: State-aware finish -n (S1)
+### Design decisions
+- `classify_default` split out of `reach_merged_tip` - `src/release/finish.rs:classify_default` - fetch + compare + the ahead/diverged refusals now live in one function the real run and `finish -n` share, so the dry-run refuses exactly where the real run does, with byte-identical messages.
+- `MergedTip` + `classify_merged_tip` - `src/release/finish.rs` - the dry-run applies the real run's ladder order to `origin/<default>`'s tip without checking it out: remote tag (`git ls-remote`, read-only) at the tip -> Released, elsewhere -> MissedBump; then `git tag --points-at <tip>` -> LocalTag (resume); a local tag of that name elsewhere -> MissedBump; else Untagged.
+- New `git::tags_at` (`git tag --points-at <sha>`) - `src/git.rs` - the doc's named primitive; two unit tests (tag on a non-checked-out commit, unknown rev errors).
+- The tip's version is read with the existing `git::manifest_version_at` (`git show <sha>:<manifest>`), and the sha with `git::rev_parse(origin/<default>)` after `fetch_branch`.
+- Missed bump and "no manifest version at the tip" refuse in the dry-run (exit 1, the real run's `missed_bump` message), same as Phase 6's plain-bump dry-run running the real refusal.
+- Printed steps follow the state: the `git checkout` line only for CheckoutHere, the `git pull --ff-only` line only when local default is behind, the CI wait / tag / push block only for Untagged (LocalTag prints it with "local tag already present"), and Released prints only the already-released line plus install/verify.
+- `ReleaseReport.resumed` is true on a LocalTag dry-run, mirroring the real run's report.
+- Binary tests in a new `tests/finish.rs`: released prints no `git tag -a`/push/CI wait; `--no-install` on released; pending t5 prints tag and push; local-only tag prints push without `git tag -a`; a clone behind origin with a stale `origin/main` is classified by origin's fetched tip (pull line, v0.1.2, no v0.1.1); `finish -n` leaves HEAD, `for-each-ref`, status and Cargo.toml identical on t4 and t5; missed bump refuses; Phase 7's empty-install refusal and Phases 8/9's verify lines on both states. Break-the-code: on the old `finish.rs` the six state tests fail, the three preservation tests pass (they pin behavior that must not change).
+- `tests/subdir.rs:finish_from_a_subdir_runs_on_the_root` inverted: its `released_repo` is the missed-bump shape, so the dry-run now refuses (exit 1, `no untagged version on main`) from the subdir and the root alike, where it used to print a plan containing `v0.1.1`.
+### Deviations
+- Already released with no install command (`--no-install`, or nothing installable) prints `[dry-run] already released v<X>; would run: nothing`, not the doc's `would run: install, verify`, which would be false there. The doc's exact line prints whenever an install command resolves.
+- `finish -n` refuses (exit 1) on a missed bump and on an ahead/diverged local default instead of printing steps; the doc says "prints only the steps that would run" and the real run runs none there.
+- Added a `[dry-run] fetched origin/<default>: <sha8> carries <tag>` line and a one-line state header for the untagged / local-tag cases; the doc names only the already-released line.
+### Tradeoffs
+- Install command and verify target still resolve from the resolved worktree's on-disk `bump.yml` / `Cargo.toml` (as before) vs reading them at the merged tip with `config::load_at` - the real run reads the working tree after the fast-forward (so an untracked `bump.yml` counts there); `load_at` would diverge on that case, and the working-tree read keeps Phase 7's check on the same config it already validated.
+- The dry-run fetch moves `origin/<default>` (the only ref it touches) vs `--dry-run` fetch or no fetch - the doc's contract is "fetches (still changes nothing)"; measured that `git fetch origin <branch>` does not auto-follow tags, so no local tag appears.
+### Open questions
+- None.

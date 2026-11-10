@@ -163,7 +163,7 @@ pub struct ReleaseArgs {
 /// `bump finish [-n] [--install "<cmd>"|--no-install] [--no-ci-gate] [--ci-timeout SECS] [DIR]`
 #[derive(clap::Args, Debug)]
 pub struct FinishArgs {
-    /// Preview every command that would run; execute nothing
+    /// Preview every command that would run; changes nothing (it fetches origin)
     #[arg(short = 'n', long)]
     pub dry_run: bool,
 

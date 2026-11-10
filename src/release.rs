@@ -60,7 +60,7 @@ use standalone::{classify_gated_standalone, execute_gated_standalone, is_bump_on
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
-use tag::{TagTarget, echo_tag_steps, gate_tag_and_push};
+use tag::{CiPreview, TagTarget, echo_tag_steps, gate_tag_and_push};
 
 /// The default install command when none is configured and a Cargo manifest is present.
 const DEFAULT_INSTALL_COMMAND: &str = "cargo install --path .";
@@ -1204,7 +1204,12 @@ fn execute_release<P: Pusher, I: Installer, R: Pr, C: Ci>(
         println!("[dry-run] bump --no-tag{force_flag}  (commit the version bump for {target_tag})");
         println!("[dry-run] git push --no-follow-tags origin {default}");
         println!("[dry-run] (confirm HEAD is on origin/{default} before tagging)");
-        echo_tag_steps(target_tag, default, &ci_gate(opts.ci_gate, opts.ci_timeout), false);
+        echo_tag_steps(
+            target_tag,
+            default,
+            &CiPreview::from_gate(ci_gate(opts.ci_gate, opts.ci_timeout)),
+            false,
+        );
         echo_install(dir, &opts.install, &install_command, target_tag);
         return Ok(ReleaseReport {
             install_command,
@@ -1272,7 +1277,12 @@ fn execute_pending<P: Pusher, I: Installer, R: Pr, C: Ci>(
             println!("[dry-run] git push --no-follow-tags origin {default}");
         }
         println!("[dry-run] (confirm HEAD is on origin/{default} before tagging)");
-        echo_tag_steps(tag, default, &ci_gate(opts.ci_gate, opts.ci_timeout), local_tag_present);
+        echo_tag_steps(
+            tag,
+            default,
+            &CiPreview::from_gate(ci_gate(opts.ci_gate, opts.ci_timeout)),
+            local_tag_present,
+        );
         echo_install(dir, &opts.install, &install_command, tag);
         return Ok(ReleaseReport {
             resumed: !ahead,

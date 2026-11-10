@@ -253,10 +253,7 @@ fn finish_dry_run_executes_nothing() {
     let report = finish(dir, &finish_opts(true), &pusher, &installer, &NoCi).expect("dry-run must succeed");
 
     assert!(report.dry_run);
-    assert_eq!(
-        report.tag, "v0.1.6",
-        "dry-run reports the current manifest version's tag"
-    );
+    assert_eq!(report.tag, "v0.1.6", "dry-run reports the merged tip's version tag");
     assert_eq!(report.install_command.as_deref(), Some("cargo install --path ."));
     // No side effects whatsoever.
     assert_eq!(

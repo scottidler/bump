@@ -141,16 +141,39 @@ pub(super) fn gate_tag_and_push<P: Pusher, C: Ci>(
     Ok(sha)
 }
 
+/// What the CI gate would do on the tagged sha, for a `-n` preview: wait, or skip it for
+/// the same reason the real run (`wait_for_green`) would.
+#[derive(Debug, Clone)]
+pub(super) enum CiPreview {
+    /// Poll check runs and statuses, up to the timeout.
+    Wait(CiGate),
+    /// `--no-ci-gate`.
+    SkippedByFlag,
+    /// `bump.yml` committed at this sha declares `ci: none`.
+    DeclaredNone(String),
+}
+
+impl CiPreview {
+    /// The preview for `gate` when the sha's committed `bump.yml` is not known (the
+    /// version commit does not exist yet, or the caller did not read it).
+    pub(super) fn from_gate(gate: CiGate) -> Self {
+        if gate.enabled { CiPreview::Wait(gate) } else { CiPreview::SkippedByFlag }
+    }
+}
+
 /// Echo the CI gate + tag steps for `-n` dry-run.
-pub(super) fn echo_tag_steps(tag: &str, default: &str, gate: &CiGate, local_tag_present: bool) {
-    if gate.enabled {
-        println!(
+pub(super) fn echo_tag_steps(tag: &str, default: &str, ci: &CiPreview, local_tag_present: bool) {
+    match ci {
+        CiPreview::Wait(gate) => println!(
             "[dry-run] wait for green CI on the sha (check-runs + commit status every {}s, up to {}s)",
             CI_POLL_INTERVAL.as_secs(),
             gate.timeout.as_secs()
-        );
-    } else {
-        println!("[dry-run] CI gate: SKIPPED (--no-ci-gate)");
+        ),
+        CiPreview::SkippedByFlag => println!("[dry-run] CI gate: SKIPPED (--no-ci-gate)"),
+        CiPreview::DeclaredNone(sha) => println!(
+            "[dry-run] CI gate: skipped, bump.yml at {} declares `ci: none`",
+            sha.chars().take(8).collect::<String>()
+        ),
     }
     println!("[dry-run] git fetch origin {default}  (the sha must equal origin/{default} and carry {tag})");
     if local_tag_present {
