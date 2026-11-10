@@ -24,7 +24,7 @@ fn released_repo(tmp: &Path) -> PathBuf {
     let origin = tmp.join("origin.git");
     let work = tmp.join("work");
     fs::create_dir_all(work.join("src")).unwrap();
-    git(tmp, &["init", "-q", "--bare", origin.to_str().unwrap()]);
+    git(tmp, &["init", "-q", "--bare", "-b", "main", origin.to_str().unwrap()]);
     git(&work, &["init", "-q", "-b", "main"]);
     git(&work, &["config", "user.email", "t@t"]);
     git(&work, &["config", "user.name", "t"]);

@@ -28,7 +28,7 @@ fn init(work: &Path) {
 fn released_head(tmp: &Path) -> PathBuf {
     let origin = tmp.join("origin.git");
     let work = tmp.join("t4");
-    git(tmp, &["init", "-q", "--bare", origin.to_str().unwrap()]);
+    git(tmp, &["init", "-q", "--bare", "-b", "main", origin.to_str().unwrap()]);
     init(&work);
     fs::write(
         work.join("Cargo.toml"),

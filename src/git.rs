@@ -1342,7 +1342,7 @@ mod tests {
         assert!(repo_root(&work.path().join(".git")).is_err(), "inside .git");
 
         let bare = TempDir::new().unwrap();
-        git_in(bare.path(), &["init", "-q", "--bare"]);
+        git_in(bare.path(), &["init", "-q", "--bare", "-b", "main"]);
         assert!(repo_root(bare.path()).is_err(), "bare repo");
     }
 

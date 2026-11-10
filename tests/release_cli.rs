@@ -48,7 +48,7 @@ fn setup_ungated_service_repo(origin_dir: &Path, work: &Path) {
 /// Commit everything in `work` on `main` and push it to a fresh bare `origin_dir`.
 fn commit_and_push(origin_dir: &Path, work: &Path) {
     Command::new("git")
-        .args(["init", "--bare", "-q", origin_dir.to_str().unwrap()])
+        .args(["init", "--bare", "-q", "-b", "main", origin_dir.to_str().unwrap()])
         .output()
         .unwrap();
 
