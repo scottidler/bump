@@ -261,6 +261,60 @@ pub(crate) fn determine_version_action(
     }
 }
 
+/// The clean-tree refusal, shared by the real run and `-n` so they cannot drift.
+const HEAD_ALREADY_TAGGED: &str = "HEAD already has a tag. Make changes first, then run bump. Use --force to override.";
+
+/// "Committed and tagged X" says a commit happened; when nothing was staged only the tag did.
+fn tagged_line(committed_verb: &str, nothing_staged: bool, tag: &str) -> String {
+    if nothing_staged {
+        format!("Tagged {tag}")
+    } else {
+        format!("{committed_verb} {tag}")
+    }
+}
+
+/// Every file `write_all` would touch for these manifests (manifest plus its lockfile),
+/// named relative to `dir`.
+fn manifest_file_names(dir: &Path, manifests: &[Box<dyn lang::Manifest>]) -> Vec<String> {
+    manifests
+        .iter()
+        .flat_map(|m| m.version_files())
+        .map(|p| p.strip_prefix(dir).unwrap_or(&p).display().to_string())
+        .collect()
+}
+
+/// Facts the plain-bump dry-run reports, gathered so the wording is a pure function.
+struct DryRunPlan<'a> {
+    update_files: &'a [String],
+    create_tag: bool,
+    has_changes: bool,
+    nothing_to_stage: bool,
+    is_pushed: bool,
+    new_tag: &'a str,
+    new_file_version: &'a str,
+}
+
+fn dry_run_lines(plan: &DryRunPlan) -> Vec<String> {
+    let mut lines = Vec::new();
+    if !plan.update_files.is_empty() {
+        lines.push(format!("[dry-run] Would update: {}", plan.update_files.join(", ")));
+    }
+    let tag = plan.new_tag;
+    if !plan.create_tag {
+        lines.push(format!(
+            "[dry-run] Would commit version bump to {} (no tag)",
+            plan.new_file_version
+        ));
+    } else if plan.nothing_to_stage {
+        lines.push(format!("[dry-run] Would tag: {tag}"));
+    } else if !plan.has_changes && !plan.is_pushed {
+        lines.push(format!("[dry-run] Would amend previous commit and tag: {tag}"));
+    } else {
+        lines.push(format!("[dry-run] Would commit and tag: {tag}"));
+    }
+    lines
+}
+
 /// Determine the commit message based on CLI flags and context
 fn determine_commit_message(
     cli: &Cli,
@@ -622,6 +676,7 @@ pub(crate) fn process_directory(dir: &Path, cli: &Cli, bump_type: BumpType) -> R
         let current_version = file_version
             .as_ref()
             .map(version::format_file_version)
+            .or_else(|| git::get_latest_tag(dir).ok().flatten())
             .unwrap_or_else(|| "unknown".to_string());
         println!("bump: {} -> {}", current_version, new_file_version);
     }
@@ -638,22 +693,29 @@ pub(crate) fn process_directory(dir: &Path, cli: &Cli, bump_type: BumpType) -> R
     // distinguish a bump-synced lockfile from one the user had already changed.
     let predirty_files = git::dirty_files(dir)?;
 
-    // 8. Handle dry-run
+    // 8. Handle dry-run. It runs the same refusal the real run does (a clean tree whose
+    //    HEAD already has a tag, unless --force), so a dry-run never promises what the
+    //    real run would refuse.
     if cli.dry_run {
-        if action.needs_file_update {
-            println!("[dry-run] Would update: {}", version_file_name(project_type));
+        if !has_changes && git::head_has_tag(dir)? && !cli.force {
+            bail!("{HEAD_ALREADY_TAGGED}");
         }
-        if !create_tag {
-            println!("[dry-run] Would commit version bump to {} (no tag)", new_file_version);
-        } else if !has_changes && !git::head_has_tag(dir)? {
-            let is_pushed = cli.never_amend || git::is_head_pushed(dir)?;
-            if is_pushed {
-                println!("[dry-run] Would create new commit and tag: {}", new_tag);
-            } else {
-                println!("[dry-run] Would amend previous commit and tag: {}", new_tag);
-            }
+        let update_files = if action.needs_file_update {
+            manifest_file_names(dir, &manifests)
         } else {
-            println!("[dry-run] Would commit and tag: {}", new_tag);
+            Vec::new()
+        };
+        let is_pushed = cli.never_amend || git::is_head_pushed(dir)?;
+        for line in dry_run_lines(&DryRunPlan {
+            update_files: &update_files,
+            create_tag,
+            has_changes,
+            nothing_to_stage: !has_changes && !action.needs_file_update,
+            is_pushed,
+            new_tag: &new_tag,
+            new_file_version: &new_file_version,
+        }) {
+            println!("{line}");
         }
         return Ok(());
     }
@@ -693,7 +755,10 @@ pub(crate) fn process_directory(dir: &Path, cli: &Cli, bump_type: BumpType) -> R
         if create_tag {
             git::create_tag(dir, &new_tag, &commit_message, &git::head_sha(dir)?)?;
             info!("Created tag: {}", new_tag);
-            println!("Committed and tagged {}", new_tag);
+            println!(
+                "{}",
+                tagged_line("Committed and tagged", staged_files.is_empty(), &new_tag)
+            );
         } else {
             println!("Committed version bump to {} (no tag)", new_file_version);
         }
@@ -702,7 +767,7 @@ pub(crate) fn process_directory(dir: &Path, cli: &Cli, bump_type: BumpType) -> R
 
         // Check if HEAD already has a tag
         if git::head_has_tag(dir)? && !cli.force {
-            bail!("HEAD already has a tag. Make changes first, then run bump. Use --force to override.");
+            bail!("{HEAD_ALREADY_TAGGED}");
         }
 
         // Check if HEAD has been pushed. `never_amend` (set by the release verbs, never by
@@ -740,7 +805,10 @@ pub(crate) fn process_directory(dir: &Path, cli: &Cli, bump_type: BumpType) -> R
             if create_tag {
                 git::create_tag(dir, &new_tag, &commit_message, &git::head_sha(dir)?)?;
                 info!("Created tag: {}", new_tag);
-                println!("Committed and tagged {}", new_tag);
+                println!(
+                    "{}",
+                    tagged_line("Committed and tagged", staged_files.is_empty(), &new_tag)
+                );
             } else {
                 println!("Committed version bump to {} (no tag)", new_file_version);
             }
@@ -770,7 +838,10 @@ pub(crate) fn process_directory(dir: &Path, cli: &Cli, bump_type: BumpType) -> R
                 let tag_message = explicit_message.unwrap_or_else(|| format!("Bump version to {}", new_tag));
                 git::create_tag(dir, &new_tag, &tag_message, &git::head_sha(dir)?)?;
                 info!("Created tag: {}", new_tag);
-                println!("Amended commit and tagged {}", new_tag);
+                println!(
+                    "{}",
+                    tagged_line("Amended commit and tagged", staged_files.is_empty(), &new_tag)
+                );
             } else {
                 println!("Amended commit with version bump to {} (no tag)", new_file_version);
             }
@@ -2541,6 +2612,70 @@ name = "test-pkg"
         fs::create_dir_all(repo.join("src")).unwrap();
         setup_git_repo(&repo);
         repo
+    }
+
+    fn plan<'a>(files: &'a [String]) -> DryRunPlan<'a> {
+        DryRunPlan {
+            update_files: files,
+            create_tag: true,
+            has_changes: false,
+            nothing_to_stage: false,
+            is_pushed: true,
+            new_tag: "v1.2.4",
+            new_file_version: "1.2.4",
+        }
+    }
+
+    #[test]
+    fn dry_run_lines_lists_each_file_and_uses_one_commit_wording() {
+        let files = vec!["Cargo.toml".to_string(), "Cargo.lock".to_string()];
+        assert_eq!(
+            dry_run_lines(&plan(&files)),
+            vec![
+                "[dry-run] Would update: Cargo.toml, Cargo.lock".to_string(),
+                "[dry-run] Would commit and tag: v1.2.4".to_string()
+            ]
+        );
+        // Uncommitted changes and a pushed clean HEAD are the same action: same wording.
+        let mut dirty = plan(&files);
+        dirty.has_changes = true;
+        assert_eq!(dry_run_lines(&dirty), dry_run_lines(&plan(&files)));
+    }
+
+    #[test]
+    fn dry_run_lines_amend_tag_only_and_no_tag_shapes() {
+        let none: Vec<String> = Vec::new();
+        let mut amend = plan(&none);
+        amend.is_pushed = false;
+        assert_eq!(
+            dry_run_lines(&amend),
+            vec!["[dry-run] Would amend previous commit and tag: v1.2.4".to_string()]
+        );
+        let mut tag_only = plan(&none);
+        tag_only.nothing_to_stage = true;
+        assert_eq!(
+            dry_run_lines(&tag_only),
+            vec!["[dry-run] Would tag: v1.2.4".to_string()]
+        );
+        let mut no_tag = plan(&none);
+        no_tag.create_tag = false;
+        assert_eq!(
+            dry_run_lines(&no_tag),
+            vec!["[dry-run] Would commit version bump to 1.2.4 (no tag)".to_string()]
+        );
+    }
+
+    #[test]
+    fn tagged_line_drops_the_commit_claim_when_nothing_was_staged() {
+        assert_eq!(
+            tagged_line("Committed and tagged", false, "v1.0.0"),
+            "Committed and tagged v1.0.0"
+        );
+        assert_eq!(tagged_line("Committed and tagged", true, "v1.0.0"), "Tagged v1.0.0");
+        assert_eq!(
+            tagged_line("Amended commit and tagged", true, "v1.0.0"),
+            "Tagged v1.0.0"
+        );
     }
 
     #[test]

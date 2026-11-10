@@ -65,3 +65,21 @@
 - Asserting the hint in the existing stale-skip test vs. a new test: same call, same error, one fewer fixture.
 ### Open questions
 - None.
+
+## Phase 6: Plain-bump dry-run tells the truth (bug 4, C1, C4)
+### Design decisions
+- `-n` runs the real run's clean-tree refusal (`!has_changes && head_has_tag && !--force`) before printing anything about the plan (`src/main.rs`, `process_directory`). The message is one const, `HEAD_ALREADY_TAGGED`, used by both paths so they cannot drift. The refusal fires after the `bump: X -> Y` line, as in the real run.
+- The dry-run wording is a pure function, `dry_run_lines(&DryRunPlan)`, so the shapes are unit-tested without a repo. With `--force` on a tagged, pushed HEAD it plans a new commit; unpushed, an amend (the same `is_head_pushed` / `never_amend` choice as the real run).
+- One commit-and-tag wording: `Would commit and tag: <tag>` for both uncommitted changes and a pushed clean HEAD. The doc names the problem ("two wordings") but not the survivor; I kept the shorter one, which matches the real run's "Committed and tagged". `Would amend previous commit and tag` stays, since it is a different action.
+- Added `Would tag: <tag>` for the dry-run of a repo where nothing would be staged (generic, clean), mirroring the real run's new `Tagged <tag>` line. Wording is mine.
+- Manifest listing: `manifest_file_names` uses each manifest's `version_files()` (manifest plus any existing lockfile), relative to the directory, comma-joined on one `Would update:` line (`Would update: Cargo.toml, Cargo.lock`). A lockfile that does not exist yet is not listed; the sync only touches one that exists.
+- C1 "from": `bump: v0.6.0 -> 0.6.1`, the raw latest-tag string, falling back to `unknown` only when there is no tag and no manifest version. The doc's criterion shows the `v` prefix, so I did not strip it.
+- C1 "Tagged vX": `tagged_line` replaces "Committed and tagged" / "Amended commit and tagged" with `Tagged <tag>` whenever no file was staged, in all three real-run branches.
+### Deviations
+- Binary tests live in a new `tests/dryrun.rs`, not `tests/release_cli.rs`, for the same reason as Phase 4's `tests/subdir.rs` (plain bump, own fixture helpers).
+- The doc says "Dry-run lists each manifest with its lockfile" as separate items; I print them on one line rather than one line per file.
+### Tradeoffs
+- Reusing a shared const for the refusal vs. extracting a check function: the check is one condition and the dry-run needs `bail!` at the same point, so the message const is the smallest thing that cannot drift.
+- Showing `Would tag:` for the nothing-to-stage case vs. leaving it under "Would commit and tag": the latter is the same false claim C1 fixes in the real run.
+### Open questions
+- None.
