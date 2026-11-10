@@ -57,7 +57,7 @@ use log::debug;
 use pr::{branch_slug, pr_body, pr_title, standalone_order_line};
 use semver::Version;
 use standalone::{classify_gated_standalone, execute_gated_standalone, is_bump_only_branch};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 use tag::{TagTarget, echo_tag_steps, gate_tag_and_push};
@@ -284,15 +284,16 @@ pub trait Pusher {
 }
 
 /// Runs the post-release install command, then proves the installed binary is the release.
-/// A port so tests assert the RESOLVED command and the verified (binary, tag) pair without
-/// executing a real (slow, outward) `cargo install`.
+/// A port so tests assert the RESOLVED command and the verified (target, binary, tag)
+/// without executing a real (slow, outward) `cargo install`.
 pub trait Installer {
     fn install(&self, dir: &Path, command: &str) -> Result<()>;
     /// `<bin> --version` must name `tag` exactly: the build-version contract puts the
     /// bare `vX.Y.Z` in `BUILD_VERSION` only when HEAD is the tagged commit, so this
     /// catches a stale binary earlier on PATH, a crate still on `CARGO_PKG_VERSION`
-    /// (`X.Y.Z`, no `v`), and a `vX.Y.Z-N-g<sha>` build past the tag.
-    fn verify(&self, bin: &str, tag: &str) -> Result<()>;
+    /// (`X.Y.Z`, no `v`), and a `vX.Y.Z-N-g<sha>` build past the tag. `dir` is where the
+    /// binary's manifest lives (the install target, e.g. `<repo>/clyde`).
+    fn verify(&self, dir: &Path, bin: &str, tag: &str) -> Result<()>;
 }
 
 /// Production `Pusher`: real `git push origin <name>` by explicit name (never `--tags`,
@@ -327,16 +328,31 @@ struct Ports<'a, P: Pusher, I: Installer, R: Pr, C: Ci> {
 pub struct ShellInstaller {
     /// Where `cargo install` writes: `$CARGO_INSTALL_ROOT`, else `$CARGO_HOME`, else
     /// `~/.cargo`. `None` when none resolves; the binary is then looked up on PATH.
-    pub install_root: Option<std::path::PathBuf>,
+    pub install_root: Option<PathBuf>,
+    /// How long `<bin> --version` may run before it is killed and verify fails. A CLI
+    /// answers at once; a server that ignores the flag would otherwise hang the release.
+    pub verify_timeout: Duration,
 }
+
+/// `ShellInstaller::default()`'s `verify_timeout`.
+const DEFAULT_VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How often the verify loop polls the `--version` child for exit.
+const VERIFY_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// The closing line of every verify failure: the tag already stands on origin, so a source
+/// fix moves HEAD past it (a new release), while a plain reinstall is `bump finish`.
+const VERIFY_RERUN: &str = "The tag is pushed and stands. A source fix is a new release: commit it and run \
+     `bump release`. To only reinstall, re-run `bump finish` (repeat any --install override).";
 
 impl Default for ShellInstaller {
     fn default() -> Self {
         Self {
             install_root: std::env::var_os("CARGO_INSTALL_ROOT")
                 .or_else(|| std::env::var_os("CARGO_HOME"))
-                .map(std::path::PathBuf::from)
+                .map(PathBuf::from)
                 .or_else(|| dirs::home_dir().map(|home| home.join(".cargo"))),
+            verify_timeout: DEFAULT_VERIFY_TIMEOUT,
         }
     }
 }
@@ -356,43 +372,160 @@ impl Installer for ShellInstaller {
         Ok(())
     }
 
-    fn verify(&self, bin: &str, tag: &str) -> Result<()> {
-        let path = installed_bin_path(self.install_root.as_deref(), bin);
-        debug!("ShellInstaller::verify: bin={} tag={}", path.display(), tag);
-        let output = Command::new(&path)
-            .arg("--version")
-            .output()
-            .with_context(|| format!("failed to run `{} --version`", path.display()))?;
-        let printed = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !output.status.success() {
-            bail!(
-                "install verification failed: `{} --version` exited {} ({printed})",
-                path.display(),
-                output.status
-            );
-        }
-        if version_matches(&printed, tag) {
-            println!("verify: {} --version -> {printed}", path.display());
-            return Ok(());
-        }
-        bail!(
-            "install verification failed: `{} --version` printed \"{printed}\", expected {tag}. {} \
-             The tag is pushed; only the install is unproven. Fix the build and re-run `bump finish` \
-             to reinstall.",
+    fn verify(&self, dir: &Path, bin: &str, tag: &str) -> Result<()> {
+        let (path, source) = installed_bin_path(self.install_root.as_deref(), bin);
+        debug!(
+            "ShellInstaller::verify: dir={} bin={} source={:?} tag={} timeout={:?}",
+            dir.display(),
             path.display(),
-            version_mismatch_hint(&printed, tag)
+            source,
+            tag,
+            self.verify_timeout
         );
+        let run = run_version(&path, self.verify_timeout).map_err(|e| {
+            eyre::eyre!(
+                "install verification failed: could not run `{} --version`: {e:#}\n{VERIFY_RERUN}",
+                path.display()
+            )
+        })?;
+        debug!("ShellInstaller::verify: outcome={:?}", run);
+        match run {
+            VersionRun::TimedOut { stdout, stderr } => bail!(
+                "install verification failed: `{} --version` did not exit within {}; a CLI answers \
+                 --version at once.{}\n{VERIFY_RERUN}",
+                path.display(),
+                format_timeout(self.verify_timeout),
+                captured(&stdout, &stderr)
+            ),
+            VersionRun::Exited {
+                success: false,
+                status,
+                stdout,
+                stderr,
+            } => bail!(
+                "install verification failed: `{} --version` exited {status}.{}\n{VERIFY_RERUN}",
+                path.display(),
+                captured(&stdout, &stderr)
+            ),
+            VersionRun::Exited { stdout, .. } => {
+                let printed = stdout.trim();
+                if version_matches(printed, tag) {
+                    println!("verify: {} --version -> {printed}", path.display());
+                    return Ok(());
+                }
+                bail!("{}", version_mismatch_message(&path, source, printed, tag));
+            }
+        }
+    }
+}
+
+/// Where the verified binary was found: the install root `cargo install` writes to, or a
+/// bare name left for PATH to resolve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BinSource {
+    InstallRoot,
+    Path,
+}
+
+impl BinSource {
+    fn describe(self) -> &'static str {
+        match self {
+            BinSource::InstallRoot => "from the install root",
+            BinSource::Path => "from PATH",
+        }
     }
 }
 
 /// Where `cargo install` put `bin`: `<install_root>/bin/<bin>` when that file exists.
 /// Otherwise (a custom `install:` command that installs elsewhere) the bare name, so
-/// PATH resolves it.
-fn installed_bin_path(install_root: Option<&Path>, bin: &str) -> std::path::PathBuf {
+/// PATH resolves it. The source says which, for the mismatch error's fact line.
+fn installed_bin_path(install_root: Option<&Path>, bin: &str) -> (PathBuf, BinSource) {
     match install_root {
-        Some(root) if root.join("bin").join(bin).is_file() => root.join("bin").join(bin),
-        _ => std::path::PathBuf::from(bin),
+        Some(root) if root.join("bin").join(bin).is_file() => (root.join("bin").join(bin), BinSource::InstallRoot),
+        _ => (PathBuf::from(bin), BinSource::Path),
     }
+}
+
+/// How a `<bin> --version` run ended.
+#[derive(Debug)]
+enum VersionRun {
+    Exited {
+        success: bool,
+        status: std::process::ExitStatus,
+        stdout: String,
+        stderr: String,
+    },
+    TimedOut {
+        stdout: String,
+        stderr: String,
+    },
+}
+
+/// Spawn `<path> --version` with stdin null and stdout/stderr in anonymous temp files
+/// (never pipes: an undrained pipe can block the child, and a descendant holding the pipe
+/// can block the post-exit read with no deadline). Poll for exit until `timeout`, then
+/// kill and reap the child. A descendant that outlives the child is not killed, but it
+/// only holds a file, so the deadline is hard.
+fn run_version(path: &Path, timeout: Duration) -> Result<VersionRun> {
+    use std::io::{Read, Seek};
+    let mut out = tempfile::tempfile().context("failed to create a temp file for stdout")?;
+    let mut err = tempfile::tempfile().context("failed to create a temp file for stderr")?;
+    let mut child = Command::new(path)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(out.try_clone()?)
+        .stderr(err.try_clone()?)
+        .spawn()?;
+    let started = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break Some(status);
+        }
+        if started.elapsed() >= timeout {
+            // `kill` on a child that exited since the last poll is `Ok(())` (std docs).
+            child.kill()?;
+            child.wait()?;
+            break None;
+        }
+        std::thread::sleep(VERIFY_POLL_INTERVAL.min(timeout));
+    };
+    let read_back = |file: &mut std::fs::File| -> Result<String> {
+        let mut bytes = Vec::new();
+        file.rewind()?;
+        file.read_to_end(&mut bytes)?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    };
+    let stdout = read_back(&mut out)?;
+    let stderr = read_back(&mut err)?;
+    Ok(match status {
+        Some(status) => VersionRun::Exited {
+            success: status.success(),
+            status,
+            stdout,
+            stderr,
+        },
+        None => VersionRun::TimedOut { stdout, stderr },
+    })
+}
+
+/// `10s`, or `200ms` when the timeout is not whole seconds.
+fn format_timeout(timeout: Duration) -> String {
+    if timeout.subsec_millis() == 0 {
+        format!("{}s", timeout.as_secs())
+    } else {
+        format!("{}ms", timeout.as_millis())
+    }
+}
+
+/// The child's output for an error message: each non-empty stream on its own line.
+fn captured(stdout: &str, stderr: &str) -> String {
+    let mut text = String::new();
+    for (name, body) in [("stdout", stdout.trim()), ("stderr", stderr.trim())] {
+        if !body.is_empty() {
+            text.push_str(&format!("\n{name}: {body}"));
+        }
+    }
+    text
 }
 
 /// True when some whitespace-separated token of the `--version` output is exactly `tag`.
@@ -401,18 +534,41 @@ fn version_matches(printed: &str, tag: &str) -> bool {
     printed.split_whitespace().any(|token| token == tag)
 }
 
-/// Name the cause of a `--version` mismatch when the output's shape gives it away.
-fn version_mismatch_hint(printed: &str, tag: &str) -> &'static str {
+/// The mismatch error: what ran and what it printed, one line of fact saying where the
+/// binary came from, at most one shape hint, and the shared re-run line.
+fn version_mismatch_message(path: &Path, source: BinSource, printed: &str, tag: &str) -> String {
+    let mut message = format!(
+        "install verification failed: `{} --version` printed \"{printed}\", expected {tag}.\n\
+         verify ran {} ({})",
+        path.display(),
+        path.display(),
+        source.describe()
+    );
+    if let Some(hint) = version_mismatch_hint(printed, tag) {
+        message.push('\n');
+        message.push_str(hint);
+    }
+    message.push('\n');
+    message.push_str(VERIFY_RERUN);
+    message
+}
+
+/// Name the cause of a `--version` mismatch only when the output's shape proves it. Any
+/// other mismatch (an older copy, an install that wrote elsewhere, a fresh build reporting
+/// the wrong thing) gets no hint: the fact line says which path ran, and bump does not
+/// guess.
+fn version_mismatch_hint(printed: &str, tag: &str) -> Option<&'static str> {
     let bare = tag.strip_prefix('v').unwrap_or(tag);
+    let past_tag = format!("{tag}-");
     if printed
         .split_whitespace()
-        .any(|token| token.starts_with(tag) && token.contains("-g"))
+        .any(|token| token.starts_with(&past_tag) && token.contains("-g"))
     {
-        "The binary was built past the tag (a `-N-g<sha>` build): HEAD is not the tagged commit."
+        Some("The binary was built past the tag (a -N-g<sha> build): HEAD is not the tagged commit.")
     } else if printed.split_whitespace().any(|token| token == bare) {
-        "The crate reports CARGO_PKG_VERSION (no `v`): its build.rs is not `build_version::emit()`."
+        Some("The binary reports CARGO_PKG_VERSION (no v), which the build-version contract never prints.")
     } else {
-        "An older binary may sit earlier on PATH, or the install wrote somewhere else."
+        None
     }
 }
 
@@ -1359,13 +1515,49 @@ fn install_skip_reason(dir: &Path, choice: &InstallChoice) -> &'static str {
     }
 }
 
-/// The `verify: skipped` reason when the manifest names no single binary to check.
-const VERIFY_SKIPPED: &str = "skipped (no binary name in Cargo.toml)";
+/// What the post-install verify step checks, resolved once per install from the install
+/// command (data model, 2026-11-09 install-verify-clis-only doc).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VerifyTarget {
+    /// Run `<bin> --version` for the package at `dir`.
+    Verify { dir: PathBuf, bin: String },
+    /// Print `verify: skipped (<reason>)`.
+    Skip(String),
+}
 
-/// Resolve and run the install step, then verify the installed binary reports `tag`;
-/// return the command that ran (`None` = skipped). A manifest with no single binary name
-/// (custom `install:` on a workspace root, a non-Cargo repo) installs unverified and says
-/// so.
+/// Resolve the verify target from the install command that ran in `dir`. Reasons in order:
+/// not a `cargo install`; a `cargo install` of something else; no binary name in the
+/// target's manifest; no `clap` dependency there. Binary name before clap, because a
+/// virtual root has neither and "no binary name" is the truth about it.
+fn verify_target(dir: &Path, command: &str) -> VerifyTarget {
+    let target = match lang::cargo::cargo_install_target(dir, command) {
+        lang::cargo::InstallTarget::NotCargoInstall => {
+            return VerifyTarget::Skip("install command is not cargo install".to_string());
+        }
+        lang::cargo::InstallTarget::NotThisRepo => {
+            return VerifyTarget::Skip("install command does not install this repo".to_string());
+        }
+        lang::cargo::InstallTarget::Dir(target) => target,
+    };
+    let manifest = target.join("Cargo.toml");
+    let resolved = match lang::cargo::install_bin_name(&target) {
+        None => VerifyTarget::Skip(format!("no binary name in {}", manifest.display())),
+        Some(_) if !lang::cargo::has_clap_dependency(&target) => {
+            VerifyTarget::Skip(format!("no clap dependency in {}", manifest.display()))
+        }
+        Some(bin) => VerifyTarget::Verify { dir: target, bin },
+    };
+    debug!(
+        "verify_target: dir={} command={} -> {:?}",
+        dir.display(),
+        command,
+        resolved
+    );
+    resolved
+}
+
+/// Resolve and run the install step, then verify the installed binary reports `tag` (or
+/// say why verify is skipped); return the command that ran (`None` = install skipped).
 fn run_install<I: Installer>(
     dir: &Path,
     choice: &InstallChoice,
@@ -1377,9 +1569,9 @@ fn run_install<I: Installer>(
         Some(cmd) => {
             println!("install: {cmd}");
             installer.install(dir, &cmd)?;
-            match lang::cargo::install_bin_name(dir) {
-                Some(bin) => installer.verify(&bin, tag)?,
-                None => println!("verify: {VERIFY_SKIPPED}"),
+            match verify_target(dir, &cmd) {
+                VerifyTarget::Verify { dir: target, bin } => installer.verify(&target, &bin, tag)?,
+                VerifyTarget::Skip(reason) => println!("verify: skipped ({reason})"),
             }
             Ok(Some(cmd))
         }
@@ -1395,9 +1587,9 @@ fn echo_install(dir: &Path, choice: &InstallChoice, install_command: &Option<Str
     match install_command {
         Some(cmd) => {
             println!("[dry-run] install: {cmd}");
-            match lang::cargo::install_bin_name(dir) {
-                Some(bin) => println!("[dry-run] verify: {bin} --version == {tag}"),
-                None => println!("[dry-run] verify: {VERIFY_SKIPPED}"),
+            match verify_target(dir, cmd) {
+                VerifyTarget::Verify { bin, .. } => println!("[dry-run] verify: {bin} --version == {tag}"),
+                VerifyTarget::Skip(reason) => println!("[dry-run] verify: skipped ({reason})"),
             }
         }
         None => println!("[dry-run] install: {}", install_skip_reason(dir, choice)),

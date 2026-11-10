@@ -138,6 +138,44 @@ fn finish_already_released_still_installs() {
     drop(origin);
 }
 
+/// Recovery after a failed verify: the first finish tags, pushes, installs, and fails the
+/// verb on the verify; the tag stands on origin. A second finish (already released)
+/// reinstalls and verifies again, pushing nothing.
+#[test]
+fn finish_reinstalls_after_a_failed_verify() {
+    let (origin, work) = setup_finish_untagged_merged("0.1.5", "0.1.6");
+    let dir = work.path();
+
+    let pusher = RecordingPusher::new(false);
+    let failing = RecordingInstaller::failing_verify_once();
+    let err = finish(dir, &finish_opts(false), &pusher, &failing, &NoCi)
+        .expect_err("a failed verify fails the verb")
+        .to_string();
+    assert!(err.contains("install verification failed"), "got: {err}");
+    assert_eq!(
+        pusher.calls(),
+        vec!["tag:v0.1.6".to_string()],
+        "the tag was pushed first"
+    );
+    assert!(
+        git::remote_tag_sha(dir, "v0.1.6").unwrap().is_some(),
+        "the tag stands on origin"
+    );
+    assert_eq!(failing.calls(), vec!["cargo install --path .".to_string()]);
+    assert_eq!(failing.verified(), vec![verified_entry(dir, "test-pkg", "v0.1.6")]);
+
+    let head = git::head_sha(dir).unwrap();
+    let retry_pusher = RecordingPusher::new(false);
+    let installer = RecordingInstaller::new();
+    let report = finish(dir, &finish_opts(false), &retry_pusher, &installer, &NoCi).expect("re-run reinstalls");
+    assert_eq!(report.tag, "v0.1.6");
+    assert_eq!(installer.calls(), vec!["cargo install --path .".to_string()]);
+    assert_eq!(installer.verified(), vec![verified_entry(dir, "test-pkg", "v0.1.6")]);
+    assert!(retry_pusher.calls().is_empty(), "the re-run pushes nothing");
+    assert_eq!(git::head_sha(dir).unwrap(), head, "the re-run commits nothing");
+    drop(origin);
+}
+
 /// Row 5: a generic (no-manifest) repo -- finish cannot derive a version, so it refuses with
 /// the gated-generic-unsupported message before any checkout.
 #[test]

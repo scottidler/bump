@@ -37,7 +37,46 @@ fn ungated_release_pushes_branch_then_tag_in_order() {
     assert_eq!(report.install_command.as_deref(), Some("cargo install --path ."));
     assert_eq!(installer.calls(), vec!["cargo install --path .".to_string()]);
     // The installed binary was checked against the tag just pushed, by its package name.
-    assert_eq!(installer.verified(), vec!["test-pkg:v0.1.6".to_string()]);
+    assert_eq!(installer.verified(), vec![verified_entry(dir, "test-pkg", "v0.1.6")]);
+    drop(origin);
+}
+
+/// Recovery after a failed verify on the ungated path: `release` pushes the branch and the
+/// tag, installs, and fails on the verify. `finish` then reinstalls and verifies with no new
+/// commit and no new push.
+#[test]
+fn ungated_release_failed_verify_then_finish_reinstalls() {
+    let _guard = crate::ENV_LOCK.lock().unwrap();
+    let (origin, work) = setup_with_pending_commit("0.1.5");
+    let dir = work.path();
+
+    let pusher = RecordingPusher::new(false);
+    let failing = RecordingInstaller::failing_verify_once();
+    let prev = set_probe("ungated");
+    let result = release(dir, &auto_opts(None, false), &pusher, &failing, &no_pr(), &NoCi);
+    restore_probe(prev);
+
+    let err = result.expect_err("a failed verify fails the release").to_string();
+    assert!(err.contains("install verification failed"), "got: {err}");
+    assert_eq!(
+        pusher.calls(),
+        vec!["branch:main".to_string(), "tag:v0.1.6".to_string()]
+    );
+    assert!(
+        git::remote_tag_sha(dir, "v0.1.6").unwrap().is_some(),
+        "the tag is already on origin"
+    );
+    assert_eq!(failing.verified(), vec![verified_entry(dir, "test-pkg", "v0.1.6")]);
+
+    let head = git::head_sha(dir).unwrap();
+    let finish_pusher = RecordingPusher::new(false);
+    let installer = RecordingInstaller::new();
+    let report = finish(dir, &finish_opts(false), &finish_pusher, &installer, &NoCi).expect("finish reinstalls");
+    assert_eq!(report.tag, "v0.1.6");
+    assert_eq!(installer.calls(), vec!["cargo install --path .".to_string()]);
+    assert_eq!(installer.verified(), vec![verified_entry(dir, "test-pkg", "v0.1.6")]);
+    assert!(finish_pusher.calls().is_empty(), "no new push");
+    assert_eq!(git::head_sha(dir).unwrap(), head, "no new commit");
     drop(origin);
 }
 
@@ -49,8 +88,8 @@ fn ungated_release_with_real_pusher_and_installer() {
     let (origin, work) = setup_with_pending_commit("0.1.5");
     let dir = work.path();
 
-    // The install command writes a fake `test-pkg` into a private install root that
-    // answers `--version` with the tag about to be cut, so the real verify step passes.
+    // The install command writes a fake `test-pkg` into a private install root. It is not
+    // a `cargo install`, so verify skips; `ShellInstaller::verify` is proven in `install`.
     let root = TempDir::new().unwrap();
     let install_cmd = format!(
         "mkdir -p {root}/bin && printf '#!/bin/sh\\necho test-pkg v0.1.6\\n' > {root}/bin/test-pkg \
@@ -63,6 +102,7 @@ fn ungated_release_with_real_pusher_and_installer() {
     };
     let installer = ShellInstaller {
         install_root: Some(root.path().to_path_buf()),
+        verify_timeout: std::time::Duration::from_secs(10),
     };
     let prev = set_probe("ungated");
     let report = release(dir, &opts, &GitPusher, &installer, &GhPr, &GhCi);

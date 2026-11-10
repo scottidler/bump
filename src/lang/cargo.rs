@@ -263,6 +263,147 @@ pub fn has_clap_dependency(dir: &Path) -> bool {
     })
 }
 
+/// What a post-release install command installs, as far as the verify step can tell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstallTarget {
+    /// Not a `cargo install` at all (`make install`, a script): nothing says what it
+    /// installs.
+    NotCargoInstall,
+    /// A `cargo install` of something other than this checkout: a positional crate name
+    /// (crates.io), `--git`, or `--registry`.
+    NotThisRepo,
+    /// A `cargo install` of this checkout: the directory it installs from (`--path <dir>`
+    /// or `--path=<dir>` joined onto the repo, else the repo itself).
+    Dir(PathBuf),
+}
+
+/// `cargo install` options that take a value as the next word (or after `=`). Any other
+/// bare word after `cargo install` is a positional crate name.
+const CARGO_INSTALL_VALUE_FLAGS: &[&str] = &[
+    "--version",
+    "--vers",
+    "--git",
+    "--branch",
+    "--tag",
+    "--rev",
+    "--path",
+    "--root",
+    "--index",
+    "--registry",
+    "--bin",
+    "--example",
+    "--features",
+    "-F",
+    "--target",
+    "--target-dir",
+    "--profile",
+    "--jobs",
+    "-j",
+    "--config",
+    "-Z",
+    "--color",
+    "--message-format",
+];
+
+/// Split `command` into words the way `sh` would for the cases an install line uses:
+/// whitespace separates, single quotes are literal, double quotes group (a backslash
+/// escapes `"` or `\` inside them), and a backslash outside quotes escapes the next
+/// character. Quoted pieces join the word they touch, so `--path="my dir"` is one word.
+/// An unterminated quote runs to the end of the command; `sh` itself rejects that line
+/// before verify is reached.
+fn split_command_words(command: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut chars = command.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                in_word = true;
+                word.extend(chars.by_ref().take_while(|&q| q != '\''));
+            }
+            '"' => {
+                in_word = true;
+                while let Some(q) = chars.next() {
+                    match q {
+                        '"' => break,
+                        '\\' => match chars.next() {
+                            Some(e @ ('"' | '\\')) => word.push(e),
+                            Some(e) => {
+                                word.push('\\');
+                                word.push(e);
+                            }
+                            None => word.push('\\'),
+                        },
+                        _ => word.push(q),
+                    }
+                }
+            }
+            '\\' => {
+                in_word = true;
+                if let Some(e) = chars.next() {
+                    word.push(e);
+                }
+            }
+            c if c.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+            }
+            c => {
+                in_word = true;
+                word.push(c);
+            }
+        }
+    }
+    if in_word {
+        words.push(word);
+    }
+    words
+}
+
+/// Resolve what `command` installs, relative to the repo at `dir`. Words are split with
+/// shell quoting (`split_command_words`), and a `cargo +<toolchain> install` is still a
+/// `cargo install`.
+pub fn cargo_install_target(dir: &Path, command: &str) -> InstallTarget {
+    let words = split_command_words(command);
+    let mut words = words.iter().map(String::as_str).peekable();
+    if words.next() != Some("cargo") {
+        return InstallTarget::NotCargoInstall;
+    }
+    words.next_if(|word| word.starts_with('+'));
+    if words.next() != Some("install") {
+        return InstallTarget::NotCargoInstall;
+    }
+    let mut path = None;
+    while let Some(word) = words.next() {
+        let (flag, inline_value) = match word.split_once('=') {
+            Some((flag, value)) if flag.starts_with('-') => (flag, Some(value)),
+            _ => (word, None),
+        };
+        if !flag.starts_with('-') {
+            return InstallTarget::NotThisRepo;
+        }
+        if flag == "--git" || flag == "--registry" {
+            return InstallTarget::NotThisRepo;
+        }
+        if !CARGO_INSTALL_VALUE_FLAGS.contains(&flag) {
+            continue;
+        }
+        let value = inline_value.or_else(|| words.next());
+        if flag == "--path" {
+            path = value;
+        }
+    }
+    let target = match path {
+        Some(p) => dir.join(p),
+        None => dir.to_path_buf(),
+    };
+    // `components()` drops interior `.`: `--path .` names the repo itself, not `<repo>/.`.
+    InstallTarget::Dir(target.components().collect())
+}
+
 /// The binary the default install produces, for the post-install `--version` check: the
 /// first `[[bin]]`'s `name` (falling back to the package name, as cargo does), else the
 /// package name when `src/main.rs` exists. `None` for a library crate, a crate whose
@@ -604,6 +745,104 @@ name = "test"
         );
         assert!(!has_clap_dependency(dir.path()), "virtual root: the member decides");
         assert!(!has_clap_dependency(TempDir::new().unwrap().path()));
+    }
+
+    #[test]
+    fn test_cargo_install_target_follows_path() {
+        let dir = Path::new("/repo");
+        let target = |p: &str| InstallTarget::Dir(PathBuf::from(p));
+        assert_eq!(cargo_install_target(dir, "cargo install --path ."), target("/repo"));
+        assert_eq!(
+            cargo_install_target(dir, "cargo install --locked --path clyde"),
+            target("/repo/clyde")
+        );
+        assert_eq!(
+            cargo_install_target(dir, "cargo install --path=clyde --locked"),
+            target("/repo/clyde")
+        );
+        assert_eq!(
+            cargo_install_target(dir, "cargo install --features full --path cli"),
+            target("/repo/cli"),
+            "a flag's value is not a positional crate name"
+        );
+        assert_eq!(cargo_install_target(dir, "cargo install"), target("/repo"));
+        assert_eq!(cargo_install_target(dir, "cargo install --locked"), target("/repo"));
+    }
+
+    /// Quoted option values and a `+<toolchain>` are part of a `cargo install` of this repo:
+    /// v0.4.6 verified all three, and each resolves to the repo root.
+    #[test]
+    fn test_cargo_install_target_quotes_and_toolchain() {
+        let dir = Path::new("/repo");
+        let root = InstallTarget::Dir(PathBuf::from("/repo"));
+        for command in [
+            "cargo install --path . --config \"build.jobs = 2\"",
+            "cargo install --path . --features \"a b\"",
+            "cargo +nightly install --path .",
+        ] {
+            assert_eq!(cargo_install_target(dir, command), root, "{command}");
+        }
+        assert_eq!(
+            cargo_install_target(dir, "cargo install --path \"my cli\""),
+            InstallTarget::Dir(PathBuf::from("/repo/my cli"))
+        );
+        assert_eq!(
+            cargo_install_target(dir, "cargo install --path='my cli'"),
+            InstallTarget::Dir(PathBuf::from("/repo/my cli"))
+        );
+        assert_eq!(
+            cargo_install_target(dir, "cargo +nightly ripgrep"),
+            InstallTarget::NotCargoInstall,
+            "a toolchain is not an install subcommand"
+        );
+    }
+
+    #[test]
+    fn test_split_command_words_honors_quotes() {
+        let split = |s: &str| split_command_words(s);
+        assert_eq!(split("a  b\tc"), vec!["a", "b", "c"]);
+        assert_eq!(split("--config \"build.jobs = 2\""), vec!["--config", "build.jobs = 2"]);
+        assert_eq!(split("--features 'a b'"), vec!["--features", "a b"]);
+        assert_eq!(split("--path=\"my dir\"x"), vec!["--path=my dirx"]);
+        assert_eq!(split("\"say \\\"hi\\\"\""), vec!["say \"hi\""]);
+        assert_eq!(split("a\\ b"), vec!["a b"]);
+        assert_eq!(split("''"), vec![""], "an empty quoted word is still a word");
+        assert_eq!(split("'unterminated b"), vec!["unterminated b"]);
+        assert!(split("   ").is_empty());
+    }
+
+    #[test]
+    fn test_cargo_install_target_not_cargo_install() {
+        let dir = Path::new("/repo");
+        assert_eq!(
+            cargo_install_target(dir, "make install"),
+            InstallTarget::NotCargoInstall
+        );
+        assert_eq!(
+            cargo_install_target(dir, "cargo build --release"),
+            InstallTarget::NotCargoInstall
+        );
+        assert_eq!(cargo_install_target(dir, "cargo"), InstallTarget::NotCargoInstall);
+        assert_eq!(cargo_install_target(dir, ""), InstallTarget::NotCargoInstall);
+    }
+
+    #[test]
+    fn test_cargo_install_target_not_this_repo() {
+        let dir = Path::new("/repo");
+        for command in [
+            "cargo install ripgrep",
+            "cargo install --locked ripgrep",
+            "cargo install --git https://github.com/x/y",
+            "cargo install --git=https://github.com/x/y",
+            "cargo install --registry internal tool",
+            "cargo install --registry=internal",
+        ] {
+            assert_eq!(
+                cargo_install_target(dir, command),
+                InstallTarget::NotThisRepo,
+                "{command}"
+            );
+        }
     }
 
     #[test]

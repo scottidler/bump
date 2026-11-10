@@ -153,6 +153,7 @@ struct RecordingInstaller {
     calls: RefCell<Vec<String>>,
     dirs: RefCell<Vec<std::path::PathBuf>>,
     verified: RefCell<Vec<String>>,
+    fail_next_verify: std::cell::Cell<bool>,
 }
 
 impl RecordingInstaller {
@@ -161,7 +162,15 @@ impl RecordingInstaller {
             calls: RefCell::new(Vec::new()),
             dirs: RefCell::new(Vec::new()),
             verified: RefCell::new(Vec::new()),
+            fail_next_verify: std::cell::Cell::new(false),
         }
+    }
+    /// The first `verify` is recorded and then fails (a stale binary after the tag is
+    /// pushed); later ones pass.
+    fn failing_verify_once() -> Self {
+        let installer = Self::new();
+        installer.fail_next_verify.set(true);
+        installer
     }
     fn calls(&self) -> Vec<String> {
         self.calls.borrow().clone()
@@ -169,10 +178,16 @@ impl RecordingInstaller {
     fn dirs(&self) -> Vec<std::path::PathBuf> {
         self.dirs.borrow().clone()
     }
-    /// Every `verify` call as `<bin>:<tag>`: the proof step ran against the right binary.
+    /// Every `verify` call as `verify:<full target path>:<bin>:<tag>`: the proof step ran
+    /// against the right package dir (the full path tells worktrees apart) and binary.
     fn verified(&self) -> Vec<String> {
         self.verified.borrow().clone()
     }
+}
+
+/// The `RecordingInstaller::verified` entry for a verify of `bin` at `tag` in `dir`.
+fn verified_entry(dir: &Path, bin: &str, tag: &str) -> String {
+    format!("verify:{}:{bin}:{tag}", dir.display())
 }
 
 impl Installer for RecordingInstaller {
@@ -182,8 +197,11 @@ impl Installer for RecordingInstaller {
         Ok(())
     }
 
-    fn verify(&self, bin: &str, tag: &str) -> Result<()> {
-        self.verified.borrow_mut().push(format!("{bin}:{tag}"));
+    fn verify(&self, dir: &Path, bin: &str, tag: &str) -> Result<()> {
+        self.verified.borrow_mut().push(verified_entry(dir, bin, tag));
+        if self.fail_next_verify.replace(false) {
+            bail!("install verification failed (simulated): `{bin} --version` printed a stale version");
+        }
         Ok(())
     }
 }
