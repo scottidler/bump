@@ -283,10 +283,16 @@ pub trait Pusher {
     fn push_feature_branch(&self, dir: &Path, branch: &str) -> Result<()>;
 }
 
-/// Runs the post-release install command. A port so tests assert the RESOLVED command
-/// without executing a real (slow, outward) `cargo install`.
+/// Runs the post-release install command, then proves the installed binary is the release.
+/// A port so tests assert the RESOLVED command and the verified (binary, tag) pair without
+/// executing a real (slow, outward) `cargo install`.
 pub trait Installer {
     fn install(&self, dir: &Path, command: &str) -> Result<()>;
+    /// `<bin> --version` must name `tag` exactly: the build-version contract puts the
+    /// bare `vX.Y.Z` in `BUILD_VERSION` only when HEAD is the tagged commit, so this
+    /// catches a stale binary earlier on PATH, a crate still on `CARGO_PKG_VERSION`
+    /// (`X.Y.Z`, no `v`), and a `vX.Y.Z-N-g<sha>` build past the tag.
+    fn verify(&self, bin: &str, tag: &str) -> Result<()>;
 }
 
 /// Production `Pusher`: real `git push origin <name>` by explicit name (never `--tags`,
@@ -317,8 +323,23 @@ struct Ports<'a, P: Pusher, I: Installer, R: Pr, C: Ci> {
 }
 
 /// Production `Installer`: run the repo-committed install command through the shell (same
-/// trust model as `.otto.yml`).
-pub struct ShellInstaller;
+/// trust model as `.otto.yml`), then prove the installed binary with `--version`.
+pub struct ShellInstaller {
+    /// Where `cargo install` writes: `$CARGO_INSTALL_ROOT`, else `$CARGO_HOME`, else
+    /// `~/.cargo`. `None` when none resolves; the binary is then looked up on PATH.
+    pub install_root: Option<std::path::PathBuf>,
+}
+
+impl Default for ShellInstaller {
+    fn default() -> Self {
+        Self {
+            install_root: std::env::var_os("CARGO_INSTALL_ROOT")
+                .or_else(|| std::env::var_os("CARGO_HOME"))
+                .map(std::path::PathBuf::from)
+                .or_else(|| dirs::home_dir().map(|home| home.join(".cargo"))),
+        }
+    }
+}
 
 impl Installer for ShellInstaller {
     fn install(&self, dir: &Path, command: &str) -> Result<()> {
@@ -333,6 +354,65 @@ impl Installer for ShellInstaller {
             bail!("install command failed: {command}");
         }
         Ok(())
+    }
+
+    fn verify(&self, bin: &str, tag: &str) -> Result<()> {
+        let path = installed_bin_path(self.install_root.as_deref(), bin);
+        debug!("ShellInstaller::verify: bin={} tag={}", path.display(), tag);
+        let output = Command::new(&path)
+            .arg("--version")
+            .output()
+            .with_context(|| format!("failed to run `{} --version`", path.display()))?;
+        let printed = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !output.status.success() {
+            bail!(
+                "install verification failed: `{} --version` exited {} ({printed})",
+                path.display(),
+                output.status
+            );
+        }
+        if version_matches(&printed, tag) {
+            println!("verify: {} --version -> {printed}", path.display());
+            return Ok(());
+        }
+        bail!(
+            "install verification failed: `{} --version` printed \"{printed}\", expected {tag}. {} \
+             The tag is pushed; only the install is unproven. Fix the build and re-run `bump finish` \
+             to reinstall.",
+            path.display(),
+            version_mismatch_hint(&printed, tag)
+        );
+    }
+}
+
+/// Where `cargo install` put `bin`: `<install_root>/bin/<bin>` when that file exists.
+/// Otherwise (a custom `install:` command that installs elsewhere) the bare name, so
+/// PATH resolves it.
+fn installed_bin_path(install_root: Option<&Path>, bin: &str) -> std::path::PathBuf {
+    match install_root {
+        Some(root) if root.join("bin").join(bin).is_file() => root.join("bin").join(bin),
+        _ => std::path::PathBuf::from(bin),
+    }
+}
+
+/// True when some whitespace-separated token of the `--version` output is exactly `tag`.
+/// Token equality, not substring: `v0.4.5-3-gabc1234` must not pass for `v0.4.5`.
+fn version_matches(printed: &str, tag: &str) -> bool {
+    printed.split_whitespace().any(|token| token == tag)
+}
+
+/// Name the cause of a `--version` mismatch when the output's shape gives it away.
+fn version_mismatch_hint(printed: &str, tag: &str) -> &'static str {
+    let bare = tag.strip_prefix('v').unwrap_or(tag);
+    if printed
+        .split_whitespace()
+        .any(|token| token.starts_with(tag) && token.contains("-g"))
+    {
+        "The binary was built past the tag (a `-N-g<sha>` build): HEAD is not the tagged commit."
+    } else if printed.split_whitespace().any(|token| token == bare) {
+        "The crate reports CARGO_PKG_VERSION (no `v`): its build.rs is not `build_version::emit()`."
+    } else {
+        "An older binary may sit earlier on PATH, or the install wrote somewhere else."
     }
 }
 
@@ -920,7 +1000,7 @@ fn execute_release<P: Pusher, I: Installer, R: Pr, C: Ci>(
         println!("[dry-run] git push --no-follow-tags origin {default}");
         println!("[dry-run] (confirm HEAD is on origin/{default} before tagging)");
         echo_tag_steps(target_tag, default, &ci_gate(opts.ci_gate, opts.ci_timeout), false);
-        echo_install(dir, &opts.install, &install_command);
+        echo_install(dir, &opts.install, &install_command, target_tag);
         return Ok(ReleaseReport {
             install_command,
             dry_run: true,
@@ -947,7 +1027,7 @@ fn execute_release<P: Pusher, I: Installer, R: Pr, C: Ci>(
     let gate = ci_gate(opts.ci_gate, opts.ci_timeout);
     gate_tag_and_push(dir, gate, &target, git::head_sha(dir)?, ports.pusher, ports.ci)?;
     println!("Released {target_tag} on {default}");
-    let install_command = run_install(dir, &opts.install, config, ports.installer)?;
+    let install_command = run_install(dir, &opts.install, config, target_tag, ports.installer)?;
     Ok(ReleaseReport {
         install_command,
         ..ReleaseReport::new(target_tag)
@@ -988,7 +1068,7 @@ fn execute_pending<P: Pusher, I: Installer, R: Pr, C: Ci>(
         }
         println!("[dry-run] (confirm HEAD is on origin/{default} before tagging)");
         echo_tag_steps(tag, default, &ci_gate(opts.ci_gate, opts.ci_timeout), local_tag_present);
-        echo_install(dir, &opts.install, &install_command);
+        echo_install(dir, &opts.install, &install_command, tag);
         return Ok(ReleaseReport {
             resumed: !ahead,
             install_command,
@@ -1014,7 +1094,7 @@ fn execute_pending<P: Pusher, I: Installer, R: Pr, C: Ci>(
     } else {
         println!("Resumed release: pushed {tag} on {default}");
     }
-    let install_command = run_install(dir, &opts.install, config, ports.installer)?;
+    let install_command = run_install(dir, &opts.install, config, tag, ports.installer)?;
     Ok(ReleaseReport {
         resumed: !ahead,
         install_command,
@@ -1228,12 +1308,13 @@ fn confirm_on_origin(dir: &Path, default: &str) -> Result<()> {
     }
 }
 
-/// Resolve the install command (precedence: explicit override > config > default-if-a-
-/// real-package > skip) WITHOUT running it. `None` = the install step is skipped. The
-/// default only fires for a Cargo manifest with its OWN `[package]` table -- a virtual
-/// workspace root (`[workspace]`, no `[package]`, e.g. `tatari-tv/marquee`) has no
-/// default, since `cargo install --path .` fails on it (after the tag is already
-/// pushed, if this ran unchecked).
+/// Resolve the install command (precedence: explicit override > config > default-if-an-
+/// installable-package > skip) WITHOUT running it. `None` = the install step is skipped.
+/// The default only fires for a Cargo manifest with its OWN `[package]` table AND a
+/// binary target. A virtual workspace root (`[workspace]`, no `[package]`, e.g.
+/// `tatari-tv/marquee`) and a library crate (`src/lib.rs` only, e.g. `tatari-tv/renew`)
+/// have no default: `cargo install --path .` fails on both, after the tag is already
+/// pushed, if this ran unchecked.
 pub(crate) fn resolve_install(dir: &Path, choice: &InstallChoice, config: &Config) -> Option<String> {
     debug!(
         "resolve_install: dir={} choice={:?} config.install={:?}",
@@ -1245,7 +1326,7 @@ pub(crate) fn resolve_install(dir: &Path, choice: &InstallChoice, config: &Confi
         InstallChoice::Command(cmd) => Some(cmd.clone()),
         InstallChoice::Skip => None,
         InstallChoice::Auto => config.install.clone().or_else(|| {
-            if lang::cargo::has_package_table(dir) {
+            if lang::cargo::has_package_table(dir) && lang::cargo::has_bin_target(dir) {
                 Some(DEFAULT_INSTALL_COMMAND.to_string())
             } else {
                 None
@@ -1255,31 +1336,44 @@ pub(crate) fn resolve_install(dir: &Path, choice: &InstallChoice, config: &Confi
 }
 
 /// Why the install step was skipped, for the `install: <reason>` line. Only the `Auto`
-/// case on a virtual workspace root (a tracked `[workspace]` `Cargo.toml` with no
-/// `[package]`) gets the specific reason; every other skip (`--no-install`, or no Cargo
-/// manifest at all) prints the plain "skipped".
+/// case on a Cargo manifest with nothing installable gets a specific reason: a virtual
+/// workspace root (a tracked `[workspace]` `Cargo.toml` with no `[package]`) or a
+/// library crate (`[package]`, no binary target). Every other skip (`--no-install`, or
+/// no Cargo manifest at all) prints the plain "skipped".
 fn install_skip_reason(dir: &Path, choice: &InstallChoice) -> &'static str {
-    if matches!(choice, InstallChoice::Auto)
-        && lang::cargo::cargo_toml_exists(dir)
-        && !lang::cargo::has_package_table(dir)
-    {
+    if !matches!(choice, InstallChoice::Auto) || !lang::cargo::cargo_toml_exists(dir) {
+        "skipped"
+    } else if !lang::cargo::has_package_table(dir) {
         "skipped (virtual workspace root; pass --install or set install: in bump.yml)"
+    } else if !lang::cargo::has_bin_target(dir) {
+        "skipped (library crate, no binary target; pass --install or set install: in bump.yml)"
     } else {
         "skipped"
     }
 }
 
-/// Resolve and run the install step; return the command that ran (`None` = skipped).
+/// The `verify: skipped` reason when the manifest names no single binary to check.
+const VERIFY_SKIPPED: &str = "skipped (no binary name in Cargo.toml)";
+
+/// Resolve and run the install step, then verify the installed binary reports `tag`;
+/// return the command that ran (`None` = skipped). A manifest with no single binary name
+/// (custom `install:` on a workspace root, a non-Cargo repo) installs unverified and says
+/// so.
 fn run_install<I: Installer>(
     dir: &Path,
     choice: &InstallChoice,
     config: &Config,
+    tag: &str,
     installer: &I,
 ) -> Result<Option<String>> {
     match resolve_install(dir, choice, config) {
         Some(cmd) => {
             println!("install: {cmd}");
             installer.install(dir, &cmd)?;
+            match lang::cargo::install_bin_name(dir) {
+                Some(bin) => installer.verify(&bin, tag)?,
+                None => println!("verify: {VERIFY_SKIPPED}"),
+            }
             Ok(Some(cmd))
         }
         None => {
@@ -1289,10 +1383,16 @@ fn run_install<I: Installer>(
     }
 }
 
-/// Echo the install step for `-n` dry-run.
-fn echo_install(dir: &Path, choice: &InstallChoice, install_command: &Option<String>) {
+/// Echo the install and verify steps for `-n` dry-run.
+fn echo_install(dir: &Path, choice: &InstallChoice, install_command: &Option<String>, tag: &str) {
     match install_command {
-        Some(cmd) => println!("[dry-run] install: {cmd}"),
+        Some(cmd) => {
+            println!("[dry-run] install: {cmd}");
+            match lang::cargo::install_bin_name(dir) {
+                Some(bin) => println!("[dry-run] verify: {bin} --version == {tag}"),
+                None => println!("[dry-run] verify: {VERIFY_SKIPPED}"),
+            }
+        }
         None => println!("[dry-run] install: {}", install_skip_reason(dir, choice)),
     }
 }

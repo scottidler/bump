@@ -919,7 +919,7 @@ fn dispatch_release(dir: &Path, args: &cli::ReleaseArgs) -> Result<()> {
         dir,
         &opts,
         &release::GitPusher,
-        &release::ShellInstaller,
+        &release::ShellInstaller::default(),
         &release::GhPr,
         &release::GhCi,
     ) {
@@ -938,7 +938,7 @@ fn dispatch_finish(dir: &Path, args: &cli::FinishArgs) -> Result<()> {
         dir,
         &opts,
         &release::GitPusher,
-        &release::ShellInstaller,
+        &release::ShellInstaller::default(),
         &release::GhCi,
     ) {
         eprintln!("Error: {:#}", e);

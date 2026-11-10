@@ -36,6 +36,8 @@ fn ungated_release_pushes_branch_then_tag_in_order() {
     assert_eq!(read_cargo_version(dir), "0.1.6");
     assert_eq!(report.install_command.as_deref(), Some("cargo install --path ."));
     assert_eq!(installer.calls(), vec!["cargo install --path .".to_string()]);
+    // The installed binary was checked against the tag just pushed, by its package name.
+    assert_eq!(installer.verified(), vec!["test-pkg:v0.1.6".to_string()]);
     drop(origin);
 }
 
@@ -47,12 +49,23 @@ fn ungated_release_with_real_pusher_and_installer() {
     let (origin, work) = setup_with_pending_commit("0.1.5");
     let dir = work.path();
 
+    // The install command writes a fake `test-pkg` into a private install root that
+    // answers `--version` with the tag about to be cut, so the real verify step passes.
+    let root = TempDir::new().unwrap();
+    let install_cmd = format!(
+        "mkdir -p {root}/bin && printf '#!/bin/sh\\necho test-pkg v0.1.6\\n' > {root}/bin/test-pkg \
+         && chmod +x {root}/bin/test-pkg && touch install-marker",
+        root = root.path().display()
+    );
     let opts = ReleaseOpts {
-        install: InstallChoice::Command("touch install-marker".to_string()),
+        install: InstallChoice::Command(install_cmd),
         ..auto_opts(None, false)
     };
+    let installer = ShellInstaller {
+        install_root: Some(root.path().to_path_buf()),
+    };
     let prev = set_probe("ungated");
-    let report = release(dir, &opts, &GitPusher, &ShellInstaller, &GhPr, &GhCi);
+    let report = release(dir, &opts, &GitPusher, &installer, &GhPr, &GhCi);
     restore_probe(prev);
 
     let report = report.expect("real-pusher release must succeed");

@@ -152,6 +152,7 @@ fn no_pr() -> RecordingPr {
 struct RecordingInstaller {
     calls: RefCell<Vec<String>>,
     dirs: RefCell<Vec<std::path::PathBuf>>,
+    verified: RefCell<Vec<String>>,
 }
 
 impl RecordingInstaller {
@@ -159,6 +160,7 @@ impl RecordingInstaller {
         Self {
             calls: RefCell::new(Vec::new()),
             dirs: RefCell::new(Vec::new()),
+            verified: RefCell::new(Vec::new()),
         }
     }
     fn calls(&self) -> Vec<String> {
@@ -167,12 +169,21 @@ impl RecordingInstaller {
     fn dirs(&self) -> Vec<std::path::PathBuf> {
         self.dirs.borrow().clone()
     }
+    /// Every `verify` call as `<bin>:<tag>`: the proof step ran against the right binary.
+    fn verified(&self) -> Vec<String> {
+        self.verified.borrow().clone()
+    }
 }
 
 impl Installer for RecordingInstaller {
     fn install(&self, dir: &Path, command: &str) -> Result<()> {
         self.calls.borrow_mut().push(command.to_string());
         self.dirs.borrow_mut().push(dir.to_path_buf());
+        Ok(())
+    }
+
+    fn verify(&self, bin: &str, tag: &str) -> Result<()> {
+        self.verified.borrow_mut().push(format!("{bin}:{tag}"));
         Ok(())
     }
 }
@@ -376,12 +387,16 @@ fn git_ok(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
+/// A binary crate at `version`: `[package]` plus `src/main.rs`, so the default install
+/// (`cargo install --path .`) and its `--version` verification both apply.
 fn write_cargo(dir: &Path, version: &str) {
     fs::write(
         dir.join("Cargo.toml"),
         format!("[package]\nname = \"test-pkg\"\nversion = \"{version}\"\n"),
     )
     .unwrap();
+    fs::create_dir_all(dir.join("src")).unwrap();
+    fs::write(dir.join("src/main.rs"), "fn main() {}\n").unwrap();
 }
 
 fn read_cargo_version(dir: &Path) -> String {

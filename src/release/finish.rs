@@ -157,7 +157,7 @@ pub fn finish<P: Pusher, I: Installer, C: Ci>(
             } else {
                 println!("released {tag} on {default}");
             }
-            let install_command = run_install(work, &opts.install, &config, installer)?;
+            let install_command = run_install(work, &opts.install, &config, &tag, installer)?;
             Ok(ReleaseReport {
                 resumed,
                 install_command,
@@ -173,7 +173,7 @@ pub fn finish<P: Pusher, I: Installer, C: Ci>(
         TagState::RemoteAtHead | TagState::RemoteAtOther(_) => match git::remote_tag_commit(work, &tag)? {
             Some(commit) if commit == check.head => {
                 println!("already released {tag}");
-                let install_command = run_install(work, &opts.install, &config, installer)?;
+                let install_command = run_install(work, &opts.install, &config, &tag, installer)?;
                 Ok(ReleaseReport {
                     install_command,
                     ..ReleaseReport::new(&tag)
@@ -292,7 +292,7 @@ fn finish_dry_run(
     println!("[dry-run] (tag-only ladder: require HEAD == origin/{default} before tagging)");
     println!("[dry-run] (only if the merged version is untagged; already released runs only the install:)");
     echo_tag_steps(&tag, default, &ci_gate(opts.ci_gate, opts.ci_timeout), false);
-    echo_install(dir, &opts.install, &install_command);
+    echo_install(dir, &opts.install, &install_command, &tag);
     Ok(ReleaseReport {
         install_command,
         dry_run: true,

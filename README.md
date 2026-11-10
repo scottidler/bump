@@ -78,11 +78,23 @@ already knows the repo's CI story, not for an agent to get unstuck.
 
 `--install <cmd>` / `--no-install` control the post-release install step (precedence:
 flag override > repo-root `bump.yml`'s `install:` key > `cargo install --path .` iff the
-root `Cargo.toml` declares its own `[package]` table > skip). A virtual workspace root
-(`[workspace]` with no `[package]`, e.g. a Cargo workspace with no root crate) has no
-default install and prints `install: skipped (virtual workspace root; pass --install or
-set install: in bump.yml)`. `-n` previews every command the verb would run and executes
-nothing.
+root `Cargo.toml` declares its own `[package]` table AND a binary target > skip). A
+virtual workspace root (`[workspace]` with no `[package]`) and a library crate
+(`src/lib.rs` only) have no default install, since `cargo install --path .` fails on
+both; each prints its own `install: skipped (...; pass --install or set install: in
+bump.yml)` reason.
+
+After the install, bump proves it: the binary named by the root `Cargo.toml` (the first
+`[[bin]]`, else the package name when `src/main.rs` exists) is run from the cargo install
+root (`$CARGO_INSTALL_ROOT`, `$CARGO_HOME`, `~/.cargo`), else from PATH, and
+`<bin> --version` must contain the tag as a whole token (`bump v0.4.6`). That is the
+`build-version` contract: `BUILD_VERSION` is the bare `vX.Y.Z` only on the tagged commit.
+A `vX.Y.Z-N-g<sha>` (built past the tag), a bare `X.Y.Z` (still on `CARGO_PKG_VERSION`),
+or an older version (a stale copy earlier on PATH) fails the verb with the shape named;
+the tag is already pushed, so the fix is to repair the build and re-run `bump finish`,
+whose already-released row re-runs the install. A manifest with no single binary name
+prints `verify: skipped (no binary name in Cargo.toml)`. `-n` previews every command the
+verb would run, the verify included, and executes nothing.
 
 `gh` calls are authed per-org: a token file, then `GITHUB_PAT_<ORG>`, then
 `GITHUB_PAT_WORK` for `tatari-tv` / `GITHUB_PAT_HOME` otherwise, else ambient `gh auth` --

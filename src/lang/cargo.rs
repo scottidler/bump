@@ -218,6 +218,57 @@ pub fn has_package_table(dir: &Path) -> bool {
     doc.get("package").is_some()
 }
 
+/// Parse the root `Cargo.toml` when it exists and parses; `None` otherwise.
+fn root_manifest(dir: &Path) -> Option<DocumentMut> {
+    let content = fs::read_to_string(dir.join("Cargo.toml")).ok()?;
+    content.parse::<DocumentMut>().ok()
+}
+
+/// True when the root crate builds at least one binary: a `[[bin]]` entry, a
+/// `src/main.rs`, or a populated `src/bin/`. A library crate (`src/lib.rs` only, e.g.
+/// `tatari-tv/renew`) is false: `cargo install --path .` fails on it with
+/// `no packages found with binaries`, after the tag is already pushed.
+pub fn has_bin_target(dir: &Path) -> bool {
+    let Some(doc) = root_manifest(dir) else {
+        return false;
+    };
+    if doc.get("package").is_none() {
+        return false;
+    }
+    if doc
+        .get("bin")
+        .and_then(Item::as_array_of_tables)
+        .is_some_and(|bins| !bins.is_empty())
+    {
+        return true;
+    }
+    if dir.join("src/main.rs").is_file() {
+        return true;
+    }
+    fs::read_dir(dir.join("src/bin")).is_ok_and(|mut entries| entries.next().is_some())
+}
+
+/// The binary the default install produces, for the post-install `--version` check: the
+/// first `[[bin]]`'s `name` (falling back to the package name, as cargo does), else the
+/// package name when `src/main.rs` exists. `None` for a library crate, a crate whose
+/// only binaries live under `src/bin/` (several names, none canonical), a virtual
+/// workspace root, or no manifest.
+pub fn install_bin_name(dir: &Path) -> Option<String> {
+    let doc = root_manifest(dir)?;
+    let package_name = doc.get("package")?.get("name")?.as_str()?.to_string();
+    if let Some(bins) = doc.get("bin").and_then(Item::as_array_of_tables)
+        && let Some(first) = bins.iter().next()
+    {
+        return Some(
+            first
+                .get("name")
+                .and_then(Item::as_str)
+                .map_or(package_name, str::to_string),
+        );
+    }
+    dir.join("src/main.rs").is_file().then_some(package_name)
+}
+
 /// Represents a workspace member with an independent version
 #[derive(Debug)]
 pub struct IndependentVersionMember {
@@ -471,6 +522,89 @@ name = "test"
         let dir = TempDir::new().unwrap();
         create_cargo_toml(dir.path(), "[workspace]\nmembers = [\"crates/a\"]\nresolver = \"2\"\n");
         assert!(!has_package_table(dir.path()));
+    }
+
+    #[test]
+    fn test_has_bin_target_via_main_rs() {
+        let dir = TempDir::new().unwrap();
+        create_cargo_toml(dir.path(), "[package]\nname = \"tool\"\nversion = \"0.1.0\"\n");
+        assert!(!has_bin_target(dir.path()), "no sources yet");
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/lib.rs"), "").unwrap();
+        assert!(!has_bin_target(dir.path()), "library crate");
+        fs::write(dir.path().join("src/main.rs"), "fn main() {}").unwrap();
+        assert!(has_bin_target(dir.path()));
+    }
+
+    #[test]
+    fn test_has_bin_target_via_bin_table_and_src_bin() {
+        let dir = TempDir::new().unwrap();
+        create_cargo_toml(
+            dir.path(),
+            "[package]\nname = \"tool\"\nversion = \"0.1.0\"\n\n[[bin]]\nname = \"t\"\npath = \"src/t.rs\"\n",
+        );
+        assert!(has_bin_target(dir.path()), "[[bin]] declared");
+
+        let dir = TempDir::new().unwrap();
+        create_cargo_toml(dir.path(), "[package]\nname = \"tool\"\nversion = \"0.1.0\"\n");
+        fs::create_dir_all(dir.path().join("src/bin")).unwrap();
+        assert!(!has_bin_target(dir.path()), "empty src/bin");
+        fs::write(dir.path().join("src/bin/a.rs"), "fn main() {}").unwrap();
+        assert!(has_bin_target(dir.path()), "populated src/bin");
+    }
+
+    #[test]
+    fn test_has_bin_target_false_on_virtual_workspace_root() {
+        let dir = TempDir::new().unwrap();
+        create_cargo_toml(dir.path(), "[workspace]\nmembers = [\"crates/a\"]\n");
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/main.rs"), "fn main() {}").unwrap();
+        assert!(!has_bin_target(dir.path()));
+    }
+
+    #[test]
+    fn test_install_bin_name_prefers_bin_table_then_package_name() {
+        let dir = TempDir::new().unwrap();
+        create_cargo_toml(
+            dir.path(),
+            "[package]\nname = \"tool-rs\"\nversion = \"0.1.0\"\n\n[[bin]]\nname = \"tool\"\npath = \"src/main.rs\"\n",
+        );
+        assert_eq!(install_bin_name(dir.path()).as_deref(), Some("tool"));
+
+        let dir = TempDir::new().unwrap();
+        create_cargo_toml(
+            dir.path(),
+            "[package]\nname = \"tool-rs\"\nversion = \"0.1.0\"\n\n[[bin]]\npath = \"src/main.rs\"\n",
+        );
+        assert_eq!(
+            install_bin_name(dir.path()).as_deref(),
+            Some("tool-rs"),
+            "[[bin]] without a name takes the package name"
+        );
+
+        let dir = TempDir::new().unwrap();
+        create_cargo_toml(dir.path(), "[package]\nname = \"tool-rs\"\nversion = \"0.1.0\"\n");
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/main.rs"), "fn main() {}").unwrap();
+        assert_eq!(install_bin_name(dir.path()).as_deref(), Some("tool-rs"));
+    }
+
+    #[test]
+    fn test_install_bin_name_none_for_library_src_bin_only_and_workspace_root() {
+        let dir = TempDir::new().unwrap();
+        create_cargo_toml(dir.path(), "[package]\nname = \"lib\"\nversion = \"0.1.0\"\n");
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/lib.rs"), "").unwrap();
+        assert_eq!(install_bin_name(dir.path()), None, "library crate");
+
+        fs::create_dir_all(dir.path().join("src/bin")).unwrap();
+        fs::write(dir.path().join("src/bin/a.rs"), "fn main() {}").unwrap();
+        assert_eq!(install_bin_name(dir.path()), None, "src/bin only: no canonical name");
+
+        let dir = TempDir::new().unwrap();
+        create_cargo_toml(dir.path(), "[workspace]\nmembers = [\"crates/a\"]\n");
+        assert_eq!(install_bin_name(dir.path()), None);
+        assert_eq!(install_bin_name(TempDir::new().unwrap().path()), None, "no manifest");
     }
 
     #[test]
