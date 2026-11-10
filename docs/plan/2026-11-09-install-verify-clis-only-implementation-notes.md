@@ -77,3 +77,22 @@ Source: review panel round 2, `~/.cache/review-panel/runs/0QlPmZSK/synthesis.md`
 
 ### Open questions
 - None.
+
+## Phase 4: Companion prose in scottidler/claude
+Commit b57a463c89dbcc6758da8f4beeb427c436c975de in `scottidler/claude` (not pushed).
+
+### Design decisions
+- Staged only this phase's hunks of the two files another session had already edited (`HOME/.claude/skills/plan/agents/release-driver.md`, `HOME/.claude/skills/plan/skills/release/SKILL.md`) by writing HEAD plus my transform as the index blob (`git update-index --cacheinfo`). The foreign hunks stay uncommitted in the working tree. No file was left wholly unstaged.
+- Step 6 wait bullet keeps the doc's code block verbatim; the surrounding prose was rewritten because the old `tee`-vs-`grep -q` explanation no longer applies.
+- The `GIT_DESCRIBE` sentence in the plan release skill became the build-version paragraph copied from `skills/bump/SKILL.md`, which now also carries the install-skip sentence (three reasons, services never installed by default, `--install` or `bump.yml` `install:` overrides).
+
+### Deviations
+- The `ls-remote` line gained a short "(exit 0 means the tag is there)" gloss beyond the bare command. Same effect.
+- `HOME/.claude/agents/release-driver.md` and `skills/bump/SKILL.md` are inside the claude repo's `PLAN_OLD` rollback-baseline set (`.otto.yml` lint). The doc requires editing them, so `otto ci` lint stays red; see open questions.
+
+### Tradeoffs
+- Index-blob staging vs `git add -p`: the blob route is deterministic and leaves foreign hunks intact; `-p` on interleaved hunks risks mis-staging.
+
+### Open questions
+- `otto ci` in the claude repo fails its `lint` task: "The old pipeline files moved off the rollback baseline 62dc65f; fix plan/ instead", covering `agents/release-driver.md` and `skills/bump/SKILL.md`. This predates Phase 4 (HEAD already differs from the baseline by 21 lines in those two files, from commit da11994) and my edit adds to the drift. The `test` task passed. Should the baseline check exempt these two files, or is the old-pipeline soak over?
+- Another session has uncommitted edits in the claude repo (including both plan files' other hunks); they remain untouched.

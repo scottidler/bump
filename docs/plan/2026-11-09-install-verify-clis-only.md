@@ -2,7 +2,7 @@
 
 **Author:** Scott Idler
 **Date:** 2026-11-09
-**Status:** Draft
+**Status:** Implemented
 **Review Passes Completed:** 4/5 (panel round 1 folded in; see Resolved Decisions)
 
 ## Summary
