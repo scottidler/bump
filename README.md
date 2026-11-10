@@ -78,23 +78,35 @@ already knows the repo's CI story, not for an agent to get unstuck.
 
 `--install <cmd>` / `--no-install` control the post-release install step (precedence:
 flag override > repo-root `bump.yml`'s `install:` key > `cargo install --path .` iff the
-root `Cargo.toml` declares its own `[package]` table AND a binary target > skip). A
-virtual workspace root (`[workspace]` with no `[package]`) and a library crate
-(`src/lib.rs` only) have no default install, since `cargo install --path .` fails on
-both; each prints its own `install: skipped (...; pass --install or set install: in
-bump.yml)` reason.
+root `Cargo.toml` declares its own `[package]` table, a binary target AND a `clap`
+dependency > skip). The default installs CLIs only: three cases print their own
+`install: skipped (...; pass --install or set install: in bump.yml)` reason, checked in
+this order: a virtual workspace root (`[workspace]` with no `[package]`), a library crate
+(no binary target), and a package with no `clap` dependency (a web server, not a CLI).
+An explicit `--install` or `bump.yml` `install:` is the owner's call and always runs.
 
-After the install, bump proves it: the binary named by the root `Cargo.toml` (the first
-`[[bin]]`, else the package name when `src/main.rs` exists) is run from the cargo install
-root (`$CARGO_INSTALL_ROOT`, `$CARGO_HOME`, `~/.cargo`), else from PATH, and
-`<bin> --version` must contain the tag as a whole token (`bump v0.4.6`). That is the
-`build-version` contract: `BUILD_VERSION` is the bare `vX.Y.Z` only on the tagged commit.
-A `vX.Y.Z-N-g<sha>` (built past the tag), a bare `X.Y.Z` (still on `CARGO_PKG_VERSION`),
-or an older version (a stale copy earlier on PATH) fails the verb with the shape named;
-the tag is already pushed, so the fix is to repair the build and re-run `bump finish`,
-whose already-released row re-runs the install. A manifest with no single binary name
-prints `verify: skipped (no binary name in Cargo.toml)`. `-n` previews every command the
-verb would run, the verify included, and executes nothing.
+After a `cargo install` of this repo, bump proves it. The verify target is the directory
+that command installs from: `--path <dir>` or `--path=<dir>`, else the repo root. The
+command is split with shell quoting, so a quoted value (`--features "a b"`, `--path
+"my cli"`) stays one word, and `cargo +<toolchain> install` counts as `cargo install`. The
+binary named by that directory's `Cargo.toml` (the first `[[bin]]`, else the package name
+when `src/main.rs` exists) is run from the cargo install root (`$CARGO_INSTALL_ROOT`,
+`$CARGO_HOME`, `~/.cargo`), else from PATH, and `<bin> --version` must contain the tag as
+a whole token (`bump v0.4.6`). The process gets 10 seconds, then it is killed and verify
+fails. That is the `build-version` contract: `BUILD_VERSION` is the bare `vX.Y.Z` on the
+tagged commit, and also outside CI or when no tag is reachable. A `vX.Y.Z-N-g<sha>`
+(built past the tag), a bare `X.Y.Z` (still on `CARGO_PKG_VERSION`), or an older version
+(a stale copy earlier on PATH) fails the verb. The error says which path ran, names a
+shape only when the output proves it, and ends by saying the tag is pushed and stands: a
+source fix is a new `bump release`; to only reinstall, re-run `bump finish` (repeat any
+`--install` override), whose already-released row re-runs the install.
+
+Verify prints `verify: skipped (<reason>)` instead when, checked in this order: the
+install command is not `cargo install` (`make install`, a script); the install command
+does not install this repo (a positional crate name, `--git`, `--registry`); there is no
+binary name in `<dir>/Cargo.toml`; or there is no clap dependency in `<dir>/Cargo.toml`.
+`-n` previews every command the verb would run, the verify included, and executes
+nothing.
 
 `gh` calls are authed per-org: a token file, then `GITHUB_PAT_<ORG>`, then
 `GITHUB_PAT_WORK` for `tatari-tv` / `GITHUB_PAT_HOME` otherwise, else ambient `gh auth` --

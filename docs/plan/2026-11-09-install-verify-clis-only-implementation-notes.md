@@ -41,3 +41,39 @@
 
 ### Open questions
 - None.
+
+## Phase 3: Docs in the bump repo
+### Design decisions
+- The README install paragraph describes the code as built: the three install skip reasons in `install_skip_reason` order, the verify target rule (`--path <dir>` / `--path=<dir>`, else the repo root), the 10s kill, the fact line and closing re-run advice (source fix is a new `bump release`; reinstall only is `bump finish`) - `README.md` - read off `src/release.rs` rather than the doc's sketch.
+- The README names no line numbers, counts or version pins beyond the existing `bump v0.4.6` example output - `README.md` - durable-doc rule.
+- `Installer::verify` doc comment now says the bare tag comes on the tagged commit and also outside CI or with no tag reachable (cases-table rows 1, 4, 8) - `src/release.rs:Installer::verify`.
+- The design doc is committed unchanged with Status left Draft - Phase 4 and finalization are pending.
+
+### Deviations
+- The README documents FOUR verify skip reasons, not the Phase 3 bullet's "three" - the bullet predates the Data Model's fourth reason (no clap dependency in `<dir>/Cargo.toml`), and Phase 2 shipped all four.
+
+### Tradeoffs
+- Folded the old "no binary name" sentence into the full ordered skip-reason list vs. keeping it as a separate sentence - one list, one order, matches `verify_target`.
+
+### Open questions
+- None.
+
+## Implementation audit fold-in
+Source: review panel round 2, `~/.cache/review-panel/runs/0QlPmZSK/synthesis.md` (# Round 2, cheap-wins 1 and 2) and `probes.md` beside it. Each fix is folded into the commit that owns the code: finding 1 into Phase 2, finding 2 into Phase 1, the doc/README/notes edits into Phase 3.
+
+### Design decisions
+- Finding 1 (cheap-win 1, probes 10-12): `cargo_install_target` split on whitespace and required word 2 == `install`, so three commands v0.4.6 verified now skipped verify with a false reason. Evidence, probes 10-12 on sdv with the 9f37c13 build: `--install 'cargo install --path . --config "build.jobs = 2"'` and `'cargo install --path . --features "a b"'` printed `verify: skipped (install command does not install this repo)`; `'cargo +nightly install --path .'` printed `verify: skipped (install command is not cargo install)`. v0.4.6 printed `verify: sdv --version == v0.5.11` for all three. Fix: a quote-aware `split_command_words` (single quotes literal, double quotes group with `\"`/`\\` escapes, backslash outside quotes escapes one char, quoted pieces join the word they touch) and an optional `+<toolchain>` word after `cargo` - `src/lang/cargo.rs:split_command_words`, `cargo_install_target` - no new crate, per the doc's Dependencies section.
+- Tests for finding 1: `test_cargo_install_target_quotes_and_toolchain` asserts all three commands resolve to `InstallTarget::Dir("/repo")`, a quoted `--path "my cli"` and `--path='my cli'` resolve to `/repo/my cli`, and `cargo +nightly ripgrep` stays `NotCargoInstall`; `test_split_command_words_honors_quotes` covers the tokenizer's quoting, escapes, an empty quoted word and an unterminated quote - `src/lang/cargo.rs`.
+- Finding 2 (cheap-win 2): the Phase 1 bullet "skips with the clap reason and prints it" was only half met; `resolve_install_auto_skips_on_service_without_clap` asserted the `install_skip_reason` string, and nothing asserted the printed line or the absence of a verify line. Fix: `release_dry_run_on_a_service_prints_the_clap_skip_and_no_verify` runs the compiled `bump release -n --no-ci-gate` on a valet-shaped fixture (`[package]`, `src/main.rs`, `axum`, no clap) and asserts the `[dry-run] install:`/`[dry-run] verify:` lines are exactly the one clap skip line - `tests/release_cli.rs` - real binary, real stdout, the same pattern as the file's existing dry-run test.
+
+### Deviations
+- The doc's Non-Goals bullet no longer parks a quoted `--path "dir"`: the splitter makes it resolve like an unquoted one. `--root` and `--bin` stay parked.
+- An unterminated quote runs to the end of the command instead of producing a separate "could not parse" verify reason (the synthesis offered one) - `sh -c` rejects that line in `ShellInstaller::install` before verify runs, so only a dry run can show its verify line.
+- The Phase 3 commit body says the design doc is "committed unchanged"; that commit now also carries this Non-Goals edit. The commit bodies stay as written, per the fold-in instruction.
+
+### Tradeoffs
+- A hand-written splitter vs. a `shlex` dependency - the doc says no new crates, and the install line needs only quotes and backslashes; `$var`, globs and `$(...)` are not expanded (an install line using them is not a plain `cargo install` of a path bump can resolve).
+- The service-print assertion lives in a CLI integration test rather than capturing `println!` in a unit test - the unit tests have no stdout seam, and the compiled binary's stdout is what the Phase 1 success criterion measures.
+
+### Open questions
+- None.

@@ -289,10 +289,11 @@ pub trait Pusher {
 pub trait Installer {
     fn install(&self, dir: &Path, command: &str) -> Result<()>;
     /// `<bin> --version` must name `tag` exactly: the build-version contract puts the
-    /// bare `vX.Y.Z` in `BUILD_VERSION` only when HEAD is the tagged commit, so this
-    /// catches a stale binary earlier on PATH, a crate still on `CARGO_PKG_VERSION`
-    /// (`X.Y.Z`, no `v`), and a `vX.Y.Z-N-g<sha>` build past the tag. `dir` is where the
-    /// binary's manifest lives (the install target, e.g. `<repo>/clyde`).
+    /// bare `vX.Y.Z` in `BUILD_VERSION` on the tagged commit, and also outside CI or when
+    /// no tag is reachable (its cases-table rows 1, 4 and 8), so this catches a stale
+    /// binary earlier on PATH, a crate still on `CARGO_PKG_VERSION` (`X.Y.Z`, no `v`), and
+    /// a `vX.Y.Z-N-g<sha>` build past the tag. `dir` is where the binary's manifest lives
+    /// (the install target, e.g. `<repo>/clyde`).
     fn verify(&self, dir: &Path, bin: &str, tag: &str) -> Result<()>;
 }
 
