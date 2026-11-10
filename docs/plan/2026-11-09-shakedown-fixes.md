@@ -2,7 +2,7 @@
 
 **Author:** Scott Idler
 **Date:** 2026-11-09
-**Status:** Draft
+**Status:** Implemented (Phases 1-12; Phase 13 lands in scottidler/claude after the release)
 **Review Passes Completed:** 2/5 (draft, correctness; Scott's bug 1 ruling and panel round 1 folded in)
 
 ## Summary
