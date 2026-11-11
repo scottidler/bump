@@ -80,7 +80,7 @@ source = "git+https://github.com/tatari-tv/build-version-rs?tag=v0.1.0#06411938a
 
 [[package]]
 name = "bump"
-version = "0.4.8"
+version = "0.4.9"
 dependencies = [
  "build-version",
  "clap",
