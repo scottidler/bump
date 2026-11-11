@@ -223,3 +223,50 @@ fn gated_release_never_spawns_gh_pr_create() {
         .unwrap();
     assert!(pushed.status.success(), "the feature branch was pushed to origin");
 }
+
+fn release_dry_run(work: &Path) -> String {
+    let output = Command::new(env!("CARGO_BIN_EXE_bump"))
+        .args(["release", "-n"])
+        .current_dir(work)
+        .env("BUMP_GATES_PROBE", "ungated")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        output.status.success(),
+        "bump release -n must succeed; stdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    stdout
+}
+
+/// A committed `ci: none` makes the real gate skip, so the preview must say so instead
+/// of promising a CI wait the run never does.
+#[test]
+fn release_dry_run_under_committed_ci_none_previews_the_skip() {
+    let origin = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    fs::write(work.path().join("bump.yml"), "ci: none\n").unwrap();
+    setup_ungated_repo(origin.path(), work.path());
+
+    let stdout = release_dry_run(work.path());
+    assert!(
+        stdout.contains("[dry-run] CI gate: skipped, bump.yml at") && stdout.contains("declares `ci: none`"),
+        "the preview must name the ci: none skip; stdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains("wait for green CI"),
+        "ci: none never waits, so the preview must not either; stdout: {stdout}"
+    );
+}
+
+/// Without the declaration the preview still promises the wait.
+#[test]
+fn release_dry_run_without_ci_none_previews_the_wait() {
+    let origin = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    setup_ungated_repo(origin.path(), work.path());
+
+    let stdout = release_dry_run(work.path());
+    assert!(stdout.contains("[dry-run] wait for green CI"), "stdout: {stdout}");
+}

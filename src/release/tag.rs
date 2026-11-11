@@ -3,6 +3,7 @@
 
 use super::Pusher;
 use super::ci::{CI_POLL_INTERVAL, Ci, CiGate, wait_for_green};
+use crate::config::{self, CiDeclaration};
 use crate::git;
 use crate::lang::{self, ProjectType};
 use crate::version;
@@ -158,6 +159,17 @@ impl CiPreview {
     /// version commit does not exist yet, or the caller did not read it).
     pub(super) fn from_gate(gate: CiGate) -> Self {
         if gate.enabled { CiPreview::Wait(gate) } else { CiPreview::SkippedByFlag }
+    }
+
+    /// The preview for `gate` on `sha`, reading the `bump.yml` committed there exactly as
+    /// `wait_for_green` will. A fresh release passes HEAD: the version commit it will
+    /// create touches only the manifests, so it carries HEAD's `bump.yml`.
+    pub(super) fn at_sha(dir: &Path, sha: &str, gate: CiGate) -> Result<Self> {
+        if gate.enabled && config::load_at(dir, sha)?.ci == Some(CiDeclaration::None) {
+            Ok(CiPreview::DeclaredNone(sha.to_string()))
+        } else {
+            Ok(CiPreview::from_gate(gate))
+        }
     }
 }
 

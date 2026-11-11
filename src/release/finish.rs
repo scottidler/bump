@@ -5,7 +5,7 @@ use super::tag::{CiPreview, TagTarget, echo_tag_steps, gate_tag_and_push};
 use super::{
     FinishOpts, Installer, Pusher, ReleaseReport, check_install_not_empty, echo_install, resolve_install, run_install,
 };
-use crate::config::{self, CONFIG_FILE_NAME, CiDeclaration, Config};
+use crate::config::{self, CONFIG_FILE_NAME, Config};
 use crate::git::{self, HeadRemote};
 use crate::lang;
 use crate::version;
@@ -376,11 +376,7 @@ fn finish_dry_run(dir: &Path, place: &FinishDir, opts: &FinishOpts, default: &st
     check_install_not_empty(&opts.install, &config)?;
     let install_command = resolve_install(dir, &opts.install, &config);
     let gate = ci_gate(opts.ci_gate, opts.ci_timeout);
-    let ci = if gate.enabled && config::load_at(dir, &tip)?.ci == Some(CiDeclaration::None) {
-        CiPreview::DeclaredNone(tip.clone())
-    } else {
-        CiPreview::from_gate(gate)
-    };
+    let ci = CiPreview::at_sha(dir, &tip, gate)?;
     match merged {
         MergedTip::Released => match install_command {
             Some(_) => println!("[dry-run] already released {tag}; would run: install, verify"),

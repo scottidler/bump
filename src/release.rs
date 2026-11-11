@@ -1207,7 +1207,7 @@ fn execute_release<P: Pusher, I: Installer, R: Pr, C: Ci>(
         echo_tag_steps(
             target_tag,
             default,
-            &CiPreview::from_gate(ci_gate(opts.ci_gate, opts.ci_timeout)),
+            &CiPreview::at_sha(dir, &git::head_sha(dir)?, ci_gate(opts.ci_gate, opts.ci_timeout))?,
             false,
         );
         echo_install(dir, &opts.install, &install_command, target_tag);
@@ -1280,7 +1280,7 @@ fn execute_pending<P: Pusher, I: Installer, R: Pr, C: Ci>(
         echo_tag_steps(
             tag,
             default,
-            &CiPreview::from_gate(ci_gate(opts.ci_gate, opts.ci_timeout)),
+            &CiPreview::at_sha(dir, &git::head_sha(dir)?, ci_gate(opts.ci_gate, opts.ci_timeout))?,
             local_tag_present,
         );
         echo_install(dir, &opts.install, &install_command, tag);
