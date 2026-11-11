@@ -1,0 +1,12 @@
+# The only global git config the test suite sees (wired in .cargo/config.toml).
+# init.defaultBranch is deliberately NOT main: a fixture that relies on the host's
+# default branch fails here on every machine, not only on a host set to master.
+[init]
+	defaultBranch = fixture-default-is-not-main
+[user]
+	name = Test
+	email = test@test.com
+[commit]
+	gpgsign = false
+[tag]
+	gpgsign = false

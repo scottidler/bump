@@ -1,0 +1,5 @@
+# Isolate every git call in `cargo test` (fixtures and the bump binary under test)
+# from the host's ~/.gitconfig and /etc/gitconfig. See tests/fixtures/gitconfig.
+[env]
+GIT_CONFIG_GLOBAL = { value = "tests/fixtures/gitconfig", relative = true }
+GIT_CONFIG_NOSYSTEM = "1"
