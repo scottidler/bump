@@ -10,3 +10,8 @@
 	gpgsign = false
 [tag]
 	gpgsign = false
+# Cargo's [env] also reaches build.rs (build-version runs git). In a CI container the
+# checkout is owned by another uid and actions/checkout trusts it in the global config
+# this file replaces, so trust every directory here or the build dies on dubious ownership.
+[safe]
+	directory = *
